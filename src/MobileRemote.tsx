@@ -195,7 +195,7 @@ export default function MobileRemote() {
         .from('sessions')
         .select('current_slide, file_id, slide_map')
         .eq('id', session)
-        .single();
+        .maybeSingle();
       if (error) console.error('🚨 DB Fetch Error:', error.message);
       if (data) {
         if (data.current_slide) {
@@ -204,6 +204,12 @@ export default function MobileRemote() {
         }
         if (data.file_id) setFileId(data.file_id);
         if (Array.isArray(data.slide_map)) setFlatSlides(data.slide_map);
+      } else if (!cancelled) {
+        // The presenter may not have finished preparing/writing the slide
+        // list yet (e.g. the phone scanned the QR a moment too early).
+        // Retry briefly instead of leaving the remote permanently stuck
+        // with an empty slide list.
+        setTimeout(() => { if (!cancelled) fetchCurrentSessionState(); }, 1500);
       }
 
       // Non-critical: existing drawings + screen/zoom/PIN state for this
@@ -214,7 +220,7 @@ export default function MobileRemote() {
           .from('sessions')
           .select('canvas_data, session_state')
           .eq('id', session)
-          .single();
+          .maybeSingle();
         if (extra?.canvas_data) {
           allDrawingsRef.current = extra.canvas_data as CanvasDataMap;
           setTimeout(() => redrawCanvasForSlide(currentSlideRef.current, allDrawingsRef.current), 500);
@@ -292,7 +298,11 @@ export default function MobileRemote() {
       // channel, so we can flag "another device is also controlling this".
       room.on('presence', { event: 'sync' }, () => {
         const state = room.presenceState();
-        const otherKeys = Object.keys(state).filter((k) => k !== myClientId);
+        const otherKeys = Object.keys(state).filter((k) => {
+          if (k === myClientId) return false;
+          const entries = (state as Record<string, any[]>)[k] || [];
+          return entries.some((entry) => entry?.role === 'remote');
+        });
         setOtherRemoteCount(otherKeys.length);
       });
 
