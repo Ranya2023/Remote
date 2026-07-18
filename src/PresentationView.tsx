@@ -192,12 +192,12 @@ export default function PresentationView() {
           <p className="text-sm text-gray-400 mb-8">{t.scan}</p>
           
           <div className="bg-white p-4 rounded-xl mb-2">
-            <QRCodeSVG value={`${window.location.origin}/#/remote?session=${sessionId}`} size={180} />
+            <QRCodeSVG value={`${window.location.origin}${window.location.pathname}#/remote?session=${sessionId}`} size={180} />
           </div>
           
           {/* THE NEW CLICKABLE TEST LINK */}
           <a 
-            href={`${window.location.origin}/#/remote?session=${sessionId}`} 
+            href={`${window.location.origin}${window.location.pathname}#/remote?session=${sessionId}`} 
             target="_blank" 
             rel="noreferrer"
             className="text-xs text-blue-400 underline hover:text-blue-300 mb-6"

@@ -248,7 +248,7 @@ export default function Present() {
     return newId;
   });
 
-  const remoteUrl = `${window.location.origin}/#/remote?session=${sessionId}`;
+  const remoteUrl = `${window.location.origin}${window.location.pathname}#/remote?session=${sessionId}`;
   const wrapperRef = useRef<HTMLDivElement>(null);
   const channelRef = useRef<any>(null);
 
