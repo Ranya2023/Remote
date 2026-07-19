@@ -47,34 +47,69 @@ const DEFAULT_ZOOM: ZoomState = { scale: 1, x: 0, y: 0 };
 const DEFAULT_VIDEO_STATE: VideoState = { playing: false, time: 0, duration: 0, volume: 100 };
 const DEFAULT_SESSION_STATE: SessionState = { screenMode: 'normal', zoom: DEFAULT_ZOOM, videoState: DEFAULT_VIDEO_STATE };
 
-// --- Audience-facing polls -------------------------------------------------
-// These shapes must stay in sync with AudienceJoin.tsx, which already
-// implements the voting UI, quiz reveal, Q&A, and reactions - this is the
-// presenter-side counterpart: creating polls, tallying votes, showing
-// results. Round-trips through the `audience_state` column + the
-// `audience_state_update` broadcast, same pattern as session_state.
-interface PollOption { id: string; text: string; votes: number; }
-interface PollState {
+// --- Audience-facing live quiz ---------------------------------------------
+// These shapes must stay in sync with AudienceJoin.tsx (voting/answer UI,
+// leaderboard, Q&A, reactions) and MobileRemote.tsx (phone-side quiz
+// builder/controls) - all three read/write the same `audience_state`
+// column + `audience_state_update` broadcast, same pattern as session_state.
+interface QuizOption { id: string; text: string; imageUrl?: string; }
+interface QuizQuestion {
   id: string;
   question: string;
-  options: PollOption[];
-  isQuiz: boolean;
-  correctOptionId?: string;
-  status: 'live' | 'closed';
-  createdAt: number;
+  options: QuizOption[];
+  correctOptionId: string;
+  source?: string;          // reading material / citation shown after reveal
+  timeLimitSeconds: number;
 }
+interface QuizAnswerRecord { optionId: string; answeredAt: number; correct: boolean; points: number; }
+interface QuizParticipant {
+  id: string;
+  name: string;
+  joinedAt: number;
+  totalScore: number;
+  answers: Record<string, QuizAnswerRecord>; // keyed by questionId
+}
+type QuizStatus = 'building' | 'lobby' | 'question' | 'reveal' | 'finished';
+interface QuizState {
+  questions: QuizQuestion[];
+  currentIndex: number;               // -1 = lobby, not yet on a question
+  status: QuizStatus;
+  questionStartedAt: number | null;
+  participants: Record<string, QuizParticipant>;
+}
+const DEFAULT_QUIZ_STATE: QuizState = { questions: [], currentIndex: -1, status: 'building', questionStartedAt: null, participants: {} };
+
+function scoreAnswer(correct: boolean, answeredAt: number, questionStartedAt: number, timeLimitSeconds: number): number {
+  if (!correct) return 0;
+  const elapsed = Math.max(0, (answeredAt - questionStartedAt) / 1000);
+  const timeLeftFraction = Math.max(0, 1 - elapsed / Math.max(1, timeLimitSeconds));
+  return Math.round(500 + 500 * timeLeftFraction); // 500-1000 pts: correctness always worth something, speed adds a bonus
+}
+function rankParticipants(participants: Record<string, QuizParticipant>): QuizParticipant[] {
+  return Object.values(participants).sort((a, b) => b.totalScore - a.totalScore);
+}
+function downloadCsv(filename: string, rows: (string | number)[][]) {
+  const csv = rows.map((r) => r.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(',')).join('\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
 interface AudienceQuestion { id: string; text: string; upvotes: number; answered: boolean; createdAt: number; }
 type FeedbackKind = '👍' | '❤️' | '👏' | '🤔' | '🐢' | '🚀';
 type FeedbackCounts = Record<FeedbackKind, number>;
 const EMPTY_FEEDBACK: FeedbackCounts = { '👍': 0, '❤️': 0, '👏': 0, '🤔': 0, '🐢': 0, '🚀': 0 };
 interface AudienceState {
   joinCount: number;
-  polls: PollState[];
+  quiz: QuizState;
   questions: AudienceQuestion[];
   feedback: FeedbackCounts;
   qnaOpen: boolean;
 }
-const DEFAULT_AUDIENCE_STATE: AudienceState = { joinCount: 0, polls: [], questions: [], feedback: EMPTY_FEEDBACK, qnaOpen: true };
+const DEFAULT_AUDIENCE_STATE: AudienceState = { joinCount: 0, quiz: DEFAULT_QUIZ_STATE, questions: [], feedback: EMPTY_FEEDBACK, qnaOpen: true };
+
 
 interface Point { x: number; y: number; }
 type DrawMode = 'draw' | 'highlight' | 'erase';
@@ -291,16 +326,21 @@ export default function Present() {
   const [connectedRemoteCount, setConnectedRemoteCount] = useState(0);
   const hostClientId = useMemo(() => `host_${Math.random().toString(36).slice(2)}`, []);
 
-  // --- Audience polls -------------------------------------------------
+  // --- Audience live quiz ----------------------------------------------
   const [audienceState, setAudienceState] = useState<AudienceState>(DEFAULT_AUDIENCE_STATE);
   const audienceStateRef = useRef<AudienceState>(DEFAULT_AUDIENCE_STATE);
   useEffect(() => { audienceStateRef.current = audienceState; }, [audienceState]);
-  const [pollPanelOpen, setPollPanelOpen] = useState(false);
-  const [pollQuestion, setPollQuestion] = useState('');
-  const [pollType, setPollType] = useState<'mc' | 'tf'>('mc');
-  const [pollOptions, setPollOptions] = useState<string[]>(['', '']);
-  const [pollIsQuiz, setPollIsQuiz] = useState(false);
-  const [pollCorrectIndex, setPollCorrectIndex] = useState<number | null>(null);
+  const [quizPanelOpen, setQuizPanelOpen] = useState(false);
+  const [presenterLang, setPresenterLang] = useState<'ku' | 'en'>('ku');
+  const [quizStageMinimized, setQuizStageMinimized] = useState(false);
+
+  // Draft questions, built up before "Start Quiz" is pressed.
+  const [draftQuestions, setDraftQuestions] = useState<QuizQuestion[]>([]);
+  const [qText, setQText] = useState('');
+  const [qOptions, setQOptions] = useState<{ text: string; imageUrl: string }[]>([{ text: '', imageUrl: '' }, { text: '', imageUrl: '' }]);
+  const [qCorrectIndex, setQCorrectIndex] = useState<number | null>(null);
+  const [qSource, setQSource] = useState('');
+  const [qTimeLimit, setQTimeLimit] = useState(20);
 
   const persistAudienceState = useCallback((next: AudienceState) => {
     audienceStateRef.current = next;
@@ -311,35 +351,86 @@ export default function Present() {
     channelRef.current?.send({ type: 'broadcast', event: 'audience_state_update', payload: { audienceState: next } });
   }, [sessionId]);
 
-  const startPoll = () => {
-    const question = pollQuestion.trim();
-    const options = (pollType === 'tf' ? ['True', 'False'] : pollOptions.map((o) => o.trim()).filter(Boolean));
-    if (!question || options.length < 2) return;
-    const newPoll: PollState = {
-      id: `poll_${Date.now().toString(36)}`,
+  const addDraftQuestion = () => {
+    const question = qText.trim();
+    const options = qOptions.map((o) => ({ text: o.text.trim(), imageUrl: o.imageUrl.trim() })).filter((o) => o.text || o.imageUrl);
+    if (!question || options.length < 2 || qCorrectIndex === null) return;
+    const newQ: QuizQuestion = {
+      id: `q_${Date.now().toString(36)}`,
       question,
-      options: options.map((text, i) => ({ id: `opt_${i}`, text, votes: 0 })),
-      isQuiz: pollIsQuiz,
-      correctOptionId: pollIsQuiz && pollCorrectIndex !== null ? `opt_${pollCorrectIndex}` : undefined,
-      status: 'live',
-      createdAt: Date.now(),
+      options: options.map((o, i) => ({ id: `opt_${i}`, text: o.text, imageUrl: o.imageUrl || undefined })),
+      correctOptionId: `opt_${qCorrectIndex}`,
+      source: qSource.trim() || undefined,
+      timeLimitSeconds: qTimeLimit,
     };
-    // Only one live poll at a time - auto-close any previous one.
-    const closedPrior = audienceStateRef.current.polls.map((p) => (p.status === 'live' ? { ...p, status: 'closed' as const } : p));
-    persistAudienceState({ ...audienceStateRef.current, polls: [...closedPrior, newPoll] });
-    setPollQuestion('');
-    setPollOptions(['', '']);
-    setPollIsQuiz(false);
-    setPollCorrectIndex(null);
+    setDraftQuestions((prev) => [...prev, newQ]);
+    setQText(''); setQOptions([{ text: '', imageUrl: '' }, { text: '', imageUrl: '' }]); setQCorrectIndex(null); setQSource(''); setQTimeLimit(20);
   };
+  const removeDraftQuestion = (id: string) => setDraftQuestions((prev) => prev.filter((q) => q.id !== id));
 
-  const closePoll = (pollId: string) => {
-    const polls = audienceStateRef.current.polls.map((p) => (p.id === pollId ? { ...p, status: 'closed' as const } : p));
-    persistAudienceState({ ...audienceStateRef.current, polls });
+  // All quiz-flow transitions live here so both the presenter's own buttons
+  // AND a `quiz_control` command arriving from the phone call the exact
+  // same logic - single source of truth, presenter stays authoritative.
+  const startQuizFlow = useCallback((questions: QuizQuestion[]) => {
+    if (!questions.length) return;
+    setQuizStageMinimized(false);
+    persistAudienceState({ ...audienceStateRef.current, quiz: { questions, currentIndex: -1, status: 'lobby', questionStartedAt: null, participants: {} } });
+  }, [persistAudienceState]);
+
+  const advanceQuiz = useCallback(() => {
+    const quiz = audienceStateRef.current.quiz;
+    if (quiz.status === 'lobby') {
+      persistAudienceState({ ...audienceStateRef.current, quiz: { ...quiz, currentIndex: 0, status: 'question', questionStartedAt: Date.now() } });
+    } else if (quiz.status === 'reveal') {
+      const nextIndex = quiz.currentIndex + 1;
+      if (nextIndex >= quiz.questions.length) {
+        persistAudienceState({ ...audienceStateRef.current, quiz: { ...quiz, status: 'finished' } });
+      } else {
+        persistAudienceState({ ...audienceStateRef.current, quiz: { ...quiz, currentIndex: nextIndex, status: 'question', questionStartedAt: Date.now() } });
+      }
+    }
+  }, [persistAudienceState]);
+
+  const revealQuizNow = useCallback(() => {
+    const quiz = audienceStateRef.current.quiz;
+    if (quiz.status !== 'question') return;
+    persistAudienceState({ ...audienceStateRef.current, quiz: { ...quiz, status: 'reveal' } });
+  }, [persistAudienceState]);
+
+  const resetQuiz = useCallback(() => {
+    setDraftQuestions([]);
+    persistAudienceState({ ...audienceStateRef.current, quiz: DEFAULT_QUIZ_STATE });
+  }, [persistAudienceState]);
+
+  // Auto-reveal when the countdown for the current question runs out -
+  // the presenter tab is the single timer authority so everyone's clock
+  // agrees, regardless of individual device clock drift.
+  useEffect(() => {
+    const quiz = audienceState.quiz;
+    if (quiz.status !== 'question' || !quiz.questionStartedAt) return;
+    const q = quiz.questions[quiz.currentIndex];
+    if (!q) return;
+    const msLeft = quiz.questionStartedAt + q.timeLimitSeconds * 1000 - Date.now();
+    if (msLeft <= 0) { revealQuizNow(); return; }
+    const t = setTimeout(revealQuizNow, msLeft);
+    return () => clearTimeout(t);
+  }, [audienceState.quiz.status, audienceState.quiz.questionStartedAt, audienceState.quiz.currentIndex, revealQuizNow, audienceState.quiz]);
+
+  const quiz = audienceState.quiz;
+  const currentQuestion = quiz.currentIndex >= 0 ? quiz.questions[quiz.currentIndex] : null;
+  const leaderboard = rankParticipants(quiz.participants);
+
+  const downloadQuizResults = () => {
+    const rows: (string | number)[][] = [['Rank', 'Name', 'Score', 'Correct answers', 'Total questions']];
+    leaderboard.forEach((p, i) => {
+      const correctCount = Object.values(p.answers).filter((a) => a.correct).length;
+      rows.push([i + 1, p.name, p.totalScore, correctCount, quiz.questions.length]);
+    });
+    rows.push([]);
+    rows.push(['Question', 'Source / further reading']);
+    quiz.questions.forEach((q) => rows.push([q.question, q.source || '']));
+    downloadCsv(`quiz-results-${sessionId}.csv`, rows);
   };
-
-  const livePoll = audienceState.polls.find((p) => p.status === 'live');
-  const closedPolls = [...audienceState.polls].filter((p) => p.status === 'closed').reverse();
 
   const toggleFullscreen = () => {
     if (!wrapperRef.current) return;
@@ -349,6 +440,27 @@ export default function Present() {
       document.exitFullscreen();
     }
   };
+
+  // Theater/focus mode - hides the sidebar so the slide fills the screen.
+  // This is what actually responds to a remote request from the phone:
+  // the browser's real Fullscreen API can only be started by a direct user
+  // gesture on THIS page (a click here works; a command arriving over the
+  // network from the phone does not - browsers block that for security).
+  // Focus mode gets you the same practical result (no sidebar, slide fills
+  // the screen) without that restriction, so it's what the phone controls.
+  const [focusMode, setFocusMode] = useState(false);
+  const handleFullscreenRequest = useCallback(() => {
+    setFocusMode((prev) => {
+      const next = !prev;
+      channelRef.current?.send({ type: 'broadcast', event: 'fullscreen_state', payload: { active: next } });
+      return next;
+    });
+    // Also attempt the real OS-level fullscreen in case this happens to run
+    // in a context where it's allowed - silently ignored if blocked.
+    if (wrapperRef.current && !document.fullscreenElement) {
+      wrapperRef.current.requestFullscreen().catch(() => {});
+    }
+  }, []);
 
   // The file actually on screen right now - for a lesson this is the
   // active item's fileId, not the lesson's own id. MobileRemote.tsx fetches
@@ -525,20 +637,49 @@ export default function Present() {
         else if (action === 'unmute') postYouTubeCommand(iframe, 'unMute');
       });
 
-      channel.on('broadcast', { event: 'audience_vote' }, (payload) => {
-        const { pollId, optionId } = payload.payload || {};
-        if (!pollId || !optionId) return;
+      channel.on('broadcast', { event: 'fullscreen_toggle' }, () => {
+        handleFullscreenRequest();
+      });
+
+      channel.on('broadcast', { event: 'quiz_join' }, (payload) => {
+        const { participantId, name } = payload.payload || {};
+        if (!participantId || !name) return;
         const current = audienceStateRef.current;
-        const polls = current.polls.map((p) => {
-          if (p.id !== pollId || p.status !== 'live') return p;
-          return { ...p, options: p.options.map((o) => (o.id === optionId ? { ...o, votes: o.votes + 1 } : o)) };
-        });
-        persistAudienceState({ ...current, polls });
+        if (current.quiz.participants[participantId]) return; // already joined
+        const participants = { ...current.quiz.participants, [participantId]: { id: participantId, name, joinedAt: Date.now(), totalScore: 0, answers: {} } };
+        persistAudienceState({ ...current, quiz: { ...current.quiz, participants } });
+      });
+
+      channel.on('broadcast', { event: 'quiz_answer' }, (payload) => {
+        const { participantId, questionId, optionId, answeredAt } = payload.payload || {};
+        if (!participantId || !questionId || !optionId) return;
+        const current = audienceStateRef.current;
+        const quiz = current.quiz;
+        const participant = quiz.participants[participantId];
+        const question = quiz.questions.find((q) => q.id === questionId);
+        if (!participant || !question || participant.answers[questionId]) return; // no double-answers
+        const correct = question.correctOptionId === optionId;
+        const points = scoreAnswer(correct, answeredAt || Date.now(), quiz.questionStartedAt || Date.now(), question.timeLimitSeconds);
+        const updatedParticipant: QuizParticipant = {
+          ...participant,
+          totalScore: participant.totalScore + points,
+          answers: { ...participant.answers, [questionId]: { optionId, answeredAt: answeredAt || Date.now(), correct, points } },
+        };
+        persistAudienceState({ ...current, quiz: { ...quiz, participants: { ...quiz.participants, [participantId]: updatedParticipant } } });
       });
 
       channel.on('broadcast', { event: 'audience_join' }, () => {
         const current = audienceStateRef.current;
         persistAudienceState({ ...current, joinCount: current.joinCount + 1 });
+      });
+
+      // Lets the phone remote fully drive quiz creation/flow too.
+      channel.on('broadcast', { event: 'quiz_control' }, (payload) => {
+        const { action, questions } = payload.payload || {};
+        if (action === 'start_quiz' && Array.isArray(questions)) startQuizFlow(questions);
+        else if (action === 'advance') advanceQuiz();
+        else if (action === 'reveal_now') revealQuizNow();
+        else if (action === 'reset') resetQuiz();
       });
 
       channel.on('broadcast', { event: 'draw_stroke' }, (payload) => {
@@ -1061,11 +1202,12 @@ export default function Present() {
   return (
     <div className="flex h-screen w-full bg-black text-white overflow-hidden">
       {/* Sidebar: QR code for the phone remote + session info */}
+      {!focusMode && (
       <div className="w-80 bg-gray-900 border-r border-gray-800 p-6 flex flex-col items-center justify-between shrink-0">
         <div className="w-full flex justify-end gap-2">
-          <button onClick={() => setPollPanelOpen(true)} className="text-xs bg-emerald-600 hover:bg-emerald-700 px-3 py-1 rounded relative">
-            🗳️ Poll
-            {livePoll && <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse" />}
+          <button onClick={() => setQuizPanelOpen(true)} className="text-xs bg-emerald-600 hover:bg-emerald-700 px-3 py-1 rounded relative">
+            🧠 Quiz
+            {quiz.status !== 'building' && quiz.status !== 'finished' && <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse" />}
           </button>
           <button onClick={toggleFullscreen} className="text-xs bg-blue-600 hover:bg-blue-700 px-3 py-1 rounded">
             Full Screen
@@ -1106,6 +1248,16 @@ export default function Present() {
           </div>
         </div>
       </div>
+      )}
+
+      {focusMode && (
+        <button
+          onClick={handleFullscreenRequest}
+          className="fixed top-3 right-3 z-[200] bg-gray-900/80 hover:bg-gray-800 text-white text-xs px-3 py-1.5 rounded-full border border-gray-700"
+        >
+          🗗 Exit focus mode
+        </button>
+      )}
 
       {/* Main slide area */}
       <div className="flex-1 flex flex-col min-w-0">
@@ -1227,138 +1379,186 @@ export default function Present() {
         </div>
       </div>
 
-      {pollPanelOpen && (
-        <div className="fixed inset-0 z-[100] bg-black/70 flex items-center justify-center p-4" onClick={() => setPollPanelOpen(false)}>
+      {/* Fullscreen quiz stage - takes over the whole projector screen for
+          every phase except building the quiz. This is what the audience
+          watches; their phones only show the tappable options. */}
+      {quiz.status !== 'building' && !(quiz.status === 'finished' && quizStageMinimized) && (
+        <div className="fixed inset-0 z-[150] bg-gradient-to-br from-indigo-950 via-gray-950 to-black flex flex-col items-center justify-center text-white p-8 gap-6 overflow-y-auto">
+          <button
+            onClick={() => setPresenterLang((l) => (l === 'ku' ? 'en' : 'ku'))}
+            className="fixed top-4 left-4 bg-white/10 hover:bg-white/20 px-3 py-1.5 rounded-full text-xs font-bold"
+          >
+            {presenterLang === 'ku' ? 'English' : 'کوردی'}
+          </button>
+          {quiz.status === 'finished' && (
+            <button onClick={() => setQuizStageMinimized(true)} className="fixed top-4 right-4 bg-white/10 hover:bg-white/20 px-3 py-1.5 rounded-full text-xs font-bold">
+              ✕ {ST(presenterLang, 'close')}
+            </button>
+          )}
+
+          {quiz.status === 'lobby' && (
+            <div className="flex flex-col items-center gap-6 text-center">
+              <h1 className="text-3xl font-bold">{ST(presenterLang, 'scanQr')}</h1>
+              <div className="bg-white p-6 rounded-3xl shadow-2xl shadow-indigo-500/30">
+                <QRCodeSVG value={audienceUrl} size={340} />
+              </div>
+              <p className="text-indigo-300 font-mono text-sm break-all">{audienceUrl}</p>
+              <div className="flex flex-wrap gap-2 justify-center max-w-2xl mt-2">
+                {Object.values(quiz.participants).length === 0 && <span className="text-gray-400 text-sm">{ST(presenterLang, 'waitingJoin')}</span>}
+                {Object.values(quiz.participants).map((p) => (
+                  <span key={p.id} className="bg-indigo-600/30 border border-indigo-500 px-3 py-1 rounded-full text-sm">{p.name}</span>
+                ))}
+              </div>
+              <button
+                onClick={advanceQuiz}
+                disabled={Object.values(quiz.participants).length === 0}
+                className="mt-4 bg-emerald-600 disabled:opacity-30 hover:bg-emerald-500 px-8 py-3 rounded-full font-bold text-lg"
+              >
+                ▶ {ST(presenterLang, 'beginQuiz')}
+              </button>
+            </div>
+          )}
+
+          {(quiz.status === 'question' || quiz.status === 'reveal') && currentQuestion && (
+            <QuizLiveStage
+              quiz={quiz}
+              question={currentQuestion}
+              lang={presenterLang}
+              onReveal={revealQuizNow}
+              onAdvance={advanceQuiz}
+              isLast={quiz.currentIndex >= quiz.questions.length - 1}
+            />
+          )}
+
+          {quiz.status === 'finished' && (
+            <div className="flex flex-col items-center gap-6 w-full max-w-2xl">
+              <h1 className="text-3xl font-bold">🏆 {ST(presenterLang, 'leaderboard')}</h1>
+              <LeaderboardList leaderboard={leaderboard} questionCount={quiz.questions.length} />
+              <div className="flex gap-3">
+                <button onClick={downloadQuizResults} className="bg-blue-600 hover:bg-blue-500 px-5 py-2.5 rounded-full font-bold text-sm">
+                  ⬇ {ST(presenterLang, 'downloadResults')}
+                </button>
+                <button onClick={resetQuiz} className="bg-gray-700 hover:bg-gray-600 px-5 py-2.5 rounded-full font-bold text-sm">
+                  🔄 {ST(presenterLang, 'newQuiz')}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {quizPanelOpen && (
+        <div className="fixed inset-0 z-[100] bg-black/70 flex items-center justify-center p-4" onClick={() => setQuizPanelOpen(false)}>
           <div
             className="bg-gray-900 border border-gray-700 rounded-2xl w-full max-w-lg max-h-[85vh] overflow-y-auto p-6 flex flex-col gap-5"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between">
-              <h3 className="text-lg font-bold">🗳️ Audience Polls</h3>
-              <button onClick={() => setPollPanelOpen(false)} className="text-gray-400 hover:text-white text-xl leading-none">✕</button>
+              <h3 className="text-lg font-bold">🧠 Live Quiz</h3>
+              <button onClick={() => setQuizPanelOpen(false)} className="text-gray-400 hover:text-white text-xl leading-none">✕</button>
             </div>
 
-            {/* Scan-to-join QR - only needs to be scanned once per audience member,
-                after which every poll (live or future) reaches them automatically. */}
-            <div className="flex items-center gap-4 bg-gray-800 rounded-xl p-4">
-              <div className="bg-white p-2 rounded-lg shrink-0">
-                <QRCodeSVG value={audienceUrl} size={88} />
-              </div>
-              <div className="text-xs text-gray-400">
-                <p className="text-white font-semibold mb-1">Scan to join as audience</p>
-                <p>Anyone who scans this can vote on polls, ask questions, and react - but can't control slides.</p>
-                <p className="mt-1 text-gray-500">{audienceState.joinCount} joined so far</p>
-              </div>
-            </div>
-
-            {livePoll ? (
+            {quiz.status !== 'building' ? (
               <div className="flex flex-col gap-3">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-emerald-400 uppercase flex items-center gap-1.5">
-                    <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" /> Live now
-                  </span>
-                  <button onClick={() => closePoll(livePoll.id)} className="text-xs bg-red-700 hover:bg-red-600 px-3 py-1 rounded-full font-bold">
-                    End poll
-                  </button>
-                </div>
-                <PollResultsChart poll={livePoll} />
+                <p className="text-sm text-gray-300">
+                  Quiz in progress ({quiz.status}) - controls are on the big screen{quiz.status === 'finished' && quizStageMinimized ? ', or ' : ''}
+                  {quiz.status === 'finished' && quizStageMinimized && (
+                    <button onClick={() => setQuizStageMinimized(false)} className="text-blue-400 underline">reopen it</button>
+                  )}
+                  . You can also drive it entirely from the phone remote.
+                </p>
+                {quiz.status === 'finished' && (
+                  <div className="flex gap-2">
+                    <button onClick={downloadQuizResults} className="flex-1 bg-blue-600 hover:bg-blue-500 rounded-lg py-2 text-sm font-bold">⬇ Download results</button>
+                    <button onClick={resetQuiz} className="flex-1 bg-gray-700 hover:bg-gray-600 rounded-lg py-2 text-sm font-bold">🔄 New quiz</button>
+                  </div>
+                )}
               </div>
             ) : (
-              <div className="flex flex-col gap-3">
-                <p className="text-xs font-bold text-gray-400 uppercase">New poll</p>
-                <input
-                  value={pollQuestion}
-                  onChange={(e) => setPollQuestion(e.target.value)}
-                  placeholder="Ask a question..."
-                  className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
-                />
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => setPollType('mc')}
-                    className={`flex-1 text-xs py-2 rounded-lg font-semibold ${pollType === 'mc' ? 'bg-emerald-600' : 'bg-gray-800 text-gray-400'}`}
-                  >
-                    Multiple choice
-                  </button>
-                  <button
-                    onClick={() => setPollType('tf')}
-                    className={`flex-1 text-xs py-2 rounded-lg font-semibold ${pollType === 'tf' ? 'bg-emerald-600' : 'bg-gray-800 text-gray-400'}`}
-                  >
-                    True / False
-                  </button>
+              <div className="flex flex-col gap-4">
+                <div className="flex items-center gap-4 bg-gray-800 rounded-xl p-4">
+                  <div className="bg-white p-2 rounded-lg shrink-0">
+                    <QRCodeSVG value={audienceUrl} size={72} />
+                  </div>
+                  <p className="text-xs text-gray-400">Shown big on the projector once the quiz starts - audience scans it there, no need to share it separately.</p>
                 </div>
 
-                {pollType === 'mc' && (
+                {draftQuestions.length > 0 && (
                   <div className="flex flex-col gap-2">
-                    {pollOptions.map((opt, i) => (
+                    <p className="text-xs font-bold text-gray-400 uppercase">{draftQuestions.length} question{draftQuestions.length === 1 ? '' : 's'} added</p>
+                    {draftQuestions.map((q, i) => (
+                      <div key={q.id} className="bg-gray-800/60 rounded-lg p-2.5 flex items-center justify-between gap-2">
+                        <span className="text-xs truncate">{i + 1}. {q.question}</span>
+                        <button onClick={() => removeDraftQuestion(q.id)} className="text-gray-500 hover:text-red-400 text-xs shrink-0">✕</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="flex flex-col gap-3 border-t border-gray-800 pt-4">
+                  <p className="text-xs font-bold text-gray-400 uppercase">Add question</p>
+                  <input value={qText} onChange={(e) => setQText(e.target.value)} placeholder="Ask a question..." className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm" />
+
+                  <div className="flex flex-col gap-2">
+                    {qOptions.map((opt, i) => (
                       <div key={i} className="flex items-center gap-2">
-                        {pollIsQuiz && (
-                          <button
-                            onClick={() => setPollCorrectIndex(i)}
-                            title="Mark as correct answer"
-                            className={`shrink-0 w-6 h-6 rounded-full border-2 flex items-center justify-center text-xs ${pollCorrectIndex === i ? 'bg-emerald-600 border-emerald-500' : 'border-gray-600'}`}
-                          >
-                            {pollCorrectIndex === i ? '✓' : ''}
-                          </button>
-                        )}
+                        <button
+                          onClick={() => setQCorrectIndex(i)}
+                          title="Mark as correct answer"
+                          className={`shrink-0 w-6 h-6 rounded-full border-2 flex items-center justify-center text-xs ${qCorrectIndex === i ? 'bg-emerald-600 border-emerald-500' : 'border-gray-600'}`}
+                        >
+                          {qCorrectIndex === i ? '✓' : ''}
+                        </button>
                         <input
-                          value={opt}
-                          onChange={(e) => setPollOptions((prev) => prev.map((o, j) => (j === i ? e.target.value : o)))}
+                          value={opt.text}
+                          onChange={(e) => setQOptions((prev) => prev.map((o, j) => (j === i ? { ...o, text: e.target.value } : o)))}
                           placeholder={`Option ${i + 1}`}
                           className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm"
                         />
-                        {pollOptions.length > 2 && (
-                          <button
-                            onClick={() => setPollOptions((prev) => prev.filter((_, j) => j !== i))}
-                            className="shrink-0 text-gray-500 hover:text-red-400 text-sm"
-                          >
-                            ✕
-                          </button>
+                        {qOptions.length > 2 && (
+                          <button onClick={() => setQOptions((prev) => prev.filter((_, j) => j !== i))} className="shrink-0 text-gray-500 hover:text-red-400 text-sm">✕</button>
                         )}
                       </div>
                     ))}
-                    {pollOptions.length < 6 && (
-                      <button onClick={() => setPollOptions((prev) => [...prev, ''])} className="text-xs text-blue-400 self-start">
-                        + Add option
-                      </button>
+                    {qOptions.length < 6 && (
+                      <button onClick={() => setQOptions((prev) => [...prev, { text: '', imageUrl: '' }])} className="text-xs text-blue-400 self-start">+ Add option</button>
                     )}
-                  </div>
-                )}
-
-                {pollType === 'tf' && pollIsQuiz && (
-                  <div className="flex gap-2">
-                    {['True', 'False'].map((label, i) => (
-                      <button
-                        key={label}
-                        onClick={() => setPollCorrectIndex(i)}
-                        className={`flex-1 text-xs py-2 rounded-lg font-semibold border-2 ${pollCorrectIndex === i ? 'bg-emerald-600 border-emerald-500' : 'border-gray-700 text-gray-400'}`}
-                      >
-                        {label} is correct
-                      </button>
+                    <p className="text-[10px] text-gray-500">Tap the circle to mark the correct answer. Options can optionally have an image too:</p>
+                    {qOptions.map((opt, i) => (
+                      <input
+                        key={i}
+                        value={opt.imageUrl}
+                        onChange={(e) => setQOptions((prev) => prev.map((o, j) => (j === i ? { ...o, imageUrl: e.target.value } : o)))}
+                        placeholder={`Image URL for option ${i + 1} (optional)`}
+                        className="bg-gray-800/60 border border-gray-800 rounded-lg px-3 py-1 text-[11px] text-gray-400"
+                      />
                     ))}
                   </div>
-                )}
 
-                <label className="flex items-center gap-2 text-xs text-gray-400">
-                  <input type="checkbox" checked={pollIsQuiz} onChange={(e) => { setPollIsQuiz(e.target.checked); setPollCorrectIndex(null); }} />
-                  This is a quiz (mark a correct answer, audience gets right/wrong feedback)
-                </label>
+                  <input value={qSource} onChange={(e) => setQSource(e.target.value)} placeholder="Source / further reading (optional)" className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs" />
+
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-gray-400">⏱ Time limit</span>
+                    <input type="range" min={5} max={60} step={5} value={qTimeLimit} onChange={(e) => setQTimeLimit(Number(e.target.value))} className="flex-1" />
+                    <span className="text-xs font-mono w-10 text-right">{qTimeLimit}s</span>
+                  </div>
+
+                  <button
+                    onClick={addDraftQuestion}
+                    disabled={!qText.trim() || qCorrectIndex === null}
+                    className="bg-gray-700 disabled:opacity-30 hover:bg-gray-600 rounded-lg py-2 text-sm font-bold"
+                  >
+                    + Add to quiz
+                  </button>
+                </div>
 
                 <button
-                  onClick={startPoll}
-                  disabled={!pollQuestion.trim() || (pollIsQuiz && pollCorrectIndex === null)}
+                  onClick={() => startQuizFlow(draftQuestions)}
+                  disabled={draftQuestions.length === 0}
                   className="bg-emerald-600 disabled:opacity-30 rounded-lg py-2.5 text-sm font-bold"
                 >
-                  Start poll
+                  🚀 Start quiz ({draftQuestions.length} question{draftQuestions.length === 1 ? '' : 's'})
                 </button>
-              </div>
-            )}
-
-            {closedPolls.length > 0 && (
-              <div className="flex flex-col gap-3 pt-3 border-t border-gray-800">
-                <p className="text-xs font-bold text-gray-500 uppercase">Past polls</p>
-                {closedPolls.map((p) => (
-                  <PollResultsChart key={p.id} poll={p} compact />
-                ))}
               </div>
             )}
           </div>
@@ -1368,34 +1568,128 @@ export default function Present() {
   );
 }
 
-function PollResultsChart({ poll, compact }: { poll: PollState; compact?: boolean }) {
-  const total = poll.options.reduce((s, o) => s + o.votes, 0);
+// --- Small shared text dictionary for the audience-facing big-screen stage.
+const STAGE_TEXT: Record<'ku' | 'en', Record<string, string>> = {
+  ku: {
+    scanQr: 'تکایە کۆدی QR بسکان بکە بۆ بەشداریکردن', waitingJoin: 'چاوەڕێی بەشداربووان...', beginQuiz: 'دەستپێکردنی کویز',
+    question: 'پرسیار', timeLeft: 'کاتی ماوە', correctAnswer: 'وەڵامی ڕاست', leaderboard: 'پێشەنگەکان',
+    downloadResults: 'داگرتنی ئەنجامەکان', newQuiz: 'کویزی نوێ', next: 'دواتر', revealNow: 'دەرخستنی ئێستا',
+    source: 'سەرچاوە', answered: 'وەڵامیان دایەوە', close: 'داخستن',
+  },
+  en: {
+    scanQr: 'Please scan the QR code to join', waitingJoin: 'Waiting for participants...', beginQuiz: 'Begin quiz',
+    question: 'Question', timeLeft: 'Time left', correctAnswer: 'Correct answer', leaderboard: 'Leaderboard',
+    downloadResults: 'Download results', newQuiz: 'New quiz', next: 'Next', revealNow: 'Reveal now',
+    source: 'Source', answered: 'answered', close: 'Close',
+  },
+};
+function ST(lang: 'ku' | 'en', key: string) { return STAGE_TEXT[lang][key] || key; }
+
+function QuizLiveStage({ quiz, question, lang, onReveal, onAdvance, isLast }: {
+  quiz: QuizState; question: QuizQuestion; lang: 'ku' | 'en'; onReveal: () => void; onAdvance: () => void; isLast: boolean;
+}) {
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (quiz.status !== 'question') return;
+    const i = setInterval(() => tick((n) => n + 1), 250);
+    return () => clearInterval(i);
+  }, [quiz.status]);
+
+  const answeredCount = Object.values(quiz.participants).filter((p) => p.answers[question.id]).length;
+  const totalParticipants = Object.values(quiz.participants).length;
+  const secondsLeft = quiz.questionStartedAt
+    ? Math.max(0, Math.ceil((quiz.questionStartedAt + question.timeLimitSeconds * 1000 - Date.now()) / 1000))
+    : question.timeLimitSeconds;
+  const pct = Math.max(0, Math.min(100, (secondsLeft / question.timeLimitSeconds) * 100));
+
+  const votesByOption: Record<string, number> = {};
+  question.options.forEach((o) => { votesByOption[o.id] = 0; });
+  Object.values(quiz.participants).forEach((p) => {
+    const a = p.answers[question.id];
+    if (a) votesByOption[a.optionId] = (votesByOption[a.optionId] || 0) + 1;
+  });
+  const totalAnswers = Object.values(votesByOption).reduce((s, n) => s + n, 0);
+  const palette = ['bg-red-600', 'bg-blue-600', 'bg-amber-500', 'bg-emerald-600', 'bg-purple-600', 'bg-pink-600'];
+
   return (
-    <div className={compact ? 'bg-gray-800/60 rounded-lg p-3' : ''}>
-      <p className={`font-semibold mb-2 ${compact ? 'text-xs text-gray-300' : 'text-sm'}`}>
-        {poll.isQuiz ? '❓ ' : ''}{poll.question}
-      </p>
-      <div className="flex flex-col gap-1.5">
-        {poll.options.map((opt) => {
-          const pct = total ? Math.round((opt.votes / total) * 100) : 0;
-          const isCorrect = poll.isQuiz && poll.correctOptionId === opt.id;
+    <div className="w-full max-w-3xl flex flex-col items-center gap-6">
+      <div className="flex items-center gap-3 text-sm text-indigo-300">
+        <span>{ST(lang, 'question')} {quiz.currentIndex + 1} / {quiz.questions.length}</span>
+        <span>•</span>
+        <span>{answeredCount}/{totalParticipants} {ST(lang, 'answered')}</span>
+      </div>
+      <h1 className="text-3xl font-bold text-center">{question.question}</h1>
+
+      {quiz.status === 'question' && (
+        <div className="w-full max-w-md h-3 bg-white/10 rounded-full overflow-hidden">
+          <div className={`h-full transition-all duration-300 ${secondsLeft <= 5 ? 'bg-red-500' : 'bg-emerald-500'}`} style={{ width: `${pct}%` }} />
+        </div>
+      )}
+      {quiz.status === 'question' && <span className="text-4xl font-mono font-bold">{secondsLeft}s</span>}
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full">
+        {question.options.map((opt, i) => {
+          const isCorrect = quiz.status === 'reveal' && opt.id === question.correctOptionId;
+          const votes = votesByOption[opt.id] || 0;
+          const optPct = totalAnswers ? Math.round((votes / totalAnswers) * 100) : 0;
           return (
-            <div key={opt.id} className="flex items-center gap-2">
-              <div className="flex-1 h-6 bg-gray-800 rounded overflow-hidden relative">
-                <div
-                  className={`h-full transition-all duration-500 ${isCorrect ? 'bg-emerald-600' : 'bg-blue-600'}`}
-                  style={{ width: `${pct}%` }}
-                />
-                <span className="absolute inset-0 flex items-center px-2 text-[11px] font-medium">
-                  {opt.text}{isCorrect ? ' ✓' : ''}
-                </span>
+            <div
+              key={opt.id}
+              className={`relative rounded-2xl p-4 overflow-hidden font-semibold text-left ${palette[i % palette.length]} ${quiz.status === 'reveal' && !isCorrect ? 'opacity-40' : ''} ${isCorrect ? 'ring-4 ring-white' : ''}`}
+            >
+              {quiz.status === 'reveal' && (
+                <div className="absolute inset-0 bg-black/30" style={{ width: `${optPct}%` }} />
+              )}
+              <div className="relative flex items-center gap-3">
+                {opt.imageUrl && <img src={opt.imageUrl} alt="" className="w-12 h-12 object-cover rounded-lg" />}
+                <span className="flex-1">{opt.text}</span>
+                {isCorrect && <span className="text-xl">✓</span>}
+                {quiz.status === 'reveal' && <span className="text-xs font-mono">{votes} · {optPct}%</span>}
               </div>
-              <span className="text-[11px] text-gray-400 w-14 text-right shrink-0">{opt.votes} · {pct}%</span>
             </div>
           );
         })}
       </div>
-      <p className="text-[10px] text-gray-500 mt-1">{total} vote{total === 1 ? '' : 's'} total</p>
+
+      {quiz.status === 'reveal' && question.source && (
+        <p className="text-xs text-indigo-300 max-w-lg text-center">📚 {ST(lang, 'source')}: {question.source}</p>
+      )}
+
+      <div className="flex gap-3 mt-2">
+        {quiz.status === 'question' && (
+          <button onClick={onReveal} className="bg-white/10 hover:bg-white/20 px-6 py-2.5 rounded-full font-bold text-sm">
+            {ST(lang, 'revealNow')}
+          </button>
+        )}
+        {quiz.status === 'reveal' && (
+          <button onClick={onAdvance} className="bg-emerald-600 hover:bg-emerald-500 px-8 py-3 rounded-full font-bold text-lg">
+            {isLast ? `🏆 ${ST(lang, 'leaderboard')}` : `${ST(lang, 'next')} ▶`}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function LeaderboardList({ leaderboard, questionCount }: { leaderboard: QuizParticipant[]; questionCount: number }) {
+  const medals = ['🥇', '🥈', '🥉'];
+  return (
+    <div className="w-full flex flex-col gap-2">
+      {leaderboard.length === 0 && <p className="text-gray-400 text-center text-sm">No participants.</p>}
+      {leaderboard.map((p, i) => {
+        const correctCount = Object.values(p.answers).filter((a) => a.correct).length;
+        return (
+          <div
+            key={p.id}
+            className={`flex items-center gap-3 rounded-xl px-4 py-3 ${i === 0 ? 'bg-gradient-to-r from-amber-500/30 to-amber-600/10 border border-amber-500' : i < 3 ? 'bg-white/10 border border-white/20' : 'bg-white/5'}`}
+          >
+            <span className="text-xl w-8 text-center shrink-0">{medals[i] || `#${i + 1}`}</span>
+            <span className="flex-1 font-semibold truncate">{p.name}</span>
+            <span className="text-xs text-gray-400">{correctCount}/{questionCount} ✓</span>
+            <span className="font-mono font-bold text-lg w-16 text-right">{p.totalScore}</span>
+          </div>
+        );
+      })}
     </div>
   );
 }

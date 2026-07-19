@@ -12,16 +12,26 @@ const texts = {
     draw: 'کێشان', highlight: 'هایلایت', erase: 'پاکەرەوە', color: 'ڕەنگ', clear: 'سڕینەوە', timer: 'کات',
     switchLang: 'EN', connecting: 'پەیوەندی دەکرێت...', loadingPdf: 'خوێندنەوەی سلاید...', error: 'هەڵە',
     spotlight: 'تیشک', zoom: 'زووم', black: 'ڕەشکردنەوە', white: 'سپیکردنەوە', notes: 'تێبینی', hideNotes: 'شاردنەوە',
+    spotlightSize: 'قەبارە',
     play: 'لێدان', pause: 'وەستان', mute: 'بێدەنگ', unmute: 'دەنگ', reset: 'ڕێکخستنەوە', video: 'ڤیدیۆ',
     start: 'دەستپێکردن', minutesLabel: 'خولەک', undo: 'گەڕانەوە', first: 'یەکەم', last: 'کۆتایی',
+    quiz: 'کویز', addQuestion: 'زیادکردنی پرسیار', startQuiz: 'دەستپێکردنی کویز', beginQuiz: 'دەستپێکردن',
+    nextQ: 'دواتر', revealNow: 'دەرخستنی ئێستا', newQuiz: 'کویزی نوێ', question: 'پرسیار',
+    correctMark: 'کرتە لەسەر بازنە بکە بۆ دیاریکردنی وەڵامی ڕاست', timeLimit: 'کاتی پرسیار',
+    inProgress: 'کویز لە جێبەجێکردندایە', participants: 'بەشداربووان', downloadResults: 'داگرتنی ئەنجامەکان',
   },
   en: {
     session: 'Session', slide: 'Slide', next: 'NEXT', prev: 'PREV', controller: 'Controller Area', laser: 'Laser',
     draw: 'Draw', highlight: 'Highlight', erase: 'Erase', color: 'Color', clear: 'Clear', timer: 'Time',
     switchLang: 'کوردی', connecting: 'Connecting...', loadingPdf: 'Loading slide...', error: 'Error',
     spotlight: 'Spotlight', zoom: 'Zoom', black: 'Black screen', white: 'White screen', notes: 'Notes', hideNotes: 'Hide',
+    spotlightSize: 'Size',
     play: 'Play', pause: 'Pause', mute: 'Mute', unmute: 'Unmute', reset: 'Reset', video: 'Video',
     start: 'Start', minutesLabel: 'min', undo: 'Undo', first: 'First', last: 'Last',
+    quiz: 'Quiz', addQuestion: 'Add question', startQuiz: 'Start quiz', beginQuiz: 'Begin quiz',
+    nextQ: 'Next', revealNow: 'Reveal now', newQuiz: 'New quiz', question: 'Question',
+    correctMark: 'Tap the circle to mark the correct answer', timeLimit: 'Time limit',
+    inProgress: 'Quiz in progress', participants: 'participants', downloadResults: 'Download results',
   },
 };
 
@@ -64,6 +74,40 @@ const STROKE_WIDTHS: Record<DrawMode, number> = { draw: 4, highlight: 22, erase:
 type ToolMode = 'none' | 'laser' | DrawMode | 'spotlight' | 'zoom';
 
 const TYPE_ICON: Record<string, string> = { pdf: '📄', image: '🖼️', 'video-link': '▶️', other: '📁' };
+
+// --- Quiz types - MUST stay byte-for-byte in sync with Present.tsx /
+// AudienceJoin.tsx, since this is all one JSON shape round-tripping
+// through Supabase + broadcast.
+interface QuizOption { id: string; text: string; imageUrl?: string; }
+interface QuizQuestion {
+  id: string;
+  question: string;
+  options: QuizOption[];
+  correctOptionId: string;
+  source?: string;
+  timeLimitSeconds: number;
+}
+interface QuizAnswerRecord { optionId: string; answeredAt: number; correct: boolean; points: number; }
+interface QuizParticipant { id: string; name: string; joinedAt: number; totalScore: number; answers: Record<string, QuizAnswerRecord>; }
+type QuizStatus = 'building' | 'lobby' | 'question' | 'reveal' | 'finished';
+interface QuizState {
+  questions: QuizQuestion[];
+  currentIndex: number;
+  status: QuizStatus;
+  questionStartedAt: number | null;
+  participants: Record<string, QuizParticipant>;
+}
+const DEFAULT_QUIZ_STATE: QuizState = { questions: [], currentIndex: -1, status: 'building', questionStartedAt: null, participants: {} };
+interface AudienceQuestion { id: string; text: string; upvotes: number; answered: boolean; createdAt: number; }
+type FeedbackKind = '👍' | '❤️' | '👏' | '🤔' | '🐢' | '🚀';
+interface AudienceState {
+  joinCount: number;
+  quiz: QuizState;
+  questions: AudienceQuestion[];
+  feedback: Record<FeedbackKind, number>;
+  qnaOpen: boolean;
+}
+const DEFAULT_AUDIENCE_STATE: AudienceState = { joinCount: 0, quiz: DEFAULT_QUIZ_STATE, questions: [], feedback: { '👍': 0, '❤️': 0, '👏': 0, '🤔': 0, '🐢': 0, '🚀': 0 }, qnaOpen: true };
 
 export default function MobileRemote() {
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -115,32 +159,60 @@ export default function MobileRemote() {
   const [fileId, setFileId] = useState<string | null>(null);
   const [preview, setPreview] = useState<ResolvedPreview>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
+  const [spotlightRadius, setSpotlightRadius] = useState(160);
 
-  // Fullscreen for the phone itself - separate from the presenter's own
-  // "Full Screen" button, which only affects the projector screen.
-  const [isFullscreen, setIsFullscreen] = useState(false);
-  useEffect(() => {
-    const onChange = () => setIsFullscreen(!!document.fullscreenElement || !!(document as any).webkitFullscreenElement);
-    document.addEventListener('fullscreenchange', onChange);
-    document.addEventListener('webkitfullscreenchange', onChange);
-    return () => {
-      document.removeEventListener('fullscreenchange', onChange);
-      document.removeEventListener('webkitfullscreenchange', onChange);
-    };
-  }, []);
-  const toggleRemoteFullscreen = () => {
-    const el = document.documentElement as any;
-    const isFs = !!document.fullscreenElement || !!(document as any).webkitFullscreenElement;
-    if (!isFs) {
-      const req = el.requestFullscreen || el.webkitRequestFullscreen;
-      req?.call(el).catch(() => { /* not supported (e.g. iOS Safari) - button just stays a no-op */ });
-    } else {
-      const exit = (document as any).exitFullscreen || (document as any).webkitExitFullscreen;
-      exit?.call(document);
-    }
+  // This button controls the PROJECTOR's full screen, not the phone's -
+  // just sends a request; Present.tsx does the actual toggling and reports
+  // back its resulting state via `fullscreen_state` so the icon stays
+  // accurate (see channel.on('fullscreen_state', ...) below).
+  const [isProjectorFullscreen, setIsProjectorFullscreen] = useState(false);
+  const requestProjectorFullscreen = () => {
+    channelRef.current?.send({ type: 'broadcast', event: 'fullscreen_toggle', payload: {} });
   };
   const [trackpadWidth, setTrackpadWidth] = useState(0);
   const lastFetchedFileId = useRef<string | null>(null);
+
+  // --- Quiz - phone can fully build and drive the quiz too, per the
+  // existing "remote suggests, presenter persists" pattern used for every
+  // other control: this just broadcasts a `quiz_control` command that
+  // Present.tsx (the authoritative host) applies and saves.
+  const [audienceState, setAudienceState] = useState<AudienceState>(DEFAULT_AUDIENCE_STATE);
+  const audienceStateRef = useRef<AudienceState>(DEFAULT_AUDIENCE_STATE);
+  useEffect(() => { audienceStateRef.current = audienceState; }, [audienceState]);
+  const quiz = audienceState.quiz;
+
+  const [quizPanelOpen, setQuizPanelOpen] = useState(false);
+  const [draftQuestions, setDraftQuestions] = useState<QuizQuestion[]>([]);
+  const [qText, setQText] = useState('');
+  const [qOptions, setQOptions] = useState<string[]>(['', '']);
+  const [qCorrectIndex, setQCorrectIndex] = useState<number | null>(null);
+  const [qSource, setQSource] = useState('');
+  const [qTimeLimit, setQTimeLimit] = useState(20);
+
+  const addDraftQuestion = () => {
+    const question = qText.trim();
+    const options = qOptions.map((o) => o.trim()).filter(Boolean);
+    if (!question || options.length < 2 || qCorrectIndex === null) return;
+    setDraftQuestions((prev) => [...prev, {
+      id: `q_${Date.now().toString(36)}`,
+      question,
+      options: options.map((text, i) => ({ id: `opt_${i}`, text })),
+      correctOptionId: `opt_${qCorrectIndex}`,
+      source: qSource.trim() || undefined,
+      timeLimitSeconds: qTimeLimit,
+    }]);
+    setQText(''); setQOptions(['', '']); setQCorrectIndex(null); setQSource(''); setQTimeLimit(20);
+  };
+  const removeDraftQuestion = (id: string) => setDraftQuestions((prev) => prev.filter((q) => q.id !== id));
+
+  const sendQuizControl = (action: string, extra?: any) => {
+    channelRef.current?.send({ type: 'broadcast', event: 'quiz_control', payload: { action, ...extra } });
+  };
+  const startQuizFromPhone = () => {
+    if (!draftQuestions.length) return;
+    sendQuizControl('start_quiz', { questions: draftQuestions });
+    setDraftQuestions([]);
+  };
   // Mirrors `fileId` for use inside the mount-once broadcast handler below,
   // which would otherwise only ever see the fileId from the very first render.
   const fileIdRef = useRef<string | null>(null);
@@ -242,7 +314,7 @@ export default function MobileRemote() {
       try {
         const { data: extra } = await supabase
           .from('sessions')
-          .select('canvas_data, session_state')
+          .select('canvas_data, session_state, audience_state')
           .eq('id', session)
           .maybeSingle();
         if (extra?.canvas_data) {
@@ -257,6 +329,10 @@ export default function MobileRemote() {
           // Once unlocked, stay unlocked across reconnects instead of
           // re-prompting - only set requiredPin the first time we see it.
           if (s.pin) setRequiredPin((prev) => prev ?? s.pin);
+        }
+        if (extra?.audience_state) {
+          audienceStateRef.current = extra.audience_state as AudienceState;
+          setAudienceState(extra.audience_state as AudienceState);
         }
       } catch (drawErr) {
         console.error('🚨 Extra session data fetch error (non-blocking):', drawErr);
@@ -316,6 +392,15 @@ export default function MobileRemote() {
       room.on('broadcast', { event: 'video_time_update' }, (payload: any) => {
         const { playing, time, duration, volume } = payload.payload || {};
         if (typeof time === 'number') setVideoTime({ playing: !!playing, time, duration: duration || 0, volume: volume ?? 100 });
+      });
+
+      room.on('broadcast', { event: 'fullscreen_state' }, (payload: any) => {
+        if (typeof payload.payload?.active === 'boolean') setIsProjectorFullscreen(payload.payload.active);
+      });
+
+      room.on('broadcast', { event: 'audience_state_update' }, (payload: any) => {
+        const next = payload.payload?.audienceState as AudienceState | undefined;
+        if (next) { audienceStateRef.current = next; setAudienceState(next); }
       });
 
       // Presence: who else is currently connected to this session's
@@ -640,7 +725,7 @@ export default function MobileRemote() {
       if (now - lastSentTime.current < 16 && type === 'move') return;
       lastSentTime.current = now;
       const isActive = type !== 'end';
-      channelRef.current.send({ type: 'broadcast', event: 'spotlight_move', payload: { x, y, active: isActive, radius: 160 } });
+      channelRef.current.send({ type: 'broadcast', event: 'spotlight_move', payload: { x, y, active: isActive, radius: spotlightRadius } });
     } else if (activeMode === 'zoom') {
       // Dragging while in zoom mode pans; the +/- buttons (rendered below)
       // handle scale. Kept separate from laser/spotlight since it doesn't
@@ -734,7 +819,7 @@ export default function MobileRemote() {
       channelRef.current?.send({ type: 'broadcast', event: 'laser_move', payload: { x: myLaser.x, y: myLaser.y, active: false } });
     }
     if (activeMode === 'spotlight' && newMode !== 'spotlight') {
-      channelRef.current?.send({ type: 'broadcast', event: 'spotlight_move', payload: { x: 0.5, y: 0.5, active: false, radius: 160 } });
+      channelRef.current?.send({ type: 'broadcast', event: 'spotlight_move', payload: { x: 0.5, y: 0.5, active: false, radius: spotlightRadius } });
     }
 
     setActiveMode(newMode as ToolMode);
@@ -877,12 +962,16 @@ export default function MobileRemote() {
         </div>
         <div className="flex items-center gap-3">
           <button onClick={() => setLang(lang === 'ku' ? 'en' : 'ku')} className="bg-gray-800 px-3 py-1 rounded text-sm font-bold">{t.switchLang}</button>
+          <button onClick={() => setQuizPanelOpen(true)} className="bg-gray-800 w-8 h-8 rounded flex items-center justify-center text-base shrink-0 relative">
+            🧠
+            {quiz.status !== 'building' && quiz.status !== 'finished' && <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-red-500 animate-pulse" />}
+          </button>
           <button
-            onClick={toggleRemoteFullscreen}
-            aria-label={isFullscreen ? 'Exit full screen' : 'Full screen'}
+            onClick={requestProjectorFullscreen}
+            aria-label={isProjectorFullscreen ? 'Exit projector full screen' : 'Full screen the projector'}
             className="bg-gray-800 w-8 h-8 rounded flex items-center justify-center text-base shrink-0"
           >
-            {isFullscreen ? '🗗' : '⛶'}
+            {isProjectorFullscreen ? '🗗' : '⛶'}
           </button>
           <div className="bg-blue-600 px-3 py-1 rounded-full font-bold" style={{ direction: 'ltr' }}>{t.slide} {currentSlide}{flatSlides.length ? ` / ${flatSlides.length}` : ''}</div>
         </div>
@@ -892,13 +981,14 @@ export default function MobileRemote() {
           host's flatSlides list so it always matches the real slide count
           (fixes "slide 6 doesn't show" for good, since this can no longer
           drift from what's actually on screen). */}
-      <div className="w-full bg-gray-900 border-b border-gray-800 p-2 overflow-x-auto flex gap-2" style={{ direction: 'ltr' }}>
+      <div className="w-full bg-gray-900 border-b border-gray-800 p-2 overflow-x-auto flex gap-2 scroll-smooth" style={{ direction: 'ltr' }}>
         {flatSlides.map((slide, i) => (
           <button
             key={i}
+            ref={(el) => { if (currentSlide === i + 1) el?.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' }); }}
             onClick={() => updateSlide(i + 1)}
             disabled={!ready}
-            className={`min-w-[56px] h-14 rounded flex flex-col items-center justify-center font-bold text-xs gap-0.5 transition-all overflow-hidden ${currentSlide === i + 1 ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400'} ${!ready ? 'opacity-50 cursor-not-allowed' : ''}`}
+            className={`min-w-[56px] h-14 rounded flex flex-col items-center justify-center font-bold text-xs gap-0.5 transition-all duration-300 overflow-hidden ${currentSlide === i + 1 ? 'bg-blue-600 text-white scale-110 shadow-lg shadow-blue-600/30' : 'bg-gray-800 text-gray-400 scale-100'} ${!ready ? 'opacity-50 cursor-not-allowed' : ''}`}
           >
             {slide.thumbnail ? (
               <img src={slide.thumbnail} alt="" className="w-8 h-6 object-cover rounded-sm" />
@@ -954,9 +1044,15 @@ export default function MobileRemote() {
       {isVideoActive && (
         <div className="mx-4 mb-2 bg-gray-900 border border-gray-800 rounded-lg p-3 flex flex-col gap-2">
           <span className="text-xs text-gray-400 font-bold uppercase">{t.video}</span>
+          <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full w-fit ${videoTime.playing ? 'bg-green-900 text-green-400' : 'bg-gray-800 text-gray-500'}`}>
+            {videoTime.playing ? `▶ Playing` : `⏸ Paused`}
+          </span>
           <div className="flex items-center gap-2">
-            <button onClick={() => sendVideoControl(videoTime.playing ? 'pause' : 'play')} className="px-4 py-2 rounded-lg bg-blue-600 text-sm font-bold">
-              {videoTime.playing ? `⏸ ${t.pause}` : `▶ ${t.play}`}
+            <button onClick={() => sendVideoControl('play')} className="px-4 py-2 rounded-lg bg-green-600 text-sm font-bold">
+              ▶ {t.play}
+            </button>
+            <button onClick={() => sendVideoControl('pause')} className="px-4 py-2 rounded-lg bg-red-700 text-sm font-bold">
+              ⏸ {t.pause}
             </button>
             <button onClick={() => sendVideoControl('seek', Math.max(0, videoTime.time - 10))} className="px-3 py-2 rounded-lg bg-gray-800 text-sm">-10s</button>
             <button onClick={() => sendVideoControl('seek', videoTime.time + 10)} className="px-3 py-2 rounded-lg bg-gray-800 text-sm">+10s</button>
@@ -997,6 +1093,30 @@ export default function MobileRemote() {
             )}
           </div>
         </div>
+
+        {/* Spotlight size - only shown while spotlight mode is active. */}
+        {activeMode === 'spotlight' && (
+          <div className="flex items-center gap-3 mb-2 bg-gray-900 border border-gray-800 rounded-lg px-3 py-2">
+            <span className="text-xs text-gray-400 font-bold shrink-0">🔦 {t.spotlightSize}</span>
+            <button
+              onClick={() => setSpotlightRadius((r) => Math.max(60, r - 20))}
+              className="w-7 h-7 rounded-full bg-gray-800 text-white text-sm font-bold shrink-0"
+            >
+              −
+            </button>
+            <input
+              type="range" min={60} max={400} step={10} value={spotlightRadius}
+              onChange={(e) => setSpotlightRadius(Number(e.target.value))}
+              className="flex-1"
+            />
+            <button
+              onClick={() => setSpotlightRadius((r) => Math.min(400, r + 20))}
+              className="w-7 h-7 rounded-full bg-gray-800 text-white text-sm font-bold shrink-0"
+            >
+              +
+            </button>
+          </div>
+        )}
 
         {/* Zoom controls - only shown while zoom mode is active; drag on the trackpad below to pan. */}
         {activeMode === 'zoom' && (
@@ -1093,6 +1213,98 @@ export default function MobileRemote() {
           )}
         </div>
       </div>
+
+      {quizPanelOpen && (
+        <div className="fixed inset-0 z-[200] bg-black/80 flex items-end sm:items-center justify-center" onClick={() => setQuizPanelOpen(false)}>
+          <div
+            className="bg-gray-900 border border-gray-700 rounded-t-2xl sm:rounded-2xl w-full sm:max-w-lg max-h-[85vh] overflow-y-auto p-5 flex flex-col gap-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-bold">🧠 {t.quiz}</h3>
+              <button onClick={() => setQuizPanelOpen(false)} className="text-gray-400 hover:text-white text-xl leading-none">✕</button>
+            </div>
+
+            {quiz.status !== 'building' ? (
+              <div className="flex flex-col gap-3">
+                <p className="text-xs text-gray-400">{t.inProgress}: <span className="text-white font-semibold">{quiz.status}</span></p>
+                {quiz.status === 'lobby' && (
+                  <>
+                    <p className="text-xs text-gray-500">{Object.keys(quiz.participants).length} {t.participants}</p>
+                    <button onClick={() => sendQuizControl('advance')} disabled={Object.keys(quiz.participants).length === 0} className="bg-emerald-600 disabled:opacity-30 rounded-lg py-2.5 text-sm font-bold">▶ {t.beginQuiz}</button>
+                  </>
+                )}
+                {quiz.status === 'question' && (
+                  <>
+                    <p className="text-sm font-semibold">{quiz.questions[quiz.currentIndex]?.question}</p>
+                    <p className="text-xs text-gray-500">{Object.values(quiz.participants).filter((p) => p.answers[quiz.questions[quiz.currentIndex]?.id]).length}/{Object.keys(quiz.participants).length} answered</p>
+                    <button onClick={() => sendQuizControl('reveal_now')} className="bg-gray-700 hover:bg-gray-600 rounded-lg py-2.5 text-sm font-bold">{t.revealNow}</button>
+                  </>
+                )}
+                {quiz.status === 'reveal' && (
+                  <button onClick={() => sendQuizControl('advance')} className="bg-emerald-600 rounded-lg py-2.5 text-sm font-bold">
+                    {quiz.currentIndex >= quiz.questions.length - 1 ? '🏆 Leaderboard' : `${t.nextQ} ▶`}
+                  </button>
+                )}
+                {quiz.status === 'finished' && (
+                  <button onClick={() => sendQuizControl('reset')} className="bg-gray-700 hover:bg-gray-600 rounded-lg py-2.5 text-sm font-bold">🔄 {t.newQuiz}</button>
+                )}
+              </div>
+            ) : (
+              <div className="flex flex-col gap-3">
+                {draftQuestions.length > 0 && (
+                  <div className="flex flex-col gap-2">
+                    {draftQuestions.map((q, i) => (
+                      <div key={q.id} className="bg-gray-800/60 rounded-lg p-2.5 flex items-center justify-between gap-2">
+                        <span className="text-xs truncate">{i + 1}. {q.question}</span>
+                        <button onClick={() => removeDraftQuestion(q.id)} className="text-gray-500 hover:text-red-400 text-xs shrink-0">✕</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="flex flex-col gap-2.5 border-t border-gray-800 pt-3">
+                  <p className="text-xs font-bold text-gray-400 uppercase">{t.addQuestion}</p>
+                  <input value={qText} onChange={(e) => setQText(e.target.value)} placeholder="..." className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm" />
+                  {qOptions.map((opt, i) => (
+                    <div key={i} className="flex items-center gap-2">
+                      <button onClick={() => setQCorrectIndex(i)} className={`shrink-0 w-6 h-6 rounded-full border-2 flex items-center justify-center text-xs ${qCorrectIndex === i ? 'bg-emerald-600 border-emerald-500' : 'border-gray-600'}`}>
+                        {qCorrectIndex === i ? '✓' : ''}
+                      </button>
+                      <input
+                        value={opt}
+                        onChange={(e) => setQOptions((prev) => prev.map((o, j) => (j === i ? e.target.value : o)))}
+                        placeholder={`Option ${i + 1}`}
+                        className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm"
+                      />
+                      {qOptions.length > 2 && (
+                        <button onClick={() => setQOptions((prev) => prev.filter((_, j) => j !== i))} className="shrink-0 text-gray-500 text-sm">✕</button>
+                      )}
+                    </div>
+                  ))}
+                  {qOptions.length < 6 && (
+                    <button onClick={() => setQOptions((prev) => [...prev, ''])} className="text-xs text-blue-400 self-start">+ Option</button>
+                  )}
+                  <p className="text-[10px] text-gray-500">{t.correctMark}</p>
+                  <input value={qSource} onChange={(e) => setQSource(e.target.value)} placeholder="Source (optional)" className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs" />
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-gray-400">⏱ {t.timeLimit}</span>
+                    <input type="range" min={5} max={60} step={5} value={qTimeLimit} onChange={(e) => setQTimeLimit(Number(e.target.value))} className="flex-1" />
+                    <span className="text-xs font-mono w-10 text-right">{qTimeLimit}s</span>
+                  </div>
+                  <button onClick={addDraftQuestion} disabled={!qText.trim() || qCorrectIndex === null} className="bg-gray-700 disabled:opacity-30 rounded-lg py-2 text-sm font-bold">
+                    + {t.addQuestion}
+                  </button>
+                </div>
+
+                <button onClick={startQuizFromPhone} disabled={draftQuestions.length === 0} className="bg-emerald-600 disabled:opacity-30 rounded-lg py-2.5 text-sm font-bold">
+                  🚀 {t.startQuiz} ({draftQuestions.length})
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
