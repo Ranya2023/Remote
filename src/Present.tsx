@@ -47,6 +47,35 @@ const DEFAULT_ZOOM: ZoomState = { scale: 1, x: 0, y: 0 };
 const DEFAULT_VIDEO_STATE: VideoState = { playing: false, time: 0, duration: 0, volume: 100 };
 const DEFAULT_SESSION_STATE: SessionState = { screenMode: 'normal', zoom: DEFAULT_ZOOM, videoState: DEFAULT_VIDEO_STATE };
 
+// --- Audience-facing polls -------------------------------------------------
+// These shapes must stay in sync with AudienceJoin.tsx, which already
+// implements the voting UI, quiz reveal, Q&A, and reactions - this is the
+// presenter-side counterpart: creating polls, tallying votes, showing
+// results. Round-trips through the `audience_state` column + the
+// `audience_state_update` broadcast, same pattern as session_state.
+interface PollOption { id: string; text: string; votes: number; }
+interface PollState {
+  id: string;
+  question: string;
+  options: PollOption[];
+  isQuiz: boolean;
+  correctOptionId?: string;
+  status: 'live' | 'closed';
+  createdAt: number;
+}
+interface AudienceQuestion { id: string; text: string; upvotes: number; answered: boolean; createdAt: number; }
+type FeedbackKind = '👍' | '❤️' | '👏' | '🤔' | '🐢' | '🚀';
+type FeedbackCounts = Record<FeedbackKind, number>;
+const EMPTY_FEEDBACK: FeedbackCounts = { '👍': 0, '❤️': 0, '👏': 0, '🤔': 0, '🐢': 0, '🚀': 0 };
+interface AudienceState {
+  joinCount: number;
+  polls: PollState[];
+  questions: AudienceQuestion[];
+  feedback: FeedbackCounts;
+  qnaOpen: boolean;
+}
+const DEFAULT_AUDIENCE_STATE: AudienceState = { joinCount: 0, polls: [], questions: [], feedback: EMPTY_FEEDBACK, qnaOpen: true };
+
 interface Point { x: number; y: number; }
 type DrawMode = 'draw' | 'highlight' | 'erase';
 interface Stroke { points: Point[]; color: string; width: number; mode: DrawMode; }
@@ -249,6 +278,7 @@ export default function Present() {
   });
 
   const remoteUrl = `${window.location.origin}${window.location.pathname}#/remote?session=${sessionId}`;
+  const audienceUrl = `${window.location.origin}${window.location.pathname}#/audience?session=${sessionId}`;
   const wrapperRef = useRef<HTMLDivElement>(null);
   const channelRef = useRef<any>(null);
 
@@ -260,6 +290,56 @@ export default function Present() {
   // session, so the host can spot "two people are fighting over Next".
   const [connectedRemoteCount, setConnectedRemoteCount] = useState(0);
   const hostClientId = useMemo(() => `host_${Math.random().toString(36).slice(2)}`, []);
+
+  // --- Audience polls -------------------------------------------------
+  const [audienceState, setAudienceState] = useState<AudienceState>(DEFAULT_AUDIENCE_STATE);
+  const audienceStateRef = useRef<AudienceState>(DEFAULT_AUDIENCE_STATE);
+  useEffect(() => { audienceStateRef.current = audienceState; }, [audienceState]);
+  const [pollPanelOpen, setPollPanelOpen] = useState(false);
+  const [pollQuestion, setPollQuestion] = useState('');
+  const [pollType, setPollType] = useState<'mc' | 'tf'>('mc');
+  const [pollOptions, setPollOptions] = useState<string[]>(['', '']);
+  const [pollIsQuiz, setPollIsQuiz] = useState(false);
+  const [pollCorrectIndex, setPollCorrectIndex] = useState<number | null>(null);
+
+  const persistAudienceState = useCallback((next: AudienceState) => {
+    audienceStateRef.current = next;
+    setAudienceState(next);
+    supabase.from('sessions').upsert({ id: sessionId, audience_state: next }).then(({ error }) => {
+      if (error) console.error('🚨 audience_state upsert failed:', error.message, error);
+    });
+    channelRef.current?.send({ type: 'broadcast', event: 'audience_state_update', payload: { audienceState: next } });
+  }, [sessionId]);
+
+  const startPoll = () => {
+    const question = pollQuestion.trim();
+    const options = (pollType === 'tf' ? ['True', 'False'] : pollOptions.map((o) => o.trim()).filter(Boolean));
+    if (!question || options.length < 2) return;
+    const newPoll: PollState = {
+      id: `poll_${Date.now().toString(36)}`,
+      question,
+      options: options.map((text, i) => ({ id: `opt_${i}`, text, votes: 0 })),
+      isQuiz: pollIsQuiz,
+      correctOptionId: pollIsQuiz && pollCorrectIndex !== null ? `opt_${pollCorrectIndex}` : undefined,
+      status: 'live',
+      createdAt: Date.now(),
+    };
+    // Only one live poll at a time - auto-close any previous one.
+    const closedPrior = audienceStateRef.current.polls.map((p) => (p.status === 'live' ? { ...p, status: 'closed' as const } : p));
+    persistAudienceState({ ...audienceStateRef.current, polls: [...closedPrior, newPoll] });
+    setPollQuestion('');
+    setPollOptions(['', '']);
+    setPollIsQuiz(false);
+    setPollCorrectIndex(null);
+  };
+
+  const closePoll = (pollId: string) => {
+    const polls = audienceStateRef.current.polls.map((p) => (p.id === pollId ? { ...p, status: 'closed' as const } : p));
+    persistAudienceState({ ...audienceStateRef.current, polls });
+  };
+
+  const livePoll = audienceState.polls.find((p) => p.status === 'live');
+  const closedPolls = [...audienceState.polls].filter((p) => p.status === 'closed').reverse();
 
   const toggleFullscreen = () => {
     if (!wrapperRef.current) return;
@@ -341,7 +421,7 @@ export default function Present() {
     const setupSession = async () => {
       const { data } = await supabase
         .from('sessions')
-        .select('id, canvas_data, session_state')
+        .select('id, canvas_data, session_state, audience_state')
         .eq('id', sessionId)
         .single();
 
@@ -353,6 +433,7 @@ export default function Present() {
         await supabase.from('sessions').insert([{
           id: sessionId, file_id: fileId, current_slide: 1, canvas_data: {},
           session_state: { ...DEFAULT_SESSION_STATE, pin },
+          audience_state: DEFAULT_AUDIENCE_STATE,
         }]);
       } else {
         await supabase.from('sessions').update({ file_id: fileId }).eq('id', sessionId);
@@ -362,6 +443,10 @@ export default function Present() {
           if (s.screenMode) setScreenMode(s.screenMode);
           if (s.zoom) setZoom(s.zoom);
           if (s.pin) setSessionPin(s.pin);
+        }
+        if (data.audience_state) {
+          audienceStateRef.current = data.audience_state as AudienceState;
+          setAudienceState(data.audience_state as AudienceState);
         }
       }
     };
@@ -438,6 +523,22 @@ export default function Present() {
         else if (action === 'volume' && typeof value === 'number') postYouTubeCommand(iframe, 'setVolume', [value]);
         else if (action === 'mute') postYouTubeCommand(iframe, 'mute');
         else if (action === 'unmute') postYouTubeCommand(iframe, 'unMute');
+      });
+
+      channel.on('broadcast', { event: 'audience_vote' }, (payload) => {
+        const { pollId, optionId } = payload.payload || {};
+        if (!pollId || !optionId) return;
+        const current = audienceStateRef.current;
+        const polls = current.polls.map((p) => {
+          if (p.id !== pollId || p.status !== 'live') return p;
+          return { ...p, options: p.options.map((o) => (o.id === optionId ? { ...o, votes: o.votes + 1 } : o)) };
+        });
+        persistAudienceState({ ...current, polls });
+      });
+
+      channel.on('broadcast', { event: 'audience_join' }, () => {
+        const current = audienceStateRef.current;
+        persistAudienceState({ ...current, joinCount: current.joinCount + 1 });
       });
 
       channel.on('broadcast', { event: 'draw_stroke' }, (payload) => {
@@ -643,14 +744,22 @@ export default function Present() {
   // Only fires for YouTube embeds with enablejsapi=1 (see withPlaybackParams).
   useEffect(() => {
     let lastBroadcast = 0;
+    let lastPlayerState: number | null = null;
     function handleMessage(e: MessageEvent) {
       if (typeof e.data !== 'string') return;
       let data: any;
       try { data = JSON.parse(e.data); } catch { return; }
       if (data.event !== 'infoDelivery' || !data.info) return;
       const now = Date.now();
-      if (now - lastBroadcast < 900) return;
+      const stateChanged = data.info.playerState !== lastPlayerState;
+      // Always let an actual play/pause/state transition through immediately -
+      // only the repetitive "still playing at time X" ticks get throttled.
+      // Otherwise a quick pause right after a play can land inside the
+      // throttle window and get silently dropped, leaving the remote's
+      // Play/Pause button stuck showing the wrong state until the next tick.
+      if (!stateChanged && now - lastBroadcast < 900) return;
       lastBroadcast = now;
+      lastPlayerState = data.info.playerState;
       const next: VideoState = {
         playing: data.info.playerState === 1,
         time: data.info.currentTime || 0,
@@ -953,7 +1062,11 @@ export default function Present() {
     <div className="flex h-screen w-full bg-black text-white overflow-hidden">
       {/* Sidebar: QR code for the phone remote + session info */}
       <div className="w-80 bg-gray-900 border-r border-gray-800 p-6 flex flex-col items-center justify-between shrink-0">
-        <div className="w-full flex justify-end">
+        <div className="w-full flex justify-end gap-2">
+          <button onClick={() => setPollPanelOpen(true)} className="text-xs bg-emerald-600 hover:bg-emerald-700 px-3 py-1 rounded relative">
+            🗳️ Poll
+            {livePoll && <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse" />}
+          </button>
           <button onClick={toggleFullscreen} className="text-xs bg-blue-600 hover:bg-blue-700 px-3 py-1 rounded">
             Full Screen
           </button>
@@ -1113,6 +1226,176 @@ export default function Present() {
           )}
         </div>
       </div>
+
+      {pollPanelOpen && (
+        <div className="fixed inset-0 z-[100] bg-black/70 flex items-center justify-center p-4" onClick={() => setPollPanelOpen(false)}>
+          <div
+            className="bg-gray-900 border border-gray-700 rounded-2xl w-full max-w-lg max-h-[85vh] overflow-y-auto p-6 flex flex-col gap-5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-bold">🗳️ Audience Polls</h3>
+              <button onClick={() => setPollPanelOpen(false)} className="text-gray-400 hover:text-white text-xl leading-none">✕</button>
+            </div>
+
+            {/* Scan-to-join QR - only needs to be scanned once per audience member,
+                after which every poll (live or future) reaches them automatically. */}
+            <div className="flex items-center gap-4 bg-gray-800 rounded-xl p-4">
+              <div className="bg-white p-2 rounded-lg shrink-0">
+                <QRCodeSVG value={audienceUrl} size={88} />
+              </div>
+              <div className="text-xs text-gray-400">
+                <p className="text-white font-semibold mb-1">Scan to join as audience</p>
+                <p>Anyone who scans this can vote on polls, ask questions, and react - but can't control slides.</p>
+                <p className="mt-1 text-gray-500">{audienceState.joinCount} joined so far</p>
+              </div>
+            </div>
+
+            {livePoll ? (
+              <div className="flex flex-col gap-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-emerald-400 uppercase flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" /> Live now
+                  </span>
+                  <button onClick={() => closePoll(livePoll.id)} className="text-xs bg-red-700 hover:bg-red-600 px-3 py-1 rounded-full font-bold">
+                    End poll
+                  </button>
+                </div>
+                <PollResultsChart poll={livePoll} />
+              </div>
+            ) : (
+              <div className="flex flex-col gap-3">
+                <p className="text-xs font-bold text-gray-400 uppercase">New poll</p>
+                <input
+                  value={pollQuestion}
+                  onChange={(e) => setPollQuestion(e.target.value)}
+                  placeholder="Ask a question..."
+                  className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                />
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setPollType('mc')}
+                    className={`flex-1 text-xs py-2 rounded-lg font-semibold ${pollType === 'mc' ? 'bg-emerald-600' : 'bg-gray-800 text-gray-400'}`}
+                  >
+                    Multiple choice
+                  </button>
+                  <button
+                    onClick={() => setPollType('tf')}
+                    className={`flex-1 text-xs py-2 rounded-lg font-semibold ${pollType === 'tf' ? 'bg-emerald-600' : 'bg-gray-800 text-gray-400'}`}
+                  >
+                    True / False
+                  </button>
+                </div>
+
+                {pollType === 'mc' && (
+                  <div className="flex flex-col gap-2">
+                    {pollOptions.map((opt, i) => (
+                      <div key={i} className="flex items-center gap-2">
+                        {pollIsQuiz && (
+                          <button
+                            onClick={() => setPollCorrectIndex(i)}
+                            title="Mark as correct answer"
+                            className={`shrink-0 w-6 h-6 rounded-full border-2 flex items-center justify-center text-xs ${pollCorrectIndex === i ? 'bg-emerald-600 border-emerald-500' : 'border-gray-600'}`}
+                          >
+                            {pollCorrectIndex === i ? '✓' : ''}
+                          </button>
+                        )}
+                        <input
+                          value={opt}
+                          onChange={(e) => setPollOptions((prev) => prev.map((o, j) => (j === i ? e.target.value : o)))}
+                          placeholder={`Option ${i + 1}`}
+                          className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm"
+                        />
+                        {pollOptions.length > 2 && (
+                          <button
+                            onClick={() => setPollOptions((prev) => prev.filter((_, j) => j !== i))}
+                            className="shrink-0 text-gray-500 hover:text-red-400 text-sm"
+                          >
+                            ✕
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                    {pollOptions.length < 6 && (
+                      <button onClick={() => setPollOptions((prev) => [...prev, ''])} className="text-xs text-blue-400 self-start">
+                        + Add option
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {pollType === 'tf' && pollIsQuiz && (
+                  <div className="flex gap-2">
+                    {['True', 'False'].map((label, i) => (
+                      <button
+                        key={label}
+                        onClick={() => setPollCorrectIndex(i)}
+                        className={`flex-1 text-xs py-2 rounded-lg font-semibold border-2 ${pollCorrectIndex === i ? 'bg-emerald-600 border-emerald-500' : 'border-gray-700 text-gray-400'}`}
+                      >
+                        {label} is correct
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                <label className="flex items-center gap-2 text-xs text-gray-400">
+                  <input type="checkbox" checked={pollIsQuiz} onChange={(e) => { setPollIsQuiz(e.target.checked); setPollCorrectIndex(null); }} />
+                  This is a quiz (mark a correct answer, audience gets right/wrong feedback)
+                </label>
+
+                <button
+                  onClick={startPoll}
+                  disabled={!pollQuestion.trim() || (pollIsQuiz && pollCorrectIndex === null)}
+                  className="bg-emerald-600 disabled:opacity-30 rounded-lg py-2.5 text-sm font-bold"
+                >
+                  Start poll
+                </button>
+              </div>
+            )}
+
+            {closedPolls.length > 0 && (
+              <div className="flex flex-col gap-3 pt-3 border-t border-gray-800">
+                <p className="text-xs font-bold text-gray-500 uppercase">Past polls</p>
+                {closedPolls.map((p) => (
+                  <PollResultsChart key={p.id} poll={p} compact />
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PollResultsChart({ poll, compact }: { poll: PollState; compact?: boolean }) {
+  const total = poll.options.reduce((s, o) => s + o.votes, 0);
+  return (
+    <div className={compact ? 'bg-gray-800/60 rounded-lg p-3' : ''}>
+      <p className={`font-semibold mb-2 ${compact ? 'text-xs text-gray-300' : 'text-sm'}`}>
+        {poll.isQuiz ? '❓ ' : ''}{poll.question}
+      </p>
+      <div className="flex flex-col gap-1.5">
+        {poll.options.map((opt) => {
+          const pct = total ? Math.round((opt.votes / total) * 100) : 0;
+          const isCorrect = poll.isQuiz && poll.correctOptionId === opt.id;
+          return (
+            <div key={opt.id} className="flex items-center gap-2">
+              <div className="flex-1 h-6 bg-gray-800 rounded overflow-hidden relative">
+                <div
+                  className={`h-full transition-all duration-500 ${isCorrect ? 'bg-emerald-600' : 'bg-blue-600'}`}
+                  style={{ width: `${pct}%` }}
+                />
+                <span className="absolute inset-0 flex items-center px-2 text-[11px] font-medium">
+                  {opt.text}{isCorrect ? ' ✓' : ''}
+                </span>
+              </div>
+              <span className="text-[11px] text-gray-400 w-14 text-right shrink-0">{opt.votes} · {pct}%</span>
+            </div>
+          );
+        })}
+      </div>
+      <p className="text-[10px] text-gray-500 mt-1">{total} vote{total === 1 ? '' : 's'} total</p>
     </div>
   );
 }

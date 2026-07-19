@@ -115,6 +115,30 @@ export default function MobileRemote() {
   const [fileId, setFileId] = useState<string | null>(null);
   const [preview, setPreview] = useState<ResolvedPreview>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
+
+  // Fullscreen for the phone itself - separate from the presenter's own
+  // "Full Screen" button, which only affects the projector screen.
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  useEffect(() => {
+    const onChange = () => setIsFullscreen(!!document.fullscreenElement || !!(document as any).webkitFullscreenElement);
+    document.addEventListener('fullscreenchange', onChange);
+    document.addEventListener('webkitfullscreenchange', onChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', onChange);
+      document.removeEventListener('webkitfullscreenchange', onChange);
+    };
+  }, []);
+  const toggleRemoteFullscreen = () => {
+    const el = document.documentElement as any;
+    const isFs = !!document.fullscreenElement || !!(document as any).webkitFullscreenElement;
+    if (!isFs) {
+      const req = el.requestFullscreen || el.webkitRequestFullscreen;
+      req?.call(el).catch(() => { /* not supported (e.g. iOS Safari) - button just stays a no-op */ });
+    } else {
+      const exit = (document as any).exitFullscreen || (document as any).webkitExitFullscreen;
+      exit?.call(document);
+    }
+  };
   const [trackpadWidth, setTrackpadWidth] = useState(0);
   const lastFetchedFileId = useRef<string | null>(null);
   // Mirrors `fileId` for use inside the mount-once broadcast handler below,
@@ -853,6 +877,13 @@ export default function MobileRemote() {
         </div>
         <div className="flex items-center gap-3">
           <button onClick={() => setLang(lang === 'ku' ? 'en' : 'ku')} className="bg-gray-800 px-3 py-1 rounded text-sm font-bold">{t.switchLang}</button>
+          <button
+            onClick={toggleRemoteFullscreen}
+            aria-label={isFullscreen ? 'Exit full screen' : 'Full screen'}
+            className="bg-gray-800 w-8 h-8 rounded flex items-center justify-center text-base shrink-0"
+          >
+            {isFullscreen ? '🗗' : '⛶'}
+          </button>
           <div className="bg-blue-600 px-3 py-1 rounded-full font-bold" style={{ direction: 'ltr' }}>{t.slide} {currentSlide}{flatSlides.length ? ` / ${flatSlides.length}` : ''}</div>
         </div>
       </div>
@@ -1007,6 +1038,11 @@ export default function MobileRemote() {
           onMouseDown={handleTouchStart} onMouseMove={handleTouchMove} onMouseUp={handleTouchEnd} onMouseLeave={handleTouchEnd}
           className={`flex-1 w-full min-h-0 rounded-2xl border-2 flex items-center justify-center transition-colors relative touch-none overflow-hidden bg-white ${activeMode !== 'none' && ready ? 'border-yellow-500' : 'border-gray-800'}`}
         >
+          {!isVideoActive && (
+            <span className="absolute top-2 left-2 z-40 bg-black/70 text-white text-[9px] font-bold px-2 py-0.5 rounded-full flex items-center gap-1 pointer-events-none">
+              <span className="w-1.5 h-1.5 rounded-full bg-red-500" /> LIVE
+            </span>
+          )}
           {isVideoActive ? (
             <div className="flex flex-col items-center gap-2 pointer-events-none text-black">
               <span className="text-5xl">▶️</span>
