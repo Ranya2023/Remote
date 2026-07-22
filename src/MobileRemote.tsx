@@ -1,8 +1,13 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Document, Page, pdfjs } from 'react-pdf';
 import { supabase } from './supabaseClient';
+// Bundled locally instead of fetched from unpkg.com at runtime - see the
+// matching comment in Present.tsx for why (unpkg is a third-party CDN
+// request that can silently fail on a restricted/school network, breaking
+// every PDF preview while images keep working fine).
+import pdfWorkerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
-pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
+pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerSrc;
 
 const GAS_URL = 'https://script.google.com/macros/s/AKfycbx48s5aNamkERYuvJ-BE7-RBF2zt15mFZ-C-SXL_UIGZkG46RdyuPYIOlO6o0HZcr3N/exec';
 
@@ -14,6 +19,8 @@ const texts = {
     spotlight: 'تیشک', zoom: 'زووم', black: 'ڕەشکردنەوە', white: 'سپیکردنەوە', notes: 'تێبینی', hideNotes: 'شاردنەوە',
     spotlightSize: 'قەبارە',
     play: 'لێدان', pause: 'وەستان', mute: 'بێدەنگ', unmute: 'دەنگ', reset: 'ڕێکخستنەوە', video: 'ڤیدیۆ',
+    videoLoading: 'چاوەڕوانی ڤیدیۆ بۆ دەستپێکردن...',
+    startLesson: 'دەستپێکردنی وانە', startLessonSent: 'نێردرا - چاوەڕێ بە بۆ دەرکەوتنی سلایدەکان لە سەرەوە',
     start: 'دەستپێکردن', minutesLabel: 'خولەک', undo: 'گەڕانەوە', first: 'یەکەم', last: 'کۆتایی',
     quiz: 'کویز', addQuestion: 'زیادکردنی پرسیار', startQuiz: 'دەستپێکردنی کویز', beginQuiz: 'دەستپێکردن',
     nextQ: 'دواتر', revealNow: 'دەرخستنی ئێستا', newQuiz: 'کویزی نوێ', question: 'پرسیار',
@@ -27,6 +34,8 @@ const texts = {
     spotlight: 'Spotlight', zoom: 'Zoom', black: 'Black screen', white: 'White screen', notes: 'Notes', hideNotes: 'Hide',
     spotlightSize: 'Size',
     play: 'Play', pause: 'Pause', mute: 'Mute', unmute: 'Unmute', reset: 'Reset', video: 'Video',
+    videoLoading: 'Waiting for video to start...',
+    startLesson: 'Start the lesson and wait until slides show above', startLessonSent: 'Sent - watch the projector screen',
     start: 'Start', minutesLabel: 'min', undo: 'Undo', first: 'First', last: 'Last',
     quiz: 'Quiz', addQuestion: 'Add question', startQuiz: 'Start quiz', beginQuiz: 'Begin quiz',
     nextQ: 'Next', revealNow: 'Reveal now', newQuiz: 'New quiz', question: 'Question',
@@ -58,7 +67,7 @@ interface VideoTime { playing: boolean; time: number; duration: number; volume: 
 type ResolvedPreview =
   | { fileType: 'pdf'; data: Uint8Array }
   | { fileType: 'image'; url: string }
-  | { fileType: 'video-link'; name?: string }
+  | { fileType: 'video-link'; name?: string; embedUrl?: string; platform?: string }
   | { fileType: 'other'; name?: string }
   | null;
 
@@ -75,20 +84,74 @@ type ToolMode = 'none' | 'laser' | DrawMode | 'spotlight' | 'zoom';
 
 const TYPE_ICON: Record<string, string> = { pdf: '📄', image: '🖼️', 'video-link': '▶️', other: '📁' };
 
+function isYouTubeEmbed(embedUrl: string, platform?: string): boolean {
+  try {
+    const url = new URL(embedUrl);
+    return platform === 'youtube' || url.hostname.includes('youtube.com') || url.hostname.includes('youtu.be');
+  } catch {
+    return false;
+  }
+}
+
+// Same idea as the loader in Present.tsx: loads YouTube's official IFrame
+// Player API once and resolves when window.YT.Player is usable. Used here
+// for the Pro-mode "mirror" player (see the sync effect in the component
+// below) - a second, muted player on the phone that's driven to match
+// whatever the projector's player is doing, rather than an independent
+// playback timeline of its own.
+let ytApiLoadPromise: Promise<void> | null = null;
+function loadYouTubeIframeAPI(): Promise<void> {
+  if (typeof window === 'undefined') return Promise.resolve();
+  const w = window as any;
+  if (w.YT && w.YT.Player) return Promise.resolve();
+  if (ytApiLoadPromise) return ytApiLoadPromise;
+  ytApiLoadPromise = new Promise((resolve) => {
+    const previous = w.onYouTubeIframeAPIReady;
+    w.onYouTubeIframeAPIReady = () => {
+      previous?.();
+      resolve();
+    };
+    if (!document.querySelector('script[src="https://www.youtube.com/iframe_api"]')) {
+      const tag = document.createElement('script');
+      tag.src = 'https://www.youtube.com/iframe_api';
+      document.head.appendChild(tag);
+    }
+  });
+  return ytApiLoadPromise;
+}
+
+// Muted, controls-hidden, jsapi-enabled - this is a passive mirror the
+// person can't accidentally poke, not a second set of controls.
+function mirrorPlaybackUrl(embedUrl: string): string {
+  try {
+    const url = new URL(embedUrl);
+    url.searchParams.set('enablejsapi', '1');
+    url.searchParams.set('mute', '1');
+    url.searchParams.set('playsinline', '1');
+    url.searchParams.set('controls', '0');
+    url.searchParams.set('origin', window.location.origin);
+    return url.toString();
+  } catch {
+    return embedUrl;
+  }
+}
+
 // --- Quiz types - MUST stay byte-for-byte in sync with Present.tsx /
 // AudienceJoin.tsx, since this is all one JSON shape round-tripping
 // through Supabase + broadcast.
 interface QuizOption { id: string; text: string; imageUrl?: string; }
+type QuizQuestionType = 'mcq' | 'short' | 'long';
 interface QuizQuestion {
   id: string;
+  type: QuizQuestionType;
   question: string;
   options: QuizOption[];
   correctOptionId: string;
   source?: string;
   timeLimitSeconds: number;
 }
-interface QuizAnswerRecord { optionId: string; answeredAt: number; correct: boolean; points: number; }
-interface QuizParticipant { id: string; name: string; joinedAt: number; totalScore: number; answers: Record<string, QuizAnswerRecord>; }
+interface QuizAnswerRecord { optionId: string; text?: string; answeredAt: number; correct: boolean; points: number; }
+interface QuizParticipant { id: string; name: string; emoji?: string; joinedAt: number; totalScore: number; answers: Record<string, QuizAnswerRecord>; }
 type QuizStatus = 'building' | 'lobby' | 'question' | 'reveal' | 'finished';
 interface QuizState {
   questions: QuizQuestion[];
@@ -96,18 +159,21 @@ interface QuizState {
   status: QuizStatus;
   questionStartedAt: number | null;
   participants: Record<string, QuizParticipant>;
+  spotlightParticipantId?: string | null;
 }
-const DEFAULT_QUIZ_STATE: QuizState = { questions: [], currentIndex: -1, status: 'building', questionStartedAt: null, participants: {} };
+const DEFAULT_QUIZ_STATE: QuizState = { questions: [], currentIndex: -1, status: 'building', questionStartedAt: null, participants: {}, spotlightParticipantId: null };
+interface SavedQuiz { id: string; title: string; questions: QuizQuestion[]; createdAt: number; }
 interface AudienceQuestion { id: string; text: string; upvotes: number; answered: boolean; createdAt: number; }
 type FeedbackKind = '👍' | '❤️' | '👏' | '🤔' | '🐢' | '🚀';
 interface AudienceState {
   joinCount: number;
   quiz: QuizState;
+  savedQuizzes: SavedQuiz[];
   questions: AudienceQuestion[];
   feedback: Record<FeedbackKind, number>;
   qnaOpen: boolean;
 }
-const DEFAULT_AUDIENCE_STATE: AudienceState = { joinCount: 0, quiz: DEFAULT_QUIZ_STATE, questions: [], feedback: { '👍': 0, '❤️': 0, '👏': 0, '🤔': 0, '🐢': 0, '🚀': 0 }, qnaOpen: true };
+const DEFAULT_AUDIENCE_STATE: AudienceState = { joinCount: 0, quiz: DEFAULT_QUIZ_STATE, savedQuizzes: [], questions: [], feedback: { '👍': 0, '❤️': 0, '👏': 0, '🤔': 0, '🐢': 0, '🚀': 0 }, qnaOpen: true };
 
 export default function MobileRemote() {
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -121,6 +187,43 @@ export default function MobileRemote() {
   const [selectedColor, setSelectedColor] = useState('#eab308');
   const [lang, setLang] = useState<'ku' | 'en'>('ku');
   const t = texts[lang];
+
+  // "Classic" is the original layout, untouched. "Pro" is an alternate
+  // visual theme (see the nx-* class hooks + index.css) that also mirrors
+  // the projector's actual video content (muted) instead of the "preview
+  // not shown" placeholder classic mode still uses. Persisted so it sticks
+  // between sessions.
+  const [uiMode, setUiMode] = useState<'classic' | 'pro'>(() => {
+    try { return (localStorage.getItem('nextslide_remote_ui_mode') as 'classic' | 'pro') || 'classic'; } catch { return 'classic'; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('nextslide_remote_ui_mode', uiMode); } catch { /* private mode etc. - not persisted this time, not fatal */ }
+  }, [uiMode]);
+
+  // Custom background color for the remote's own screen (cosmetic only -
+  // doesn't touch the projector). All the remote's text is white, so the
+  // palette below is deliberately kept to dark tones that stay readable;
+  // 'default' means "don't override" and falls back to the normal
+  // black/pro-theme background. Persisted the same way as uiMode.
+  const BG_COLOR_PRESETS: { id: string; label: string; swatch: string }[] = [
+    { id: 'default', label: 'Default', swatch: '#000000' },
+    { id: '#0f172a', label: 'Slate', swatch: '#0f172a' },
+    { id: '#1e1b4b', label: 'Indigo', swatch: '#1e1b4b' },
+    { id: '#3b0764', label: 'Purple', swatch: '#3b0764' },
+    { id: '#4a044e', label: 'Fuchsia', swatch: '#4a044e' },
+    { id: '#4c0519', label: 'Rose', swatch: '#4c0519' },
+    { id: '#052e16', label: 'Green', swatch: '#052e16' },
+    { id: '#082f49', label: 'Sky', swatch: '#082f49' },
+    { id: '#451a03', label: 'Amber', swatch: '#451a03' },
+    { id: '#18181b', label: 'Charcoal', swatch: '#18181b' },
+  ];
+  const [bgColor, setBgColor] = useState<string>(() => {
+    try { return localStorage.getItem('nextslide_remote_bg_color') || 'default'; } catch { return 'default'; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('nextslide_remote_bg_color', bgColor); } catch { /* not fatal */ }
+  }, [bgColor]);
+  const [bgPickerOpen, setBgPickerOpen] = useState(false);
 
   // PIN gate (soft client-side lock) - if the host set a PIN when the
   // session was created, the remote must enter it before it can control
@@ -150,6 +253,14 @@ export default function MobileRemote() {
   const [timerSecondsLeft, setTimerSecondsLeft] = useState<number | null>(null);
   const [timerRunning, setTimerRunning] = useState(false);
   const [timerPanelOpen, setTimerPanelOpen] = useState(false);
+  // Mute switch (skips vibration + beep) and "also show a big countdown on
+  // the projector" switch - both purely local to this phone, but the latter
+  // gets broadcast to Present.tsx so it knows whether to render anything.
+  const [timerSilent, setTimerSilent] = useState(false);
+  const [timerShowOnProjector, setTimerShowOnProjector] = useState(false);
+  // Big flash number shown briefly at 59s-left, the last 3 seconds, and 0 -
+  // both on this phone and (if timerShowOnProjector) on the projector.
+  const [timerBigAlert, setTimerBigAlert] = useState<string | null>(null);
   const trackpadRef = useRef<HTMLDivElement>(null);
   const lastSentTime = useRef<number>(0);
   const isDrawing = useRef(false);
@@ -169,6 +280,15 @@ export default function MobileRemote() {
   const requestProjectorFullscreen = () => {
     channelRef.current?.send({ type: 'broadcast', event: 'fullscreen_toggle', payload: {} });
   };
+  // "Start the lesson" button - a plain full-page reload of the projector
+  // tab, for the common case where it was left open from before class (or
+  // just seems stuck) and the teacher wants a guaranteed clean start.
+  const [reloadJustSent, setReloadJustSent] = useState(false);
+  const requestProjectorReload = () => {
+    channelRef.current?.send({ type: 'broadcast', event: 'presenter_reload', payload: {} });
+    setReloadJustSent(true);
+    setTimeout(() => setReloadJustSent(false), 4000);
+  };
   const [trackpadWidth, setTrackpadWidth] = useState(0);
   const lastFetchedFileId = useRef<string | null>(null);
 
@@ -183,24 +303,40 @@ export default function MobileRemote() {
 
   const [quizPanelOpen, setQuizPanelOpen] = useState(false);
   const [draftQuestions, setDraftQuestions] = useState<QuizQuestion[]>([]);
+  const [qType, setQType] = useState<QuizQuestionType>('mcq');
   const [qText, setQText] = useState('');
   const [qOptions, setQOptions] = useState<string[]>(['', '']);
   const [qCorrectIndex, setQCorrectIndex] = useState<number | null>(null);
   const [qSource, setQSource] = useState('');
   const [qTimeLimit, setQTimeLimit] = useState(20);
+  const [saveTitle, setSaveTitle] = useState('');
 
   const addDraftQuestion = () => {
     const question = qText.trim();
-    const options = qOptions.map((o) => o.trim()).filter(Boolean);
-    if (!question || options.length < 2 || qCorrectIndex === null) return;
-    setDraftQuestions((prev) => [...prev, {
-      id: `q_${Date.now().toString(36)}`,
-      question,
-      options: options.map((text, i) => ({ id: `opt_${i}`, text })),
-      correctOptionId: `opt_${qCorrectIndex}`,
-      source: qSource.trim() || undefined,
-      timeLimitSeconds: qTimeLimit,
-    }]);
+    if (!question) return;
+    if (qType === 'mcq') {
+      const options = qOptions.map((o) => o.trim()).filter(Boolean);
+      if (options.length < 2 || qCorrectIndex === null) return;
+      setDraftQuestions((prev) => [...prev, {
+        id: `q_${Date.now().toString(36)}`,
+        type: 'mcq',
+        question,
+        options: options.map((text, i) => ({ id: `opt_${i}`, text })),
+        correctOptionId: `opt_${qCorrectIndex}`,
+        source: qSource.trim() || undefined,
+        timeLimitSeconds: qTimeLimit,
+      }]);
+    } else {
+      setDraftQuestions((prev) => [...prev, {
+        id: `q_${Date.now().toString(36)}`,
+        type: qType,
+        question,
+        options: [],
+        correctOptionId: '',
+        source: qSource.trim() || undefined,
+        timeLimitSeconds: qTimeLimit,
+      }]);
+    }
     setQText(''); setQOptions(['', '']); setQCorrectIndex(null); setQSource(''); setQTimeLimit(20);
   };
   const removeDraftQuestion = (id: string) => setDraftQuestions((prev) => prev.filter((q) => q.id !== id));
@@ -222,12 +358,27 @@ export default function MobileRemote() {
   const [screenMode, setScreenMode] = useState<ScreenMode>('normal');
   const [zoom, setZoom] = useState<ZoomState>({ scale: 1, x: 0, y: 0 });
   const [videoTime, setVideoTime] = useState<VideoTime>({ playing: false, time: 0, duration: 0, volume: 100 });
+  // Always-current copy of videoTime for the mirror-sync interval below to
+  // read - a plain closure over videoTime would only ever see whatever it
+  // was when that effect last ran, not the latest broadcast.
+  const videoTimeRef = useRef(videoTime);
+  useEffect(() => { videoTimeRef.current = videoTime; }, [videoTime]);
+  // Pro-mode muted video mirror (see the sync effect further down).
+  const mirrorIframeRef = useRef<HTMLIFrameElement>(null);
+  const mirrorPlayerRef = useRef<any>(null);
   const [notesOpen, setNotesOpen] = useState(true);
 
   // Local laser preview — mirrors what gets broadcast, so the phone shows
   // the exact same dot (position + on/off) as the projector.
   const [myLaser, setMyLaser] = useState({ x: 0.5, y: 0.5, active: false });
   const zoomDrag = useRef<{ lastX: number; lastY: number } | null>(null);
+  // Two-finger pinch-to-zoom on the trackpad - independent of activeMode
+  // (works no matter what tool is selected, same as it would on a native
+  // photo viewer), so nobody has to switch into "zoom" mode first just to
+  // pinch in on a chart or a line of small text.
+  const pinchRef = useRef<{ startDist: number; startScale: number } | null>(null);
+  const PINCH_MIN_SCALE = 1;
+  const PINCH_MAX_SCALE = 4;
 
   // Keeps a reliable "current slide" value for use inside refs/effects
   // that shouldn't go stale (canvas resize callbacks, etc).
@@ -239,6 +390,9 @@ export default function MobileRemote() {
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
   const allDrawingsRef = useRef<CanvasDataMap>({});
   const currentLineRef = useRef<Point[]>([]);
+  // Pixel coords of the last point of the in-progress local stroke - see
+  // sendPointerData's 'move' branch for why this is needed.
+  const lastStrokePxRef = useRef<{ x: number; y: number } | null>(null);
 
   const activeFlat = flatSlides[currentSlide - 1];
 
@@ -510,15 +664,11 @@ export default function MobileRemote() {
 
   // Fires once when the countdown reaches zero: a vibration pattern plus a
   // short tone, so it's noticeable even if the phone's face-down or the
-  // presenter isn't looking at it right at that second.
+  // presenter isn't looking at it right at that second. Silenced entirely
+  // when the mute switch is on.
   const timerAlertFiredRef = useRef(false);
-  useEffect(() => {
-    if (timerSecondsLeft !== 0) { timerAlertFiredRef.current = false; return; }
-    if (timerAlertFiredRef.current) return;
-    timerAlertFiredRef.current = true;
-
-    if (navigator.vibrate) navigator.vibrate([200, 100, 200, 100, 200]);
-
+  const playAlertTone = (frequency: number, durationSec: number) => {
+    if (timerSilent) return;
     try {
       const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
       const ctx = new AudioCtx();
@@ -527,15 +677,63 @@ export default function MobileRemote() {
       osc.connect(gain);
       gain.connect(ctx.destination);
       osc.type = 'sine';
-      osc.frequency.value = 880;
+      osc.frequency.value = frequency;
       gain.gain.setValueAtTime(0.2, ctx.currentTime);
       osc.start();
-      osc.stop(ctx.currentTime + 0.5);
+      osc.stop(ctx.currentTime + durationSec);
       osc.onended = () => ctx.close();
     } catch (err) {
       console.warn('⚠️ Timer beep unavailable:', err);
     }
-  }, [timerSecondsLeft]);
+  };
+  useEffect(() => {
+    if (timerSecondsLeft !== 0) { timerAlertFiredRef.current = false; return; }
+    if (timerAlertFiredRef.current) return;
+    timerAlertFiredRef.current = true;
+    if (!timerSilent && navigator.vibrate) navigator.vibrate([200, 100, 200, 100, 200]);
+    playAlertTone(880, 0.5);
+  }, [timerSecondsLeft]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Big flash alerts: under a minute left (59s), the final 3-2-1 countdown,
+  // and the end. Shown big on this phone, and - if timerShowOnProjector is
+  // on - broadcast so the projector flashes the same number at the same
+  // moment. Fires once per threshold, driven off timerSecondsLeft ticking
+  // down through it (not off a fixed schedule), so pausing/resuming the
+  // timer can't cause double-fires or skips.
+  const firedThresholdsRef = useRef<Set<number>>(new Set());
+  useEffect(() => {
+    if (timerSecondsLeft === null) { firedThresholdsRef.current = new Set(); return; }
+    const thresholds = [59, 3, 2, 1, 0];
+    if (!thresholds.includes(timerSecondsLeft) || firedThresholdsRef.current.has(timerSecondsLeft)) return;
+    firedThresholdsRef.current.add(timerSecondsLeft);
+
+    const label = timerSecondsLeft === 0 ? '0' : String(timerSecondsLeft);
+    setTimerBigAlert(label);
+    if (!timerSilent) {
+      if (timerSecondsLeft === 0) { /* handled by the zero-alert effect above */ }
+      else playAlertTone(timerSecondsLeft <= 3 ? 660 : 523, 0.18);
+    }
+    const flashMs = timerSecondsLeft === 0 ? 1600 : 900;
+    const clearTimer = setTimeout(() => setTimerBigAlert((cur) => (cur === label ? null : cur)), flashMs);
+
+    if (timerShowOnProjector) {
+      channelRef.current?.send({ type: 'broadcast', event: 'timer_alert', payload: { label, flashMs } });
+    }
+    return () => clearTimeout(clearTimer);
+  }, [timerSecondsLeft, timerShowOnProjector]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Keeps the projector's mirrored countdown in sync whenever anything
+  // relevant changes - including toggling "show on projector" itself, so
+  // switching it on immediately shows the current number instead of
+  // waiting for the next tick, and switching it off immediately hides it.
+  useEffect(() => {
+    if (!ready) return;
+    channelRef.current?.send({
+      type: 'broadcast',
+      event: 'timer_state',
+      payload: { secondsLeft: timerSecondsLeft, running: timerRunning, visible: timerShowOnProjector },
+    });
+  }, [timerSecondsLeft, timerRunning, timerShowOnProjector, ready]);
 
   // Fetches whatever the active slide actually is - pdf, image, or just
   // metadata for video/other (video is controlled remotely, not mirrored,
@@ -572,7 +770,7 @@ export default function MobileRemote() {
           return;
         }
         if (result.embedUrl) {
-          setPreview({ fileType: 'video-link', name: result.name });
+          setPreview({ fileType: 'video-link', name: result.name, embedUrl: result.embedUrl, platform: result.platform });
           return;
         }
         if (result.data && result.mimeType) {
@@ -600,6 +798,60 @@ export default function MobileRemote() {
     };
     fetchFile();
   }, [fileId]);
+
+  // Pro-mode video mirror: when the new theme is active and the current
+  // slide is a YouTube video, binds a real (muted) YT.Player to the
+  // phone's own iframe and drives it to match videoTime - not an
+  // independent playback timeline, just a passive follower. Classic mode
+  // never runs this at all (see the "Preview not shown here..." message
+  // still used there), so nothing about the original behavior changes
+  // unless the person has actually switched to Pro.
+  useEffect(() => {
+    if (uiMode !== 'pro') return;
+    if (preview?.fileType !== 'video-link' || !preview.embedUrl) return;
+    if (!isYouTubeEmbed(preview.embedUrl, preview.platform)) return;
+    const iframe = mirrorIframeRef.current;
+    if (!iframe) return;
+
+    let cancelled = false;
+    let syncInterval: ReturnType<typeof setInterval> | null = null;
+
+    loadYouTubeIframeAPI().then(() => {
+      if (cancelled) return;
+      const YT = (window as any).YT;
+      mirrorPlayerRef.current = new YT.Player(iframe, {
+        events: {
+          onReady: (e: any) => { try { e.target.mute(); } catch { /* ignore */ } },
+        },
+      });
+      syncInterval = setInterval(() => {
+        const player = mirrorPlayerRef.current;
+        if (!player || typeof player.getPlayerState !== 'function') return;
+        const target = videoTimeRef.current;
+        try {
+          const state = player.getPlayerState();
+          const drift = Math.abs((player.getCurrentTime() || 0) - target.time);
+          if (target.playing) {
+            if (drift > 1.2) player.seekTo(target.time, true);
+            if (state !== 1) player.playVideo();
+          } else {
+            if (state === 1) player.pauseVideo();
+            if (drift > 1.2) player.seekTo(target.time, true);
+          }
+        } catch {
+          // Player mid-transition (e.g. still buffering after a seek) -
+          // the next tick just tries again.
+        }
+      }, 600);
+    });
+
+    return () => {
+      cancelled = true;
+      if (syncInterval) clearInterval(syncInterval);
+      try { mirrorPlayerRef.current?.destroy?.(); } catch { /* iframe already gone */ }
+      mirrorPlayerRef.current = null;
+    };
+  }, [uiMode, preview]);
 
   // pdfFile is memoized so react-pdf sees a stable object identity and
   // doesn't re-parse on every re-render.
@@ -682,6 +934,7 @@ export default function MobileRemote() {
     setTimerRunning(false);
     setTimerSecondsLeft(null);
     setTimerPanelOpen(false);
+    setTimerBigAlert(null);
   };
 
   // Jumps straight to any global slide number - this now actually works
@@ -764,16 +1017,25 @@ export default function MobileRemote() {
           ctx.globalAlpha = mode === 'highlight' ? 0.35 : 1;
           ctx.strokeStyle = color;
           ctx.lineWidth = width;
-          ctx.beginPath();
-          ctx.moveTo(pxX, pxY);
           currentLineRef.current = [{ x, y }];
+          lastStrokePxRef.current = { x: pxX, y: pxY };
         } else if (type === 'move') {
-          ctx.lineTo(pxX, pxY);
-          ctx.stroke();
+          // See the matching comment in Present.tsx's draw_stroke handler:
+          // stroking only the new short segment (instead of restroking the
+          // whole accumulated path every move) is what stops a translucent
+          // highlighter stroke from compounding into a near-opaque blotch.
+          const last = lastStrokePxRef.current;
+          if (last) {
+            ctx.beginPath();
+            ctx.moveTo(last.x, last.y);
+            ctx.lineTo(pxX, pxY);
+            ctx.stroke();
+          }
+          lastStrokePxRef.current = { x: pxX, y: pxY };
           currentLineRef.current.push({ x, y });
         } else if (type === 'end') {
-          ctx.closePath();
           ctx.restore();
+          lastStrokePxRef.current = null;
           if (currentLineRef.current.length > 0) {
             const slideNum = currentSlideRef.current;
             const newStroke: Stroke = { points: currentLineRef.current, color, width, mode };
@@ -849,9 +1111,54 @@ export default function MobileRemote() {
     channelRef.current?.send({ type: 'broadcast', event: 'video_control', payload: { action, value } });
   };
 
-  const handleTouchStart = (e: React.TouchEvent | React.MouseEvent) => { isDrawing.current = true; sendPointerData(e, 'start'); };
-  const handleTouchMove = (e: React.TouchEvent | React.MouseEvent) => { if (!isDrawing.current) return; sendPointerData(e, 'move'); };
-  const handleTouchEnd = (e: React.TouchEvent | React.MouseEvent) => { isDrawing.current = false; sendPointerData(e, 'end'); };
+  // Distance between two touch points, for pinch scale math.
+  const touchDist = (t1: React.Touch, t2: React.Touch) => Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+
+  const handleTouchStart = (e: React.TouchEvent | React.MouseEvent) => {
+    const touches = (e as React.TouchEvent).touches;
+    if (touches && touches.length === 2) {
+      pinchRef.current = { startDist: touchDist(touches[0], touches[1]), startScale: zoom.scale };
+      isDrawing.current = false;
+      return;
+    }
+    isDrawing.current = true;
+    sendPointerData(e, 'start');
+  };
+  const handleTouchMove = (e: React.TouchEvent | React.MouseEvent) => {
+    const touches = (e as React.TouchEvent).touches;
+    if (touches && touches.length === 2) {
+      if (!ready || !channelRef.current) return;
+      if (!pinchRef.current) {
+        pinchRef.current = { startDist: touchDist(touches[0], touches[1]), startScale: zoom.scale };
+        return;
+      }
+      const dist = touchDist(touches[0], touches[1]);
+      if (pinchRef.current.startDist < 1) return;
+      const ratio = dist / pinchRef.current.startDist;
+      const nextScale = Math.max(PINCH_MIN_SCALE, Math.min(PINCH_MAX_SCALE, +(pinchRef.current.startScale * ratio).toFixed(2)));
+      setZoom((prev) => {
+        const next = { ...prev, scale: nextScale };
+        channelRef.current?.send({ type: 'broadcast', event: 'zoom_change', payload: next });
+        return next;
+      });
+      return;
+    }
+    if (!isDrawing.current) return;
+    sendPointerData(e, 'move');
+  };
+  const handleTouchEnd = (e: React.TouchEvent | React.MouseEvent) => {
+    const touches = (e as React.TouchEvent).touches;
+    if (pinchRef.current && (!touches || touches.length < 2)) {
+      // Pinch ending (fingers lifted) - don't let the remaining single
+      // finger, if any, start a stray draw stroke from wherever it happens
+      // to be resting.
+      pinchRef.current = null;
+      isDrawing.current = false;
+      return;
+    }
+    isDrawing.current = false;
+    sendPointerData(e, 'end');
+  };
 
   if (!sessionId) return <div className="bg-black text-white p-6 text-xl font-bold text-center mt-20">Invalid Session Connection Link.</div>;
 
@@ -884,7 +1191,27 @@ export default function MobileRemote() {
   const isVideoActive = activeFlat?.fileType === 'video-link';
 
   return (
-    <div dir={lang === 'ku' ? 'rtl' : 'ltr'} className="flex flex-col h-screen w-full bg-black text-white font-sans select-none overflow-hidden">
+    <div
+      dir={lang === 'ku' ? 'rtl' : 'ltr'}
+      data-nx-theme={uiMode}
+      className="nx-root flex flex-col h-screen w-full bg-black text-white font-sans select-none overflow-hidden"
+      style={bgColor !== 'default' ? { backgroundColor: bgColor } : undefined}
+    >
+
+      {/* Big flash alert for the timer (59s-left, 3-2-1, and the end) - see
+          the threshold effect above. Fixed/topmost so it's visible no
+          matter what panel is open. */}
+      {timerBigAlert && (
+        <div className="fixed inset-0 z-[300] flex items-center justify-center pointer-events-none bg-black/40">
+          <span
+            className={`font-mono font-black drop-shadow-2xl ${timerBigAlert === '0' ? 'text-red-500' : 'text-amber-400'}`}
+            style={{ fontSize: '30vw', lineHeight: 1, animation: 'timer-flash-pop 0.35s ease-out' }}
+          >
+            {timerBigAlert === '0' ? "⏰" : timerBigAlert}
+          </span>
+          <style>{`@keyframes timer-flash-pop { 0% { transform: scale(0.5); opacity: 0; } 60% { transform: scale(1.15); opacity: 1; } 100% { transform: scale(1); opacity: 1; } }`}</style>
+        </div>
+      )}
 
       {!ready && (
         <div className="w-full bg-red-600 text-white text-center py-1 text-xs font-bold animate-pulse">
@@ -898,7 +1225,7 @@ export default function MobileRemote() {
         </div>
       )}
 
-      <div className="flex justify-between items-center p-4 bg-gray-900 border-b border-gray-800">
+      <div className="nx-header flex justify-between items-center p-4 bg-gray-900 border-b border-gray-800">
         <div className="flex items-center gap-3 relative">
           <button
             onClick={() => (timerSecondsLeft === null ? setTimerPanelOpen((o) => !o) : togglePauseTimer())}
@@ -916,6 +1243,24 @@ export default function MobileRemote() {
             <span>{timerSecondsLeft === null ? '--:--' : formatTime(timerSecondsLeft)}</span>
           </button>
 
+          <button
+            onClick={() => setTimerSilent((s) => !s)}
+            aria-label={timerSilent ? 'Unmute timer alerts' : 'Silence timer alerts'}
+            title={timerSilent ? 'Timer alerts silenced' : 'Timer alerts on'}
+            className={`w-7 h-7 rounded-full flex items-center justify-center text-xs shrink-0 ${timerSilent ? 'bg-gray-700 text-gray-400' : 'bg-gray-800 text-yellow-400'}`}
+          >
+            {timerSilent ? '🔇' : '🔊'}
+          </button>
+
+          <button
+            onClick={() => setTimerShowOnProjector((s) => !s)}
+            aria-label={timerShowOnProjector ? 'Hide timer on projector' : 'Show timer on projector'}
+            title={timerShowOnProjector ? 'Showing on projector' : 'Not shown on projector'}
+            className={`w-7 h-7 rounded-full flex items-center justify-center text-xs shrink-0 ${timerShowOnProjector ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400'}`}
+          >
+            📽️
+          </button>
+
           {timerSecondsLeft !== null && (
             <button
               onClick={resetTimer}
@@ -928,7 +1273,7 @@ export default function MobileRemote() {
 
           {timerPanelOpen && timerSecondsLeft === null && (
             <div
-              className="absolute top-full mt-2 right-0 bg-gray-900 border border-gray-700 rounded-lg p-2 flex flex-col gap-2 z-50 shadow-xl"
+              className="nx-panel absolute top-full mt-2 right-0 bg-gray-900 border border-gray-700 rounded-lg p-2 flex flex-col gap-2 z-50 shadow-xl"
               style={{ direction: 'ltr' }}
             >
               <div className="flex items-center gap-1">
@@ -961,6 +1306,42 @@ export default function MobileRemote() {
           )}
         </div>
         <div className="flex items-center gap-3">
+          <div className="relative shrink-0">
+            <button
+              onClick={() => setBgPickerOpen((o) => !o)}
+              aria-label="Change remote background color"
+              title="Change remote background color"
+              className="bg-gray-800 w-8 h-8 rounded flex items-center justify-center text-base"
+            >
+              🎨
+            </button>
+            {bgPickerOpen && (
+              <div
+                className="nx-panel absolute top-full mt-2 right-0 bg-gray-900 border border-gray-700 rounded-lg p-3 z-50 shadow-xl grid grid-cols-5 gap-2"
+                style={{ direction: 'ltr' }}
+              >
+                {BG_COLOR_PRESETS.map((c) => (
+                  <button
+                    key={c.id}
+                    onClick={() => { setBgColor(c.id); setBgPickerOpen(false); }}
+                    aria-label={c.label}
+                    title={c.label}
+                    className={`w-8 h-8 rounded-full border-2 flex items-center justify-center ${bgColor === c.id ? 'border-white' : 'border-gray-700'}`}
+                    style={{ backgroundColor: c.swatch }}
+                  >
+                    {c.id === 'default' && <span className="text-[9px]">✕</span>}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          <button
+            onClick={() => setUiMode((m) => (m === 'pro' ? 'classic' : 'pro'))}
+            className="shrink-0 px-3 py-1 rounded-full text-xs font-bold text-white bg-gradient-to-r from-indigo-500 to-purple-500 shadow-md shadow-indigo-900/40"
+            title={uiMode === 'pro' ? 'Switch back to the classic view' : 'Try the new professional view'}
+          >
+            {uiMode === 'pro' ? '◀ Classic' : '✨ Pro'}
+          </button>
           <button onClick={() => setLang(lang === 'ku' ? 'en' : 'ku')} className="bg-gray-800 px-3 py-1 rounded text-sm font-bold">{t.switchLang}</button>
           <button onClick={() => setQuizPanelOpen(true)} className="bg-gray-800 w-8 h-8 rounded flex items-center justify-center text-base shrink-0 relative">
             🧠
@@ -973,15 +1354,28 @@ export default function MobileRemote() {
           >
             {isProjectorFullscreen ? '🗗' : '⛶'}
           </button>
-          <div className="bg-blue-600 px-3 py-1 rounded-full font-bold" style={{ direction: 'ltr' }}>{t.slide} {currentSlide}{flatSlides.length ? ` / ${flatSlides.length}` : ''}</div>
+          <div className="nx-badge bg-blue-600 px-3 py-1 rounded-full font-bold" style={{ direction: 'ltr' }}>{t.slide} {currentSlide}{flatSlides.length ? ` / ${flatSlides.length}` : ''}</div>
         </div>
+      </div>
+
+      {/* One-tap reload of the projector tab - mainly for the start of
+          class, when the projector browser may have been left open from
+          before or just needs a guaranteed clean start. */}
+      <div className="px-4 pt-3">
+        <button
+          disabled={!ready}
+          onClick={requestProjectorReload}
+          className={`w-full h-11 rounded-lg text-sm font-bold flex items-center justify-center gap-2 transition-colors ${reloadJustSent ? 'bg-green-700 text-white' : 'nx-primary-btn bg-blue-600 text-white'} ${!ready ? 'opacity-50' : ''}`}
+        >
+          {reloadJustSent ? <>✅ {t.startLessonSent}</> : <>🔄 {t.startLesson}</>}
+        </button>
       </div>
 
       {/* Slide thumbnails - one per global slide number, sourced from the
           host's flatSlides list so it always matches the real slide count
           (fixes "slide 6 doesn't show" for good, since this can no longer
           drift from what's actually on screen). */}
-      <div className="w-full bg-gray-900 border-b border-gray-800 p-2 overflow-x-auto flex gap-2 scroll-smooth" style={{ direction: 'ltr' }}>
+      <div className="nx-strip w-full bg-gray-900 border-b border-gray-800 p-2 overflow-x-auto flex gap-2 scroll-smooth" style={{ direction: 'ltr' }}>
         {flatSlides.map((slide, i) => (
           <button
             key={i}
@@ -1010,14 +1404,14 @@ export default function MobileRemote() {
       </div>
 
       <div className="p-4 grid grid-cols-2 gap-4">
-        <button disabled={!ready} onClick={() => updateSlide(currentSlide - 1)} className={`h-20 rounded-xl bg-gray-800 text-white text-xl font-bold ${!ready ? 'opacity-50' : 'active:bg-gray-700'}`}>{t.prev}</button>
-        <button disabled={!ready} onClick={() => updateSlide(currentSlide + 1)} className={`h-20 rounded-xl bg-blue-600 text-white text-xl font-bold shadow-lg ${!ready ? 'opacity-50' : 'active:bg-blue-700'}`}>{t.next}</button>
+        <button disabled={!ready} onClick={() => updateSlide(currentSlide - 1)} className={`nx-chip h-20 rounded-xl bg-gray-800 text-white text-xl font-bold ${!ready ? 'opacity-50' : 'active:bg-gray-700'}`}>{t.prev}</button>
+        <button disabled={!ready} onClick={() => updateSlide(currentSlide + 1)} className={`nx-primary-btn h-20 rounded-xl bg-blue-600 text-white text-xl font-bold shadow-lg ${!ready ? 'opacity-50' : 'active:bg-blue-700'}`}>{t.next}</button>
       </div>
 
       {/* Presenter notes - only shown when the active slide actually has
           some (populate `notes` on each slide object from your backend). */}
       {activeFlat?.notes && (
-        <div className="mx-4 mb-2 bg-gray-900 border border-gray-800 rounded-lg p-3">
+        <div className="nx-panel mx-4 mb-2 bg-gray-900 border border-gray-800 rounded-lg p-3">
           <div className="flex justify-between items-center mb-1">
             <span className="text-xs text-gray-400 font-bold uppercase">{t.notes}</span>
             <button onClick={() => setNotesOpen((o) => !o)} className="text-xs text-blue-400">{notesOpen ? t.hideNotes : t.notes}</button>
@@ -1029,11 +1423,11 @@ export default function MobileRemote() {
       {/* Screen controls: black/white screen restore-to-color, spotlight,
           zoom - separate row from the draw tools since they apply to the
           whole screen rather than being a drawing mode. */}
-      <div className="px-4 mb-2 flex gap-2 flex-wrap">
-        <button disabled={!ready} onClick={() => setScreenModeRemote('black')} className={`px-3 py-1.5 rounded-full text-xs font-bold ${screenMode === 'black' ? 'bg-white text-black' : 'bg-gray-800 text-gray-400'}`}>⬛ {t.black}</button>
-        <button disabled={!ready} onClick={() => setScreenModeRemote('white')} className={`px-3 py-1.5 rounded-full text-xs font-bold ${screenMode === 'white' ? 'bg-white text-black' : 'bg-gray-800 text-gray-400'}`}>⬜ {t.white}</button>
+      <div className="nx-panel px-4 mb-2 flex gap-2 flex-wrap">
+        <button disabled={!ready} onClick={() => setScreenModeRemote('black')} className={`px-3 py-1.5 rounded-full text-xs font-bold ${screenMode === 'black' ? 'bg-white text-black' : 'nx-chip bg-gray-800 text-gray-400'}`}>⬛ {t.black}</button>
+        <button disabled={!ready} onClick={() => setScreenModeRemote('white')} className={`px-3 py-1.5 rounded-full text-xs font-bold ${screenMode === 'white' ? 'bg-white text-black' : 'nx-chip bg-gray-800 text-gray-400'}`}>⬜ {t.white}</button>
         {screenMode !== 'normal' && (
-          <button onClick={() => setScreenModeRemote('normal')} className="px-3 py-1.5 rounded-full text-xs font-bold bg-blue-600 text-white">{t.reset}</button>
+          <button onClick={() => setScreenModeRemote('normal')} className="nx-primary-btn px-3 py-1.5 rounded-full text-xs font-bold bg-blue-600 text-white">{t.reset}</button>
         )}
       </div>
 
@@ -1042,7 +1436,7 @@ export default function MobileRemote() {
           from both screens); these send remote commands to the projector's
           player instead. Currently wired for YouTube embeds. */}
       {isVideoActive && (
-        <div className="mx-4 mb-2 bg-gray-900 border border-gray-800 rounded-lg p-3 flex flex-col gap-2">
+        <div className="nx-panel mx-4 mb-2 bg-gray-900 border border-gray-800 rounded-lg p-3 flex flex-col gap-2">
           <span className="text-xs text-gray-400 font-bold uppercase">{t.video}</span>
           <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full w-fit ${videoTime.playing ? 'bg-green-900 text-green-400' : 'bg-gray-800 text-gray-500'}`}>
             {videoTime.playing ? `▶ Playing` : `⏸ Paused`}
@@ -1057,34 +1451,50 @@ export default function MobileRemote() {
             <button onClick={() => sendVideoControl('seek', Math.max(0, videoTime.time - 10))} className="px-3 py-2 rounded-lg bg-gray-800 text-sm">-10s</button>
             <button onClick={() => sendVideoControl('seek', videoTime.time + 10)} className="px-3 py-2 rounded-lg bg-gray-800 text-sm">+10s</button>
           </div>
-          {videoTime.duration > 0 && (
-            <input
-              type="range" min={0} max={videoTime.duration} value={videoTime.time}
-              onChange={(e) => sendVideoControl('seek', Number(e.target.value))}
-              className="w-full"
-            />
-          )}
+          {(() => {
+            // Real duration isn't known instantly (see the syncFromPlayer
+            // effect in Present.tsx) - rather than hide the bar until then,
+            // scrub against a generous placeholder range so it's always
+            // there and always usable; it snaps to the real length the
+            // moment duration comes in, same as it already does for time.
+            const hasDuration = videoTime.duration > 0;
+            const seekMax = hasDuration ? videoTime.duration : 3600;
+            const seekValue = Math.min(videoTime.time, seekMax);
+            return (
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] text-gray-400 font-mono w-10 text-right shrink-0">{formatTime(videoTime.time)}</span>
+                <input
+                  type="range" min={0} max={seekMax} value={seekValue}
+                  onChange={(e) => sendVideoControl('seek', Number(e.target.value))}
+                  className="nx-range w-full"
+                  style={{ ['--nx-range-pct' as any]: `${seekMax > 0 ? (seekValue / seekMax) * 100 : 0}%` }}
+                />
+                <span className="text-[10px] text-gray-400 font-mono w-10 shrink-0">{hasDuration ? formatTime(videoTime.duration) : '--:--'}</span>
+              </div>
+            );
+          })()}
           <div className="flex items-center gap-2">
             <span className="text-xs text-gray-400">🔊</span>
             <input
               type="range" min={0} max={100} value={videoTime.volume}
               onChange={(e) => sendVideoControl('volume', Number(e.target.value))}
-              className="w-full"
+              className="nx-range w-full"
+              style={{ ['--nx-range-pct' as any]: `${videoTime.volume}%` }}
             />
           </div>
         </div>
       )}
 
       <div className="flex-1 px-4 pb-4 flex flex-col min-h-0">
-        <div className="flex justify-between items-center mb-2 flex-wrap gap-y-2">
+        <div className="nx-panel flex justify-between items-center mb-2 flex-wrap gap-y-2">
           <span className="text-xs text-gray-400 font-bold uppercase">{t.controller}</span>
           <div className="flex gap-2 flex-wrap justify-end">
-            <button disabled={!ready} onClick={() => handleModeChange('laser')} className={`px-3 py-1 rounded-full text-xs font-bold ${activeMode === 'laser' ? 'bg-red-600 text-white' : 'bg-gray-800 text-gray-400'} ${!ready ? 'opacity-50' : ''}`}>{t.laser}</button>
-            <button disabled={!ready} onClick={() => handleModeChange('spotlight')} className={`px-3 py-1 rounded-full text-xs font-bold ${activeMode === 'spotlight' ? 'bg-purple-600 text-white' : 'bg-gray-800 text-gray-400'} ${!ready ? 'opacity-50' : ''}`}>{t.spotlight}</button>
-            <button disabled={!ready} onClick={() => handleModeChange('draw')} className={`px-3 py-1 rounded-full text-xs font-bold ${activeMode === 'draw' ? 'bg-yellow-500 text-black' : 'bg-gray-800 text-gray-400'} ${!ready ? 'opacity-50' : ''}`}>{t.draw}</button>
-            <button disabled={!ready} onClick={() => handleModeChange('highlight')} className={`px-3 py-1 rounded-full text-xs font-bold ${activeMode === 'highlight' ? 'bg-yellow-500 text-black' : 'bg-gray-800 text-gray-400'} ${!ready ? 'opacity-50' : ''}`}>{t.highlight}</button>
-            <button disabled={!ready} onClick={() => handleModeChange('erase')} className={`px-3 py-1 rounded-full text-xs font-bold ${activeMode === 'erase' ? 'bg-yellow-500 text-black' : 'bg-gray-800 text-gray-400'} ${!ready ? 'opacity-50' : ''}`}>{t.erase}</button>
-            <button disabled={!ready} onClick={() => handleModeChange('zoom')} className={`px-3 py-1 rounded-full text-xs font-bold ${activeMode === 'zoom' ? 'bg-green-600 text-white' : 'bg-gray-800 text-gray-400'} ${!ready ? 'opacity-50' : ''}`}>{t.zoom}</button>
+            <button disabled={!ready} onClick={() => handleModeChange('laser')} className={`px-3 py-1 rounded-full text-xs font-bold ${activeMode === 'laser' ? 'bg-red-600 text-white' : 'nx-chip bg-gray-800 text-gray-400'} ${!ready ? 'opacity-50' : ''}`}>{t.laser}</button>
+            <button disabled={!ready} onClick={() => handleModeChange('spotlight')} className={`px-3 py-1 rounded-full text-xs font-bold ${activeMode === 'spotlight' ? 'bg-purple-600 text-white' : 'nx-chip bg-gray-800 text-gray-400'} ${!ready ? 'opacity-50' : ''}`}>{t.spotlight}</button>
+            <button disabled={!ready} onClick={() => handleModeChange('draw')} className={`px-3 py-1 rounded-full text-xs font-bold ${activeMode === 'draw' ? 'bg-yellow-500 text-black' : 'nx-chip bg-gray-800 text-gray-400'} ${!ready ? 'opacity-50' : ''}`}>{t.draw}</button>
+            <button disabled={!ready} onClick={() => handleModeChange('highlight')} className={`px-3 py-1 rounded-full text-xs font-bold ${activeMode === 'highlight' ? 'bg-yellow-500 text-black' : 'nx-chip bg-gray-800 text-gray-400'} ${!ready ? 'opacity-50' : ''}`}>{t.highlight}</button>
+            <button disabled={!ready} onClick={() => handleModeChange('erase')} className={`px-3 py-1 rounded-full text-xs font-bold ${activeMode === 'erase' ? 'bg-yellow-500 text-black' : 'nx-chip bg-gray-800 text-gray-400'} ${!ready ? 'opacity-50' : ''}`}>{t.erase}</button>
+            <button disabled={!ready} onClick={() => handleModeChange('zoom')} className={`px-3 py-1 rounded-full text-xs font-bold ${activeMode === 'zoom' ? 'bg-green-600 text-white' : 'nx-chip bg-gray-800 text-gray-400'} ${!ready ? 'opacity-50' : ''}`}>{t.zoom}</button>
             {(activeMode === 'draw' || activeMode === 'highlight' || activeMode === 'erase') && (
               <>
                 <button onClick={handleUndo} className="px-3 py-1 rounded-full bg-gray-700 text-white text-xs font-bold">↶ {t.undo}</button>
@@ -1156,19 +1566,35 @@ export default function MobileRemote() {
           ref={trackpadRef}
           onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd}
           onMouseDown={handleTouchStart} onMouseMove={handleTouchMove} onMouseUp={handleTouchEnd} onMouseLeave={handleTouchEnd}
-          className={`flex-1 w-full min-h-0 rounded-2xl border-2 flex items-center justify-center transition-colors relative touch-none overflow-hidden bg-white ${activeMode !== 'none' && ready ? 'border-yellow-500' : 'border-gray-800'}`}
+          className={`nx-trackpad flex-1 w-full min-h-0 rounded-2xl border-2 flex items-center justify-center transition-colors relative touch-none overflow-hidden bg-white ${activeMode !== 'none' && ready ? 'border-yellow-500' : 'border-gray-800'}`}
         >
           {!isVideoActive && (
             <span className="absolute top-2 left-2 z-40 bg-black/70 text-white text-[9px] font-bold px-2 py-0.5 rounded-full flex items-center gap-1 pointer-events-none">
               <span className="w-1.5 h-1.5 rounded-full bg-red-500" /> LIVE
             </span>
           )}
+          {isVideoActive && uiMode === 'pro' && preview?.fileType === 'video-link' && preview.embedUrl && isYouTubeEmbed(preview.embedUrl, preview.platform) && (
+            <span className="absolute top-2 left-2 z-40 bg-black/70 text-white text-[9px] font-bold px-2 py-0.5 rounded-full flex items-center gap-1 pointer-events-none">
+              🔇 MIRROR (MUTED)
+            </span>
+          )}
           {isVideoActive ? (
-            <div className="flex flex-col items-center gap-2 pointer-events-none text-black">
-              <span className="text-5xl">▶️</span>
-              <p className="text-xs font-bold text-center px-4">{activeFlat?.name || 'Video'}</p>
-              <p className="text-[10px] text-gray-500 text-center px-6">Preview not shown here to avoid double audio — use the controls above.</p>
-            </div>
+            uiMode === 'pro' && preview?.fileType === 'video-link' && preview.embedUrl && isYouTubeEmbed(preview.embedUrl, preview.platform) ? (
+              <iframe
+                key={`mirror-${preview.embedUrl}`}
+                ref={mirrorIframeRef}
+                src={mirrorPlaybackUrl(preview.embedUrl)}
+                title={preview.name || 'Video'}
+                className="w-full h-full border-0 pointer-events-none bg-black"
+                allow="autoplay; picture-in-picture"
+              />
+            ) : (
+              <div className="flex flex-col items-center gap-2 pointer-events-none text-black">
+                <span className="text-5xl">▶️</span>
+                <p className="text-xs font-bold text-center px-4">{activeFlat?.name || 'Video'}</p>
+                <p className="text-[10px] text-gray-500 text-center px-6">Preview not shown here to avoid double audio — use the controls above.</p>
+              </div>
+            )
           ) : previewError ? (
             <p className="text-red-500 text-xs font-bold p-4 text-center pointer-events-none">{t.error}: {previewError}</p>
           ) : preview?.fileType === 'pdf' && pdfFile && trackpadWidth > 0 ? (
@@ -1217,7 +1643,7 @@ export default function MobileRemote() {
       {quizPanelOpen && (
         <div className="fixed inset-0 z-[200] bg-black/80 flex items-end sm:items-center justify-center" onClick={() => setQuizPanelOpen(false)}>
           <div
-            className="bg-gray-900 border border-gray-700 rounded-t-2xl sm:rounded-2xl w-full sm:max-w-lg max-h-[85vh] overflow-y-auto p-5 flex flex-col gap-4"
+            className="nx-panel bg-gray-900 border border-gray-700 rounded-t-2xl sm:rounded-2xl w-full sm:max-w-lg max-h-[85vh] overflow-y-auto p-5 flex flex-col gap-4"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between">
@@ -1238,13 +1664,21 @@ export default function MobileRemote() {
                   <>
                     <p className="text-sm font-semibold">{quiz.questions[quiz.currentIndex]?.question}</p>
                     <p className="text-xs text-gray-500">{Object.values(quiz.participants).filter((p) => p.answers[quiz.questions[quiz.currentIndex]?.id]).length}/{Object.keys(quiz.participants).length} answered</p>
+                    {quiz.questions[quiz.currentIndex]?.type !== 'mcq' && (
+                      <button onClick={() => sendQuizControl('spotlight_answer')} className="bg-indigo-600 hover:bg-indigo-500 rounded-lg py-2 text-sm font-bold">🎲 Spotlight an answer</button>
+                    )}
                     <button onClick={() => sendQuizControl('reveal_now')} className="bg-gray-700 hover:bg-gray-600 rounded-lg py-2.5 text-sm font-bold">{t.revealNow}</button>
                   </>
                 )}
                 {quiz.status === 'reveal' && (
-                  <button onClick={() => sendQuizControl('advance')} className="bg-emerald-600 rounded-lg py-2.5 text-sm font-bold">
-                    {quiz.currentIndex >= quiz.questions.length - 1 ? '🏆 Leaderboard' : `${t.nextQ} ▶`}
-                  </button>
+                  <>
+                    {quiz.questions[quiz.currentIndex]?.type !== 'mcq' && (
+                      <button onClick={() => sendQuizControl('spotlight_answer')} className="bg-indigo-600 hover:bg-indigo-500 rounded-lg py-2 text-sm font-bold">🎲 Spotlight an answer</button>
+                    )}
+                    <button onClick={() => sendQuizControl('advance')} className="bg-emerald-600 rounded-lg py-2.5 text-sm font-bold">
+                      {quiz.currentIndex >= quiz.questions.length - 1 ? '🏆 Leaderboard' : `${t.nextQ} ▶`}
+                    </button>
+                  </>
                 )}
                 {quiz.status === 'finished' && (
                   <button onClick={() => sendQuizControl('reset')} className="bg-gray-700 hover:bg-gray-600 rounded-lg py-2.5 text-sm font-bold">🔄 {t.newQuiz}</button>
@@ -1252,6 +1686,31 @@ export default function MobileRemote() {
               </div>
             ) : (
               <div className="flex flex-col gap-3">
+                {audienceState.savedQuizzes.length > 0 && (
+                  <div className="flex flex-col gap-1.5 bg-gray-800/40 rounded-lg p-2.5">
+                    <p className="text-[10px] font-bold text-gray-400 uppercase">📚 Saved quizzes</p>
+                    {audienceState.savedQuizzes.map((sq) => (
+                      <div key={sq.id} className="flex items-center gap-2 bg-gray-800/70 rounded-lg px-2.5 py-1.5">
+                        <span className="flex-1 text-xs truncate">{sq.title} <span className="text-gray-500">({sq.questions.length}q)</span></span>
+                        <button onClick={() => sendQuizControl('start_quiz', { questions: sq.questions })} className="text-[10px] bg-emerald-600 px-2 py-0.5 rounded-full font-bold shrink-0">▶</button>
+                        <button onClick={() => sendQuizControl('delete_saved', { id: sq.id })} className="text-gray-500 text-xs shrink-0">✕</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {audienceState.questions.length > 0 && (
+                  <div className="flex flex-col gap-1.5 bg-gray-800/40 rounded-lg p-2.5">
+                    <p className="text-[10px] font-bold text-gray-400 uppercase">📥 From student questions</p>
+                    {[...audienceState.questions].sort((a, b) => b.upvotes - a.upvotes).map((sq) => (
+                      <div key={sq.id} className="flex items-center gap-2 bg-gray-800/70 rounded-lg px-2.5 py-1.5">
+                        <span className="flex-1 text-xs truncate">{sq.text} <span className="text-gray-500">({sq.upvotes}👍)</span></span>
+                        <button onClick={() => setQText(sq.text)} className="text-[10px] bg-blue-600 px-2 py-0.5 rounded-full font-bold shrink-0">Use</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
                 {draftQuestions.length > 0 && (
                   <div className="flex flex-col gap-2">
                     {draftQuestions.map((q, i) => (
@@ -1265,8 +1724,19 @@ export default function MobileRemote() {
 
                 <div className="flex flex-col gap-2.5 border-t border-gray-800 pt-3">
                   <p className="text-xs font-bold text-gray-400 uppercase">{t.addQuestion}</p>
+                  <div className="flex gap-1.5">
+                    {(['mcq', 'short', 'long'] as QuizQuestionType[]).map((qt) => (
+                      <button
+                        key={qt}
+                        onClick={() => setQType(qt)}
+                        className={`flex-1 rounded-lg py-1.5 text-[11px] font-bold ${qType === qt ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400'}`}
+                      >
+                        {qt === 'mcq' ? 'MCQ' : qt === 'short' ? 'Short' : 'Long'}
+                      </button>
+                    ))}
+                  </div>
                   <input value={qText} onChange={(e) => setQText(e.target.value)} placeholder="..." className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm" />
-                  {qOptions.map((opt, i) => (
+                  {qType === 'mcq' && qOptions.map((opt, i) => (
                     <div key={i} className="flex items-center gap-2">
                       <button onClick={() => setQCorrectIndex(i)} className={`shrink-0 w-6 h-6 rounded-full border-2 flex items-center justify-center text-xs ${qCorrectIndex === i ? 'bg-emerald-600 border-emerald-500' : 'border-gray-600'}`}>
                         {qCorrectIndex === i ? '✓' : ''}
@@ -1282,18 +1752,35 @@ export default function MobileRemote() {
                       )}
                     </div>
                   ))}
-                  {qOptions.length < 6 && (
+                  {qType === 'mcq' && qOptions.length < 6 && (
                     <button onClick={() => setQOptions((prev) => [...prev, ''])} className="text-xs text-blue-400 self-start">+ Option</button>
                   )}
-                  <p className="text-[10px] text-gray-500">{t.correctMark}</p>
+                  {qType === 'mcq' && <p className="text-[10px] text-gray-500">{t.correctMark}</p>}
+                  {qType !== 'mcq' && <p className="text-[10px] text-gray-500">Everyone types their own answer - shows as a card on the projector once submitted.</p>}
                   <input value={qSource} onChange={(e) => setQSource(e.target.value)} placeholder="Source (optional)" className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs" />
                   <div className="flex items-center gap-2">
                     <span className="text-xs text-gray-400">⏱ {t.timeLimit}</span>
                     <input type="range" min={5} max={60} step={5} value={qTimeLimit} onChange={(e) => setQTimeLimit(Number(e.target.value))} className="flex-1" />
                     <span className="text-xs font-mono w-10 text-right">{qTimeLimit}s</span>
                   </div>
-                  <button onClick={addDraftQuestion} disabled={!qText.trim() || qCorrectIndex === null} className="bg-gray-700 disabled:opacity-30 rounded-lg py-2 text-sm font-bold">
+                  <button onClick={addDraftQuestion} disabled={!qText.trim() || (qType === 'mcq' && qCorrectIndex === null)} className="bg-gray-700 disabled:opacity-30 rounded-lg py-2 text-sm font-bold">
                     + {t.addQuestion}
+                  </button>
+                </div>
+
+                <div className="flex gap-2">
+                  <input
+                    value={saveTitle}
+                    onChange={(e) => setSaveTitle(e.target.value)}
+                    placeholder="Title to save for later"
+                    className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs"
+                  />
+                  <button
+                    onClick={() => { sendQuizControl('save_quiz', { title: saveTitle, questions: draftQuestions }); setSaveTitle(''); setDraftQuestions([]); }}
+                    disabled={draftQuestions.length === 0 || !saveTitle.trim()}
+                    className="bg-gray-700 disabled:opacity-30 px-4 rounded-lg text-xs font-bold shrink-0"
+                  >
+                    💾
                   </button>
                 </div>
 

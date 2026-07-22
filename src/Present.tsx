@@ -1,10 +1,68 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useParams } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { useParams, useSearchParams } from 'react-router-dom';
 import { QRCodeSVG } from 'qrcode.react';
 import { Document, Page, pdfjs } from 'react-pdf';
+// Bundled locally (same origin as the rest of the app) instead of fetched
+// from unpkg.com at runtime. The unpkg version worked fine on an open
+// connection, but on a locked-down/school network that blocks or throttles
+// third-party CDNs, that fetch can silently fail - the PDF worker never
+// loads, so PDF pages never render, while images (which don't need any
+// worker) keep working fine. This is the same class of problem the
+// crypto.getRandomValues polyfill in index.html works around.
+import pdfWorkerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { supabase } from './supabaseClient';
+import { QuizReportCard, exportReportPDF, exportReportPNG, type QuizReportData } from './quizReport';
+import { recordSavedItem } from './Account';
+import type { SlideTransition } from './pptxParse';
 
-pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
+// Best-effort lookup of whatever extractPptxMeta (see FileUpload.tsx) saved
+// for a given uploaded file - speaker notes and transition info, keyed by
+// slide/page number. Returns empty maps (never throws) if the table
+// doesn't exist yet, the file wasn't a pptx, or nothing was ever saved for
+// it - none of that should ever block a slide from loading.
+async function fetchPptxMeta(fileId: string): Promise<{ notesByPage: Record<number, string>; transitionsByPage: Record<number, SlideTransition> }> {
+  const empty = { notesByPage: {}, transitionsByPage: {} };
+  try {
+    const { data, error } = await supabase.from('pptx_meta').select('notes, transitions').eq('file_id', fileId).maybeSingle();
+    if (error || !data) return empty;
+    return { notesByPage: (data.notes as Record<number, string>) || {}, transitionsByPage: (data.transitions as Record<number, SlideTransition>) || {} };
+  } catch {
+    return empty;
+  }
+}
+
+// --- Tiny synthesized beeps for the quiz countdown - Web Audio API only,
+// no sound files to bundle/host. Only the presenter's screen plays these
+// (not every student's phone), so a room full of phones doesn't all beep
+// at once.
+let sharedAudioCtx: AudioContext | null = null;
+function getAudioCtx(): AudioContext | null {
+  if (typeof window === 'undefined') return null;
+  const AC = window.AudioContext || (window as any).webkitAudioContext;
+  if (!AC) return null;
+  if (!sharedAudioCtx) sharedAudioCtx = new AC();
+  if (sharedAudioCtx.state === 'suspended') sharedAudioCtx.resume().catch(() => {});
+  return sharedAudioCtx;
+}
+function playBeep(frequency: number, durationMs: number, volume = 0.15) {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = 'sine';
+  osc.frequency.value = frequency;
+  gain.gain.value = volume;
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+  osc.start();
+  gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + durationMs / 1000);
+  osc.stop(ctx.currentTime + durationMs / 1000);
+}
+function playQuestionStartChime() { playBeep(523, 100, 0.12); setTimeout(() => playBeep(784, 140, 0.12), 110); }
+function playTickBeep(urgent: boolean) { playBeep(urgent ? 660 : 440, 110, urgent ? 0.18 : 0.1); }
+function playTimesUpChime() { playBeep(880, 150, 0.16); setTimeout(() => playBeep(392, 320, 0.16), 160); }
+
+pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerSrc;
 
 // Same deployment URL as FileUpload.tsx - keep these in sync.
 const GAS_URL = 'https://script.google.com/macros/s/AKfycbx48s5aNamkERYuvJ-BE7-RBF2zt15mFZ-C-SXL_UIGZkG46RdyuPYIOlO6o0HZcr3N/exec';
@@ -34,6 +92,7 @@ interface FlatSlide {
   fileType: string;
   name?: string;
   notes?: string;
+  transition?: SlideTransition; // this slide's own PPTX transition - how it should animate IN when navigated to
   thumbnail?: string; // small data-URL preview, shown on the remote's thumbnail strip
 }
 
@@ -42,6 +101,12 @@ interface ZoomState { scale: number; x: number; y: number; } // x/y are pan offs
 interface SpotlightState { x: number; y: number; active: boolean; radius: number; }
 interface VideoState { playing: boolean; time: number; duration: number; volume: number; }
 interface SessionState { screenMode: ScreenMode; zoom: ZoomState; videoState: VideoState; pin?: string; }
+
+// Mirrors the countdown timer MobileRemote.tsx owns - Present.tsx never
+// starts/stops it, just displays whatever the phone broadcasts (see the
+// `timer_state` / `timer_alert` listeners below).
+interface ProjectorTimerState { secondsLeft: number | null; running: boolean; visible: boolean; }
+const DEFAULT_PROJECTOR_TIMER: ProjectorTimerState = { secondsLeft: null, running: false, visible: false };
 
 const DEFAULT_ZOOM: ZoomState = { scale: 1, x: 0, y: 0 };
 const DEFAULT_VIDEO_STATE: VideoState = { playing: false, time: 0, duration: 0, volume: 100 };
@@ -53,18 +118,31 @@ const DEFAULT_SESSION_STATE: SessionState = { screenMode: 'normal', zoom: DEFAUL
 // builder/controls) - all three read/write the same `audience_state`
 // column + `audience_state_update` broadcast, same pattern as session_state.
 interface QuizOption { id: string; text: string; imageUrl?: string; }
+// 'mcq' behaves exactly as before. 'short'/'long' skip options/scoring
+// entirely - the audience types an answer instead of picking one, and
+// there's no auto-grading (there's no way to auto-grade free text), just a
+// flat participation score once they submit.
+type QuizQuestionType = 'mcq' | 'short' | 'long';
 interface QuizQuestion {
   id: string;
+  type: QuizQuestionType;
   question: string;
   options: QuizOption[];
   correctOptionId: string;
   source?: string;          // reading material / citation shown after reveal
   timeLimitSeconds: number;
 }
-interface QuizAnswerRecord { optionId: string; answeredAt: number; correct: boolean; points: number; }
+interface QuizAnswerRecord {
+  optionId: string;        // mcq
+  text?: string;            // short/long
+  answeredAt: number;
+  correct: boolean;
+  points: number;
+}
 interface QuizParticipant {
   id: string;
   name: string;
+  emoji?: string;                     // optional, picked at join; auto-assigned for top 3 if absent
   joinedAt: number;
   totalScore: number;
   answers: Record<string, QuizAnswerRecord>; // keyed by questionId
@@ -76,8 +154,33 @@ interface QuizState {
   status: QuizStatus;
   questionStartedAt: number | null;
   participants: Record<string, QuizParticipant>;
+  // Which participant's short/long answer is currently featured big on the
+  // projector, for the current question - either the teacher tapped their
+  // card, or "🎲 Spotlight" picked one at random. Reset on every question
+  // change.
+  spotlightParticipantId?: string | null;
 }
-const DEFAULT_QUIZ_STATE: QuizState = { questions: [], currentIndex: -1, status: 'building', questionStartedAt: null, participants: {} };
+const DEFAULT_QUIZ_STATE: QuizState = { questions: [], currentIndex: -1, status: 'building', questionStartedAt: null, participants: {}, spotlightParticipantId: null };
+interface SavedQuiz { id: string; title: string; questions: QuizQuestion[]; createdAt: number; }
+
+// A palette of visually-distinct colors for the free-text answer cards, so
+// each participant's card is easy to tell apart at a glance. Deterministic
+// per participant (same idea as autoEmojiFor below).
+const ANSWER_CARD_COLORS = ['#f87171', '#fb923c', '#fbbf24', '#a3e635', '#34d399', '#22d3ee', '#60a5fa', '#a78bfa', '#f472b6', '#fb7185'];
+function answerCardColorFor(participantId: string): string {
+  let hash = 0;
+  for (let i = 0; i < participantId.length; i++) hash = (hash * 31 + participantId.charCodeAt(i)) >>> 0;
+  return ANSWER_CARD_COLORS[hash % ANSWER_CARD_COLORS.length];
+}
+
+const CELEBRATION_EMOJIS = ['🎉', '🥳', '🌟', '🔥', '🚀', '⭐', '🎊', '💫'];
+// Deterministic so the same participant always gets the same fallback emoji
+// within a session, instead of it changing on every re-render.
+function autoEmojiFor(participantId: string): string {
+  let hash = 0;
+  for (let i = 0; i < participantId.length; i++) hash = (hash * 31 + participantId.charCodeAt(i)) >>> 0;
+  return CELEBRATION_EMOJIS[hash % CELEBRATION_EMOJIS.length];
+}
 
 function scoreAnswer(correct: boolean, answeredAt: number, questionStartedAt: number, timeLimitSeconds: number): number {
   if (!correct) return 0;
@@ -88,14 +191,6 @@ function scoreAnswer(correct: boolean, answeredAt: number, questionStartedAt: nu
 function rankParticipants(participants: Record<string, QuizParticipant>): QuizParticipant[] {
   return Object.values(participants).sort((a, b) => b.totalScore - a.totalScore);
 }
-function downloadCsv(filename: string, rows: (string | number)[][]) {
-  const csv = rows.map((r) => r.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(',')).join('\n');
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = filename; a.click();
-  URL.revokeObjectURL(url);
-}
 
 interface AudienceQuestion { id: string; text: string; upvotes: number; answered: boolean; createdAt: number; }
 type FeedbackKind = '👍' | '❤️' | '👏' | '🤔' | '🐢' | '🚀';
@@ -104,11 +199,12 @@ const EMPTY_FEEDBACK: FeedbackCounts = { '👍': 0, '❤️': 0, '👏': 0, '�
 interface AudienceState {
   joinCount: number;
   quiz: QuizState;
-  questions: AudienceQuestion[];
+  savedQuizzes: SavedQuiz[];
+  questions: AudienceQuestion[]; // student-submitted questions - doubles as the "question bank" the teacher builds quizzes from
   feedback: FeedbackCounts;
   qnaOpen: boolean;
 }
-const DEFAULT_AUDIENCE_STATE: AudienceState = { joinCount: 0, quiz: DEFAULT_QUIZ_STATE, questions: [], feedback: EMPTY_FEEDBACK, qnaOpen: true };
+const DEFAULT_AUDIENCE_STATE: AudienceState = { joinCount: 0, quiz: DEFAULT_QUIZ_STATE, savedQuizzes: [], questions: [], feedback: EMPTY_FEEDBACK, qnaOpen: true };
 
 
 interface Point { x: number; y: number; }
@@ -225,13 +321,42 @@ async function renderImageThumbnail(blobUrl: string): Promise<string | undefined
 // YouTube's lightweight postMessage protocol only works once enablejsapi=1
 // is present; other platforms are left untouched (see the note in the
 // video-control broadcast handler below).
+// Maps a slide's extracted <p:transition> (see pptxParse.ts) to an actual
+// CSS animation played when that slide comes into view. This is a
+// deliberately simple, honest approximation of what PowerPoint itself does
+// - a real crossfade/push between the outgoing and incoming slide would mean
+// keeping both rendered and layered during the swap, which is a bigger
+// rendering-pipeline change; this instead plays a one-shot "entrance"
+// animation on the incoming slide, using the real type and duration read
+// out of the file. Keyframes are defined once, in TRANSITION_KEYFRAMES_CSS
+// below, and injected via a single <style> tag.
+function transitionAnimationStyle(transition?: SlideTransition): CSSProperties {
+  if (!transition || transition.kind === 'cut') return {};
+  const durationMs = Math.max(80, transition.durationMs || 500);
+  if (transition.kind === 'fade') {
+    return { animation: `nextslide-fade-in ${durationMs}ms ease-out` };
+  }
+  const dir = transition.direction || 'l';
+  const animName =
+    dir === 'l' ? 'nextslide-slide-in-l' : dir === 'r' ? 'nextslide-slide-in-r' : dir === 'u' ? 'nextslide-slide-in-u' : 'nextslide-slide-in-d';
+  return { animation: `${animName} ${durationMs}ms cubic-bezier(0.22,0.61,0.36,1)` };
+}
+const TRANSITION_KEYFRAMES_CSS = `
+@keyframes nextslide-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes nextslide-slide-in-l { from { transform: translateX(6%); opacity: 0.3; } to { transform: translateX(0); opacity: 1; } }
+@keyframes nextslide-slide-in-r { from { transform: translateX(-6%); opacity: 0.3; } to { transform: translateX(0); opacity: 1; } }
+@keyframes nextslide-slide-in-u { from { transform: translateY(6%); opacity: 0.3; } to { transform: translateY(0); opacity: 1; } }
+@keyframes nextslide-slide-in-d { from { transform: translateY(-6%); opacity: 0.3; } to { transform: translateY(0); opacity: 1; } }
+`;
+
 function withPlaybackParams(embedUrl: string, platform?: string): string {
   try {
     const url = new URL(embedUrl);
-    if (platform === 'youtube' || url.hostname.includes('youtube.com') || url.hostname.includes('youtu.be')) {
+    if (isYouTubeEmbed(embedUrl, platform)) {
       url.searchParams.set('enablejsapi', '1');
       url.searchParams.set('autoplay', '1');
       url.searchParams.set('playsinline', '1');
+      url.searchParams.set('origin', window.location.origin);
       return url.toString();
     }
     return embedUrl;
@@ -240,13 +365,49 @@ function withPlaybackParams(embedUrl: string, platform?: string): string {
   }
 }
 
-function postYouTubeCommand(iframe: HTMLIFrameElement | null, func: string, args: any[] = []) {
-  if (!iframe || !iframe.contentWindow) return;
-  iframe.contentWindow.postMessage(JSON.stringify({ event: 'command', func, args }), '*');
+function isYouTubeEmbed(embedUrl: string, platform?: string): boolean {
+  try {
+    const url = new URL(embedUrl);
+    return platform === 'youtube' || url.hostname.includes('youtube.com') || url.hostname.includes('youtu.be');
+  } catch {
+    return false;
+  }
+}
+
+// Loads YouTube's official IFrame Player API script once (safe to call
+// repeatedly/concurrently - later callers just await the same promise) and
+// resolves once window.YT.Player is actually usable. This replaces the old
+// approach of hand-rolling postMessage({event:'listening'}) pings and
+// sniffing raw 'infoDelivery' messages, which only worked once the player
+// happened to volunteer one on its own - in practice that meant the phone's
+// progress bar stayed empty until something like a seek nudged it into
+// talking. The real API fires a proper onReady event as soon as metadata
+// is available, and getCurrentTime()/getDuration()/getVolume() can just be
+// asked for directly instead of guessed at from whatever last flew by.
+let ytApiLoadPromise: Promise<void> | null = null;
+function loadYouTubeIframeAPI(): Promise<void> {
+  if (typeof window === 'undefined') return Promise.resolve();
+  const w = window as any;
+  if (w.YT && w.YT.Player) return Promise.resolve();
+  if (ytApiLoadPromise) return ytApiLoadPromise;
+  ytApiLoadPromise = new Promise((resolve) => {
+    const previous = w.onYouTubeIframeAPIReady;
+    w.onYouTubeIframeAPIReady = () => {
+      previous?.();
+      resolve();
+    };
+    if (!document.querySelector('script[src="https://www.youtube.com/iframe_api"]')) {
+      const tag = document.createElement('script');
+      tag.src = 'https://www.youtube.com/iframe_api';
+      document.head.appendChild(tag);
+    }
+  });
+  return ytApiLoadPromise;
 }
 
 export default function Present() {
   const { fileId } = useParams<{ fileId: string }>();
+  const [searchParams] = useSearchParams();
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -291,6 +452,13 @@ export default function Present() {
   const [screenMode, setScreenMode] = useState<ScreenMode>('normal');
   const [zoom, setZoom] = useState<ZoomState>(DEFAULT_ZOOM);
   const [spotlight, setSpotlight] = useState<SpotlightState>({ x: 0.5, y: 0.5, active: false, radius: 160 });
+  const [projectorTimer, setProjectorTimer] = useState<ProjectorTimerState>(DEFAULT_PROJECTOR_TIMER);
+  const [timerAlert, setTimerAlert] = useState<{ label: string; key: number; flashMs: number } | null>(null);
+  useEffect(() => {
+    if (!timerAlert) return;
+    const id = setTimeout(() => setTimerAlert((cur) => (cur?.key === timerAlert.key ? null : cur)), timerAlert.flashMs);
+    return () => clearTimeout(id);
+  }, [timerAlert]);
   const [laser, setLaser] = useState({ x: 0.5, y: 0.5, active: false });
   const [videoState, setVideoState] = useState<VideoState>(DEFAULT_VIDEO_STATE);
 
@@ -298,7 +466,14 @@ export default function Present() {
   const presentCtxRef = useRef<CanvasRenderingContext2D | null>(null);
   const allDrawingsRef = useRef<CanvasDataMap>({});
   const currentLineRef = useRef<Point[]>([]);
+  // Pixel coords of the last point drawn for the in-progress remote stroke.
+  // See the draw_stroke handler below for why this exists (fixes highlighter
+  // strokes rendering much darker than their final, redrawn appearance).
+  const lastStrokePxRef = useRef<{ x: number; y: number } | null>(null);
   const videoIframeRef = useRef<HTMLIFrameElement>(null);
+  // The real YT.Player instance bound to videoIframeRef - see the effect
+  // further down that creates/destroys it as video slides come and go.
+  const ytPlayerRef = useRef<any>(null);
 
   const sessionStateSaveTimer = useRef<any>(null);
 
@@ -315,7 +490,24 @@ export default function Present() {
   const remoteUrl = `${window.location.origin}${window.location.pathname}#/remote?session=${sessionId}`;
   const audienceUrl = `${window.location.origin}${window.location.pathname}#/audience?session=${sessionId}`;
   const wrapperRef = useRef<HTMLDivElement>(null);
+  // Separate from wrapperRef: this is the actual target for the real
+  // Fullscreen API (see the comment above the JSX that uses it). wrapperRef
+  // itself stays scoped to just the slide area, since it also drives the
+  // annotation canvas's size (see the resize effect below) - widening it to
+  // include the sidebar/quiz-stage would throw off every stroke's x/y math.
+  const fullscreenTargetRef = useRef<HTMLDivElement>(null);
   const channelRef = useRef<any>(null);
+
+  // Tracks real OS-level fullscreen (via the Fullscreen API), separate from
+  // focusMode. Used to hide the Prev/Next/slide-name bar so real fullscreen
+  // shows only the slide - the bar is still useful in the normal windowed
+  // view, just not once the browser has taken over the whole screen.
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  useEffect(() => {
+    const handleFullscreenChange = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
+  }, []);
 
   // Session PIN (soft lock, see the matching comment in MobileRemote.tsx) -
   // generated once when the session row is first created, then persisted
@@ -336,11 +528,13 @@ export default function Present() {
 
   // Draft questions, built up before "Start Quiz" is pressed.
   const [draftQuestions, setDraftQuestions] = useState<QuizQuestion[]>([]);
+  const [qType, setQType] = useState<QuizQuestionType>('mcq');
   const [qText, setQText] = useState('');
   const [qOptions, setQOptions] = useState<{ text: string; imageUrl: string }[]>([{ text: '', imageUrl: '' }, { text: '', imageUrl: '' }]);
   const [qCorrectIndex, setQCorrectIndex] = useState<number | null>(null);
   const [qSource, setQSource] = useState('');
   const [qTimeLimit, setQTimeLimit] = useState(20);
+  const [saveTitle, setSaveTitle] = useState('');
 
   const persistAudienceState = useCallback((next: AudienceState) => {
     audienceStateRef.current = next;
@@ -353,16 +547,33 @@ export default function Present() {
 
   const addDraftQuestion = () => {
     const question = qText.trim();
-    const options = qOptions.map((o) => ({ text: o.text.trim(), imageUrl: o.imageUrl.trim() })).filter((o) => o.text || o.imageUrl);
-    if (!question || options.length < 2 || qCorrectIndex === null) return;
-    const newQ: QuizQuestion = {
-      id: `q_${Date.now().toString(36)}`,
-      question,
-      options: options.map((o, i) => ({ id: `opt_${i}`, text: o.text, imageUrl: o.imageUrl || undefined })),
-      correctOptionId: `opt_${qCorrectIndex}`,
-      source: qSource.trim() || undefined,
-      timeLimitSeconds: qTimeLimit,
-    };
+    if (!question) return;
+    let newQ: QuizQuestion;
+    if (qType === 'mcq') {
+      const options = qOptions.map((o) => ({ text: o.text.trim(), imageUrl: o.imageUrl.trim() })).filter((o) => o.text || o.imageUrl);
+      if (options.length < 2 || qCorrectIndex === null) return;
+      newQ = {
+        id: `q_${Date.now().toString(36)}`,
+        type: 'mcq',
+        question,
+        options: options.map((o, i) => ({ id: `opt_${i}`, text: o.text, imageUrl: o.imageUrl || undefined })),
+        correctOptionId: `opt_${qCorrectIndex}`,
+        source: qSource.trim() || undefined,
+        timeLimitSeconds: qTimeLimit,
+      };
+    } else {
+      // Short/long answer: no options, nothing to auto-grade - the source
+      // note is still useful context to show after reveal.
+      newQ = {
+        id: `q_${Date.now().toString(36)}`,
+        type: qType,
+        question,
+        options: [],
+        correctOptionId: '',
+        source: qSource.trim() || undefined,
+        timeLimitSeconds: qTimeLimit,
+      };
+    }
     setDraftQuestions((prev) => [...prev, newQ]);
     setQText(''); setQOptions([{ text: '', imageUrl: '' }, { text: '', imageUrl: '' }]); setQCorrectIndex(null); setQSource(''); setQTimeLimit(20);
   };
@@ -374,19 +585,19 @@ export default function Present() {
   const startQuizFlow = useCallback((questions: QuizQuestion[]) => {
     if (!questions.length) return;
     setQuizStageMinimized(false);
-    persistAudienceState({ ...audienceStateRef.current, quiz: { questions, currentIndex: -1, status: 'lobby', questionStartedAt: null, participants: {} } });
+    persistAudienceState({ ...audienceStateRef.current, quiz: { questions, currentIndex: -1, status: 'lobby', questionStartedAt: null, participants: {}, spotlightParticipantId: null } });
   }, [persistAudienceState]);
 
   const advanceQuiz = useCallback(() => {
     const quiz = audienceStateRef.current.quiz;
     if (quiz.status === 'lobby') {
-      persistAudienceState({ ...audienceStateRef.current, quiz: { ...quiz, currentIndex: 0, status: 'question', questionStartedAt: Date.now() } });
+      persistAudienceState({ ...audienceStateRef.current, quiz: { ...quiz, currentIndex: 0, status: 'question', questionStartedAt: Date.now(), spotlightParticipantId: null } });
     } else if (quiz.status === 'reveal') {
       const nextIndex = quiz.currentIndex + 1;
       if (nextIndex >= quiz.questions.length) {
         persistAudienceState({ ...audienceStateRef.current, quiz: { ...quiz, status: 'finished' } });
       } else {
-        persistAudienceState({ ...audienceStateRef.current, quiz: { ...quiz, currentIndex: nextIndex, status: 'question', questionStartedAt: Date.now() } });
+        persistAudienceState({ ...audienceStateRef.current, quiz: { ...quiz, currentIndex: nextIndex, status: 'question', questionStartedAt: Date.now(), spotlightParticipantId: null } });
       }
     }
   }, [persistAudienceState]);
@@ -397,9 +608,71 @@ export default function Present() {
     persistAudienceState({ ...audienceStateRef.current, quiz: { ...quiz, status: 'reveal' } });
   }, [persistAudienceState]);
 
+  // Featured a specific short/long answer big on the projector - or, if no
+  // participantId is given, picks one at random from whoever's answered
+  // the current question so far. Either the teacher tapping a card, or the
+  // "🎲 Spotlight" button (on the projector or the remote), lands here.
+  const spotlightAnswer = useCallback((participantId?: string) => {
+    const quiz = audienceStateRef.current.quiz;
+    const question = quiz.currentIndex >= 0 ? quiz.questions[quiz.currentIndex] : null;
+    if (!question) return;
+    let target = participantId;
+    if (!target) {
+      const answeredIds = Object.values(quiz.participants).filter((p) => p.answers[question.id]?.text).map((p) => p.id);
+      if (!answeredIds.length) return;
+      target = answeredIds[Math.floor(Math.random() * answeredIds.length)];
+    }
+    persistAudienceState({ ...audienceStateRef.current, quiz: { ...quiz, spotlightParticipantId: target } });
+  }, [persistAudienceState]);
+
   const resetQuiz = useCallback(() => {
     setDraftQuestions([]);
     persistAudienceState({ ...audienceStateRef.current, quiz: DEFAULT_QUIZ_STATE });
+  }, [persistAudienceState]);
+
+  // Opened from the account dashboard's "▶ Open" on a saved quiz (see
+  // Account.tsx's openQuiz): the dashboard can't reach into this specific
+  // tab's React state directly (it's a brand new tab), so it hands the quiz
+  // off through a one-time sessionStorage token referenced in the URL
+  // instead. Auto-starts the quiz and opens the panel so it's ready to go
+  // the moment the presenter has an audience.
+  const presetQuizToken = searchParams.get('presetQuiz');
+  const presetQuizAppliedRef = useRef(false);
+  useEffect(() => {
+    if (!presetQuizToken || presetQuizAppliedRef.current) return;
+    presetQuizAppliedRef.current = true;
+    try {
+      const raw = sessionStorage.getItem(presetQuizToken);
+      if (!raw) return;
+      sessionStorage.removeItem(presetQuizToken);
+      const { questions } = JSON.parse(raw);
+      if (Array.isArray(questions) && questions.length) {
+        startQuizFlow(questions);
+        setQuizPanelOpen(true);
+      }
+    } catch (err) {
+      console.warn('⚠️ Could not load the preset quiz:', err);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [presetQuizToken]);
+
+  // Saved quizzes - prepared once, started whenever ("any day, same lesson
+  // link"). Lives in the same audience_state row as everything else, so no
+  // extra Supabase setup is needed - just note this ties saved quizzes to
+  // whichever browser/device is used to open the presenter link, since
+  // that's what session_id itself is tied to (see the sessionId comment
+  // above). Same device each time -> saved quizzes are always there.
+  const saveQuiz = useCallback((title: string, questions: QuizQuestion[]) => {
+    if (!title.trim() || !questions.length) return;
+    const saved: SavedQuiz = { id: `sv_${Date.now().toString(36)}`, title: title.trim(), questions, createdAt: Date.now() };
+    persistAudienceState({ ...audienceStateRef.current, savedQuizzes: [...audienceStateRef.current.savedQuizzes, saved] });
+    // Also lands in the presenter's account dashboard (if logged in), so
+    // it's reachable from anywhere, not just from inside this one file's
+    // saved-quizzes list.
+    recordSavedItem({ kind: 'quiz', title: title.trim(), questions });
+  }, [persistAudienceState]);
+  const deleteSavedQuiz = useCallback((id: string) => {
+    persistAudienceState({ ...audienceStateRef.current, savedQuizzes: audienceStateRef.current.savedQuizzes.filter((s) => s.id !== id) });
   }, [persistAudienceState]);
 
   // Auto-reveal when the countdown for the current question runs out -
@@ -420,22 +693,47 @@ export default function Present() {
   const currentQuestion = quiz.currentIndex >= 0 ? quiz.questions[quiz.currentIndex] : null;
   const leaderboard = rankParticipants(quiz.participants);
 
-  const downloadQuizResults = () => {
-    const rows: (string | number)[][] = [['Rank', 'Name', 'Score', 'Correct answers', 'Total questions']];
-    leaderboard.forEach((p, i) => {
-      const correctCount = Object.values(p.answers).filter((a) => a.correct).length;
-      rows.push([i + 1, p.name, p.totalScore, correctCount, quiz.questions.length]);
-    });
-    rows.push([]);
-    rows.push(['Question', 'Source / further reading']);
-    quiz.questions.forEach((q) => rows.push([q.question, q.source || '']));
-    downloadCsv(`quiz-results-${sessionId}.csv`, rows);
+  const reportData: QuizReportData = useMemo(() => ({
+    title: 'Quiz Results',
+    dateLabel: new Date().toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }),
+    leaderboard: leaderboard.map((p, i) => ({
+      rank: i + 1,
+      name: p.name,
+      emoji: p.emoji || (i < 3 ? autoEmojiFor(p.id) : ''),
+      score: p.totalScore,
+      correctCount: Object.values(p.answers).filter((a) => a.correct).length,
+      totalQuestions: quiz.questions.length,
+    })),
+    questions: quiz.questions.map((q) => {
+      const answersForQ = leaderboard.map((p) => p.answers[q.id]).filter(Boolean) as QuizAnswerRecord[];
+      return {
+        id: q.id,
+        question: q.question,
+        correctText: q.options.find((o) => o.id === q.correctOptionId)?.text || '',
+        source: q.source,
+        correctCount: answersForQ.filter((a) => a.correct).length,
+        incorrectCount: answersForQ.filter((a) => !a.correct).length,
+      };
+    }),
+  }), [leaderboard, quiz.questions]);
+
+  const reportNodeRef = useRef<HTMLDivElement>(null);
+  const [exporting, setExporting] = useState<'pdf' | 'png' | null>(null);
+  const downloadReport = async (format: 'pdf' | 'png') => {
+    if (!reportNodeRef.current || exporting) return;
+    setExporting(format);
+    try {
+      if (format === 'pdf') await exportReportPDF(reportNodeRef.current, `quiz-results-${sessionId}.pdf`);
+      else await exportReportPNG(reportNodeRef.current, `quiz-results-${sessionId}.png`);
+    } finally {
+      setExporting(null);
+    }
   };
 
   const toggleFullscreen = () => {
-    if (!wrapperRef.current) return;
+    if (!fullscreenTargetRef.current) return;
     if (!document.fullscreenElement) {
-      wrapperRef.current.requestFullscreen().catch(() => {});
+      fullscreenTargetRef.current.requestFullscreen().catch(() => {});
     } else {
       document.exitFullscreen();
     }
@@ -457,8 +755,8 @@ export default function Present() {
     });
     // Also attempt the real OS-level fullscreen in case this happens to run
     // in a context where it's allowed - silently ignored if blocked.
-    if (wrapperRef.current && !document.fullscreenElement) {
-      wrapperRef.current.requestFullscreen().catch(() => {});
+    if (fullscreenTargetRef.current && !document.fullscreenElement) {
+      fullscreenTargetRef.current.requestFullscreen().catch(() => {});
     }
   }, []);
 
@@ -628,42 +926,84 @@ export default function Present() {
 
       channel.on('broadcast', { event: 'video_control' }, (payload) => {
         const { action, value } = payload.payload || {};
-        const iframe = videoIframeRef.current;
-        if (action === 'play') postYouTubeCommand(iframe, 'playVideo');
-        else if (action === 'pause') postYouTubeCommand(iframe, 'pauseVideo');
-        else if (action === 'seek' && typeof value === 'number') postYouTubeCommand(iframe, 'seekTo', [value, true]);
-        else if (action === 'volume' && typeof value === 'number') postYouTubeCommand(iframe, 'setVolume', [value]);
-        else if (action === 'mute') postYouTubeCommand(iframe, 'mute');
-        else if (action === 'unmute') postYouTubeCommand(iframe, 'unMute');
+        const player = ytPlayerRef.current;
+        if (!player) return;
+        try {
+          if (action === 'play') player.playVideo();
+          else if (action === 'pause') player.pauseVideo();
+          else if (action === 'seek' && typeof value === 'number') player.seekTo(value, true);
+          else if (action === 'volume' && typeof value === 'number') player.setVolume(value);
+          else if (action === 'mute') player.mute();
+          else if (action === 'unmute') player.unMute();
+        } catch {
+          // Player not fully initialized yet - command is dropped, same
+          // best-effort behavior as before.
+        }
       });
 
       channel.on('broadcast', { event: 'fullscreen_toggle' }, () => {
         handleFullscreenRequest();
       });
 
+      // "Start the lesson" button on the phone (see MobileRemote.tsx) - a
+      // plain full page reload of the projector tab. Mainly for the case
+      // where the projector's browser was left open from before, is stuck,
+      // or just needs a clean start right as class begins.
+      channel.on('broadcast', { event: 'presenter_reload' }, () => {
+        window.location.reload();
+      });
+
+      // Countdown timer mirror - MobileRemote.tsx is authoritative, this
+      // only ever displays what it's told (see ProjectorTimerState above).
+      channel.on('broadcast', { event: 'timer_state' }, (payload) => {
+        const { secondsLeft, running, visible } = payload.payload || {};
+        setProjectorTimer({
+          secondsLeft: typeof secondsLeft === 'number' ? secondsLeft : null,
+          running: !!running,
+          visible: !!visible,
+        });
+      });
+      channel.on('broadcast', { event: 'timer_alert' }, (payload) => {
+        const { label, flashMs } = payload.payload || {};
+        if (typeof label !== 'string') return;
+        setTimerAlert({ label, key: Date.now(), flashMs: typeof flashMs === 'number' ? flashMs : 900 });
+      });
+
       channel.on('broadcast', { event: 'quiz_join' }, (payload) => {
-        const { participantId, name } = payload.payload || {};
+        const { participantId, name, emoji } = payload.payload || {};
         if (!participantId || !name) return;
         const current = audienceStateRef.current;
         if (current.quiz.participants[participantId]) return; // already joined
-        const participants = { ...current.quiz.participants, [participantId]: { id: participantId, name, joinedAt: Date.now(), totalScore: 0, answers: {} } };
+        const participants = { ...current.quiz.participants, [participantId]: { id: participantId, name, emoji: emoji || undefined, joinedAt: Date.now(), totalScore: 0, answers: {} } };
         persistAudienceState({ ...current, quiz: { ...current.quiz, participants } });
       });
 
       channel.on('broadcast', { event: 'quiz_answer' }, (payload) => {
-        const { participantId, questionId, optionId, answeredAt } = payload.payload || {};
-        if (!participantId || !questionId || !optionId) return;
+        const { participantId, questionId, optionId, text, answeredAt } = payload.payload || {};
+        if (!participantId || !questionId) return;
         const current = audienceStateRef.current;
         const quiz = current.quiz;
         const participant = quiz.participants[participantId];
         const question = quiz.questions.find((q) => q.id === questionId);
         if (!participant || !question || participant.answers[questionId]) return; // no double-answers
-        const correct = question.correctOptionId === optionId;
-        const points = scoreAnswer(correct, answeredAt || Date.now(), quiz.questionStartedAt || Date.now(), question.timeLimitSeconds);
+
+        let answerRecord: QuizAnswerRecord;
+        if (question.type === 'short' || question.type === 'long') {
+          if (!text || !String(text).trim()) return;
+          // Free text isn't auto-gradable - flat participation credit for
+          // submitting, same for everyone regardless of what they wrote.
+          const FREE_TEXT_POINTS = 50;
+          answerRecord = { optionId: '', text: String(text).trim(), answeredAt: answeredAt || Date.now(), correct: false, points: FREE_TEXT_POINTS };
+        } else {
+          if (!optionId) return;
+          const correct = question.correctOptionId === optionId;
+          const points = scoreAnswer(correct, answeredAt || Date.now(), quiz.questionStartedAt || Date.now(), question.timeLimitSeconds);
+          answerRecord = { optionId, answeredAt: answeredAt || Date.now(), correct, points };
+        }
         const updatedParticipant: QuizParticipant = {
           ...participant,
-          totalScore: participant.totalScore + points,
-          answers: { ...participant.answers, [questionId]: { optionId, answeredAt: answeredAt || Date.now(), correct, points } },
+          totalScore: participant.totalScore + answerRecord.points,
+          answers: { ...participant.answers, [questionId]: answerRecord },
         };
         persistAudienceState({ ...current, quiz: { ...quiz, participants: { ...quiz.participants, [participantId]: updatedParticipant } } });
       });
@@ -673,13 +1013,34 @@ export default function Present() {
         persistAudienceState({ ...current, joinCount: current.joinCount + 1 });
       });
 
+      // Student-submitted questions - these feed the "question bank" the
+      // quiz builder pulls from (see the Quiz panel's "From student
+      // questions" section), they're not just a live Q&A feed.
+      channel.on('broadcast', { event: 'audience_question' }, (payload) => {
+        const text = (payload.payload?.text || '').trim();
+        if (!text) return;
+        const current = audienceStateRef.current;
+        const newQ: AudienceQuestion = { id: `sq_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`, text, upvotes: 0, answered: false, createdAt: Date.now() };
+        persistAudienceState({ ...current, questions: [...current.questions, newQ] });
+      });
+      channel.on('broadcast', { event: 'audience_upvote' }, (payload) => {
+        const { questionId } = payload.payload || {};
+        if (!questionId) return;
+        const current = audienceStateRef.current;
+        const questions = current.questions.map((q) => (q.id === questionId ? { ...q, upvotes: q.upvotes + 1 } : q));
+        persistAudienceState({ ...current, questions });
+      });
+
       // Lets the phone remote fully drive quiz creation/flow too.
       channel.on('broadcast', { event: 'quiz_control' }, (payload) => {
-        const { action, questions } = payload.payload || {};
+        const { action, questions, participantId: spotlightId } = payload.payload || {};
         if (action === 'start_quiz' && Array.isArray(questions)) startQuizFlow(questions);
         else if (action === 'advance') advanceQuiz();
         else if (action === 'reveal_now') revealQuizNow();
+        else if (action === 'spotlight_answer') spotlightAnswer(spotlightId || undefined);
         else if (action === 'reset') resetQuiz();
+        else if (action === 'save_quiz' && Array.isArray(questions) && payload.payload?.title) saveQuiz(payload.payload.title, questions);
+        else if (action === 'delete_saved' && payload.payload?.id) deleteSavedQuiz(payload.payload.id);
       });
 
       channel.on('broadcast', { event: 'draw_stroke' }, (payload) => {
@@ -696,16 +1057,30 @@ export default function Present() {
           ctx.globalAlpha = mode === 'highlight' ? 0.35 : 1;
           ctx.strokeStyle = color;
           ctx.lineWidth = width;
-          ctx.beginPath();
-          ctx.moveTo(pxX, pxY);
           currentLineRef.current = [{ x, y }];
+          lastStrokePxRef.current = { x: pxX, y: pxY };
         } else if (type === 'move') {
-          ctx.lineTo(pxX, pxY);
-          ctx.stroke();
+          // Stroke only the new short segment (last point -> this point),
+          // each in its own beginPath(). Re-stroking the whole accumulated
+          // path on every move (the old behaviour) re-composites every
+          // earlier segment's alpha again and again, so a translucent
+          // highlighter stroke gets darker and darker as you draw - by the
+          // time you lift your finger it's nearly opaque and can blot out
+          // whatever's underneath. A fresh short segment per move keeps
+          // each pixel's alpha basically constant with the live stroke,
+          // matching how redrawCanvasForSlide renders it afterwards.
+          const last = lastStrokePxRef.current;
+          if (last) {
+            ctx.beginPath();
+            ctx.moveTo(last.x, last.y);
+            ctx.lineTo(pxX, pxY);
+            ctx.stroke();
+          }
+          lastStrokePxRef.current = { x: pxX, y: pxY };
           currentLineRef.current.push({ x, y });
         } else if (type === 'end') {
-          ctx.closePath();
           ctx.restore();
+          lastStrokePxRef.current = null;
           if (currentLineRef.current.length > 0) {
             const flatNum = currentFlatIndexRef.current + 1;
             const stroke: Stroke = { points: currentLineRef.current, color, width, mode };
@@ -880,52 +1255,61 @@ export default function Present() {
     };
   }, [currentFlatIndex, redrawCanvasForSlide]);
 
-  // Listens for YouTube's postMessage player updates so we can relay
-  // play/pause/time/duration back to the phone remote's progress bar.
-  // Only fires for YouTube embeds with enablejsapi=1 (see withPlaybackParams).
-  useEffect(() => {
-    let lastBroadcast = 0;
-    let lastPlayerState: number | null = null;
-    function handleMessage(e: MessageEvent) {
-      if (typeof e.data !== 'string') return;
-      let data: any;
-      try { data = JSON.parse(e.data); } catch { return; }
-      if (data.event !== 'infoDelivery' || !data.info) return;
-      const now = Date.now();
-      const stateChanged = data.info.playerState !== lastPlayerState;
-      // Always let an actual play/pause/state transition through immediately -
-      // only the repetitive "still playing at time X" ticks get throttled.
-      // Otherwise a quick pause right after a play can land inside the
-      // throttle window and get silently dropped, leaving the remote's
-      // Play/Pause button stuck showing the wrong state until the next tick.
-      if (!stateChanged && now - lastBroadcast < 900) return;
-      lastBroadcast = now;
-      lastPlayerState = data.info.playerState;
-      const next: VideoState = {
-        playing: data.info.playerState === 1,
-        time: data.info.currentTime || 0,
-        duration: data.info.duration || 0,
-        volume: typeof data.info.volume === 'number' ? data.info.volume : videoState.volume,
-      };
-      setVideoState(next);
-      channelRef.current?.send({ type: 'broadcast', event: 'video_time_update', payload: next });
-    }
-    window.addEventListener('message', handleMessage);
-    return () => window.removeEventListener('message', handleMessage);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Establishes the YouTube "listening" handshake once a video-link slide
-  // with jsapi enabled is on screen, so infoDelivery messages start flowing.
+  // Creates a real YT.Player bound to the video iframe whenever a YouTube
+  // slide is on screen, and tears it down when that slide goes away. Once
+  // it's ready, onReady/onStateChange plus a 400ms poll keep videoState
+  // (playing/time/duration/volume) accurate and broadcast to the phone -
+  // this is what makes the remote's progress bar show up reliably and its
+  // volume slider actually track the real level, instead of both sitting
+  // frozen until some other action happened to jostle the old postMessage
+  // listener into life.
   useEffect(() => {
     if (resolved?.fileType !== 'video-link') return;
+    if (!isYouTubeEmbed(resolved.embedUrl, resolved.platform)) return;
     const iframe = videoIframeRef.current;
     if (!iframe) return;
-    const t = setTimeout(() => {
-      iframe.contentWindow?.postMessage(JSON.stringify({ event: 'listening', id: 'present' }), '*');
-    }, 1000);
-    return () => clearTimeout(t);
-  }, [resolved]);
+
+    let cancelled = false;
+    let pollInterval: ReturnType<typeof setInterval> | null = null;
+
+    const syncFromPlayer = () => {
+      const player = ytPlayerRef.current;
+      if (!player || typeof player.getPlayerState !== 'function') return;
+      try {
+        const next: VideoState = {
+          playing: player.getPlayerState() === 1,
+          time: player.getCurrentTime() || 0,
+          duration: player.getDuration() || 0,
+          volume: player.getVolume(),
+        };
+        setVideoState(next);
+        channelRef.current?.send({ type: 'broadcast', event: 'video_time_update', payload: next });
+      } catch {
+        // Player exists but isn't fully initialized yet - next poll retries.
+      }
+    };
+
+    // Reset immediately so the remote doesn't keep showing the previous
+    // video's progress while this one's player spins up.
+    setVideoState(DEFAULT_VIDEO_STATE);
+    channelRef.current?.send({ type: 'broadcast', event: 'video_time_update', payload: DEFAULT_VIDEO_STATE });
+
+    loadYouTubeIframeAPI().then(() => {
+      if (cancelled) return;
+      const YT = (window as any).YT;
+      ytPlayerRef.current = new YT.Player(iframe, {
+        events: { onReady: syncFromPlayer, onStateChange: syncFromPlayer },
+      });
+      pollInterval = setInterval(syncFromPlayer, 400);
+    });
+
+    return () => {
+      cancelled = true;
+      if (pollInterval) clearInterval(pollInterval);
+      try { ytPlayerRef.current?.destroy?.(); } catch { /* iframe already gone */ }
+      ytPlayerRef.current = null;
+    };
+  }, [resolved, currentFlatIndex]);
 
   // Initial load: figure out whether this id is a lesson or a single slide.
   useEffect(() => {
@@ -1032,9 +1416,10 @@ export default function Present() {
           }
           if (entry.fileType === 'pdf') {
             const n = await getPdfPageCount(entry.blobUrl);
+            const { notesByPage, transitionsByPage } = await fetchPptxMeta(ref.fileId);
             for (let p = 1; p <= n; p++) {
               const thumbnail = await renderPdfThumbnail(entry.blobUrl, p);
-              result.push({ itemIndex: i, pageInItem: p, fileType: 'pdf', name: ref.name, notes: ref.notes, thumbnail });
+              result.push({ itemIndex: i, pageInItem: p, fileType: 'pdf', name: ref.name, notes: notesByPage[p] || ref.notes, transition: transitionsByPage[p], thumbnail });
             }
           } else {
             const thumbnail = entry.fileType === 'image' ? await renderImageThumbnail(entry.blobUrl) : undefined;
@@ -1063,11 +1448,12 @@ export default function Present() {
     (async () => {
       if (resolved.fileType === 'pdf') {
         if (!numPages) return;
+        const { notesByPage, transitionsByPage } = fileId ? await fetchPptxMeta(fileId) : { notesByPage: {}, transitionsByPage: {} };
         const slides: FlatSlide[] = [];
         for (let i = 0; i < numPages; i++) {
           if (cancelled) return;
           const thumbnail = await renderPdfThumbnail(resolved.blobUrl, i + 1);
-          slides.push({ itemIndex: 0, pageInItem: i + 1, fileType: 'pdf', thumbnail });
+          slides.push({ itemIndex: 0, pageInItem: i + 1, fileType: 'pdf', notes: notesByPage[i + 1], transition: transitionsByPage[i + 1], thumbnail });
           if (!cancelled) setFlatSlides([...slides]);
         }
       } else if (resolved.fileType === 'image') {
@@ -1079,6 +1465,7 @@ export default function Present() {
     })();
 
     return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lessonSlides, resolved, numPages]);
 
   // Whenever a new item finishes resolving: non-pdf items are always a
@@ -1187,7 +1574,10 @@ export default function Present() {
     }
   };
 
-  const showNav = flatSlides.length > 1;
+  // Hidden once the browser is truly fullscreen or the phone has put us in
+  // focus mode - both cases want the slide to fill the whole screen with no
+  // chrome. Prev/Next still work via keyboard arrows and the phone remote.
+  const showNav = flatSlides.length > 1 && !isFullscreen && !focusMode;
   const isFirstSlide = flatSlides.length ? currentFlatIndex === 0 : currentIndex === 0;
   const isLastSlide = flatSlides.length ? currentFlatIndex === flatSlides.length - 1 : true;
 
@@ -1259,7 +1649,15 @@ export default function Present() {
         </button>
       )}
 
-      {/* Main slide area */}
+      {/* Main slide area, quiz stage, and timer overlay all live inside
+          fullscreenTargetRef. The real Fullscreen API only renders
+          descendants of whatever element it was called on - anything
+          rendered as a *sibling* (even position:fixed) simply doesn't
+          appear on screen once fullscreen is active. The quiz QR stage and
+          projector timer both used to be siblings of the slide area, which
+          is exactly why starting a quiz while in full screen used to show
+          nothing until you exited full screen. */}
+      <div ref={fullscreenTargetRef} className="flex-1 flex flex-col min-w-0 relative">
       <div className="flex-1 flex flex-col min-w-0">
         {showNav && (
           <div className="flex items-center justify-between px-4 py-3 bg-gray-900 border-b border-gray-800">
@@ -1306,6 +1704,14 @@ export default function Present() {
             className="w-full h-full flex items-center justify-center"
             style={{ transform: zoomTransform, transformOrigin: 'center center', transition: 'transform 0.15s ease-out' }}
           >
+            {/* Transition layer - remounts (and replays its entrance
+                animation) every time the flat slide index changes, using
+                whatever transition pptxParse.ts read off this specific
+                slide. flatSlides[currentFlatIndex] is undefined outside
+                pptx/lesson mode (e.g. plain PDFs with no extracted meta),
+                in which case this is just a plain instant cut, same as
+                before. */}
+            <div key={currentFlatIndex} className="w-full h-full flex items-center justify-center" style={transitionAnimationStyle(flatSlides[currentFlatIndex]?.transition)}>
             {!loading && !error && resolved?.fileType === 'pdf' && (
               <div className="w-full h-full flex items-center justify-center overflow-auto bg-white">
                 <Document
@@ -1334,6 +1740,7 @@ export default function Present() {
 
             {!loading && !error && resolved?.fileType === 'video-link' && (
               <iframe
+                key={`video-${currentFlatIndex}`}
                 ref={videoIframeRef}
                 src={withPlaybackParams(resolved.embedUrl, resolved.platform)}
                 title={resolved.name || 'Video'}
@@ -1352,7 +1759,9 @@ export default function Present() {
 
             {/* Annotation layer - laser/draw/highlight/erase strokes broadcast from the phone now render here too. */}
             <canvas ref={presentCanvasRef} className="absolute top-0 left-0 w-full h-full pointer-events-none z-10" />
+            </div>
           </div>
+          <style>{TRANSITION_KEYFRAMES_CSS}</style>
 
           {/* Spotlight/focus mode - darkens everything outside a circle around the presenter's pointer. */}
           {spotlight.active && (
@@ -1426,6 +1835,7 @@ export default function Present() {
               lang={presenterLang}
               onReveal={revealQuizNow}
               onAdvance={advanceQuiz}
+              onSpotlight={spotlightAnswer}
               isLast={quiz.currentIndex >= quiz.questions.length - 1}
             />
           )}
@@ -1433,10 +1843,13 @@ export default function Present() {
           {quiz.status === 'finished' && (
             <div className="flex flex-col items-center gap-6 w-full max-w-2xl">
               <h1 className="text-3xl font-bold">🏆 {ST(presenterLang, 'leaderboard')}</h1>
-              <LeaderboardList leaderboard={leaderboard} questionCount={quiz.questions.length} />
+              <LeaderboardList leaderboard={leaderboard} questionCount={quiz.questions.length} celebrate />
               <div className="flex gap-3">
-                <button onClick={downloadQuizResults} className="bg-blue-600 hover:bg-blue-500 px-5 py-2.5 rounded-full font-bold text-sm">
-                  ⬇ {ST(presenterLang, 'downloadResults')}
+                <button onClick={() => downloadReport('pdf')} disabled={!!exporting} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 px-5 py-2.5 rounded-full font-bold text-sm">
+                  {exporting === 'pdf' ? '…' : '⬇ PDF'}
+                </button>
+                <button onClick={() => downloadReport('png')} disabled={!!exporting} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 px-5 py-2.5 rounded-full font-bold text-sm">
+                  {exporting === 'png' ? '…' : '⬇ PNG'}
                 </button>
                 <button onClick={resetQuiz} className="bg-gray-700 hover:bg-gray-600 px-5 py-2.5 rounded-full font-bold text-sm">
                   🔄 {ST(presenterLang, 'newQuiz')}
@@ -1446,6 +1859,19 @@ export default function Present() {
           )}
         </div>
       )}
+
+      {/* Projector timer overlay - shown when the phone remote has "show on
+          projector" enabled for the countdown timer. Rendered inside
+          fullscreenTargetRef (see the comment above) so it stays visible
+          while the presenter is in real full screen. */}
+      <ProjectorTimer state={projectorTimer} alert={timerAlert} />
+      </div>
+
+      {/* Off-screen (not visually visible, but fully rendered so html2canvas
+          can capture it) - shared PDF/PNG report node. */}
+      <div style={{ position: 'fixed', top: 0, left: -9999, pointerEvents: 'none' }}>
+        <div ref={reportNodeRef}><QuizReportCard data={reportData} /></div>
+      </div>
 
       {quizPanelOpen && (
         <div className="fixed inset-0 z-[100] bg-black/70 flex items-center justify-center p-4" onClick={() => setQuizPanelOpen(false)}>
@@ -1469,7 +1895,8 @@ export default function Present() {
                 </p>
                 {quiz.status === 'finished' && (
                   <div className="flex gap-2">
-                    <button onClick={downloadQuizResults} className="flex-1 bg-blue-600 hover:bg-blue-500 rounded-lg py-2 text-sm font-bold">⬇ Download results</button>
+                    <button onClick={() => downloadReport('pdf')} disabled={!!exporting} className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg py-2 text-sm font-bold">{exporting === 'pdf' ? '…' : '⬇ PDF'}</button>
+                    <button onClick={() => downloadReport('png')} disabled={!!exporting} className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg py-2 text-sm font-bold">{exporting === 'png' ? '…' : '⬇ PNG'}</button>
                     <button onClick={resetQuiz} className="flex-1 bg-gray-700 hover:bg-gray-600 rounded-lg py-2 text-sm font-bold">🔄 New quiz</button>
                   </div>
                 )}
@@ -1482,6 +1909,32 @@ export default function Present() {
                   </div>
                   <p className="text-xs text-gray-400">Shown big on the projector once the quiz starts - audience scans it there, no need to share it separately.</p>
                 </div>
+
+                {audienceState.savedQuizzes.length > 0 && (
+                  <div className="flex flex-col gap-2 bg-gray-800/40 rounded-xl p-3">
+                    <p className="text-xs font-bold text-gray-400 uppercase">📚 Saved quizzes</p>
+                    {audienceState.savedQuizzes.map((sq) => (
+                      <div key={sq.id} className="flex items-center gap-2 bg-gray-800/70 rounded-lg px-3 py-2">
+                        <span className="flex-1 text-xs truncate">{sq.title} <span className="text-gray-500">({sq.questions.length}q)</span></span>
+                        <button onClick={() => startQuizFlow(sq.questions)} className="text-[11px] bg-emerald-600 hover:bg-emerald-500 px-2.5 py-1 rounded-full font-bold shrink-0">▶ Start</button>
+                        <button onClick={() => deleteSavedQuiz(sq.id)} className="text-gray-500 hover:text-red-400 text-xs shrink-0">✕</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {audienceState.questions.length > 0 && (
+                  <div className="flex flex-col gap-2 bg-gray-800/40 rounded-xl p-3">
+                    <p className="text-xs font-bold text-gray-400 uppercase">📥 From student questions</p>
+                    {[...audienceState.questions].sort((a, b) => b.upvotes - a.upvotes).map((sq) => (
+                      <div key={sq.id} className="flex items-center gap-2 bg-gray-800/70 rounded-lg px-3 py-2">
+                        <span className="flex-1 text-xs truncate">{sq.text} <span className="text-gray-500">({sq.upvotes} 👍)</span></span>
+                        <button onClick={() => setQText(sq.text)} className="text-[11px] bg-blue-600 hover:bg-blue-500 px-2.5 py-1 rounded-full font-bold shrink-0">Use</button>
+                      </div>
+                    ))}
+                    <p className="text-[10px] text-gray-500">Fills the question box below - add options and mark the correct answer, then "Add to quiz".</p>
+                  </div>
+                )}
 
                 {draftQuestions.length > 0 && (
                   <div className="flex flex-col gap-2">
@@ -1497,8 +1950,22 @@ export default function Present() {
 
                 <div className="flex flex-col gap-3 border-t border-gray-800 pt-4">
                   <p className="text-xs font-bold text-gray-400 uppercase">Add question</p>
+
+                  <div className="flex gap-1.5">
+                    {(['mcq', 'short', 'long'] as QuizQuestionType[]).map((t) => (
+                      <button
+                        key={t}
+                        onClick={() => setQType(t)}
+                        className={`flex-1 rounded-lg py-1.5 text-xs font-bold ${qType === t ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400'}`}
+                      >
+                        {t === 'mcq' ? 'Multiple choice' : t === 'short' ? 'Short answer' : 'Long answer'}
+                      </button>
+                    ))}
+                  </div>
+
                   <input value={qText} onChange={(e) => setQText(e.target.value)} placeholder="Ask a question..." className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm" />
 
+                  {qType === 'mcq' && (
                   <div className="flex flex-col gap-2">
                     {qOptions.map((opt, i) => (
                       <div key={i} className="flex items-center gap-2">
@@ -1534,6 +2001,12 @@ export default function Present() {
                       />
                     ))}
                   </div>
+                  )}
+                  {qType !== 'mcq' && (
+                    <p className="text-[10px] text-gray-500">
+                      Everyone types their own {qType === 'short' ? 'short' : 'long'} answer - no options, nothing auto-graded. Their name and answer show up as a card on the projector once they submit.
+                    </p>
+                  )}
 
                   <input value={qSource} onChange={(e) => setQSource(e.target.value)} placeholder="Source / further reading (optional)" className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs" />
 
@@ -1545,10 +2018,26 @@ export default function Present() {
 
                   <button
                     onClick={addDraftQuestion}
-                    disabled={!qText.trim() || qCorrectIndex === null}
+                    disabled={!qText.trim() || (qType === 'mcq' && qCorrectIndex === null)}
                     className="bg-gray-700 disabled:opacity-30 hover:bg-gray-600 rounded-lg py-2 text-sm font-bold"
                   >
                     + Add to quiz
+                  </button>
+                </div>
+
+                <div className="flex gap-2">
+                  <input
+                    value={saveTitle}
+                    onChange={(e) => setSaveTitle(e.target.value)}
+                    placeholder="Quiz title (to save for later)"
+                    className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs"
+                  />
+                  <button
+                    onClick={() => { saveQuiz(saveTitle, draftQuestions); setSaveTitle(''); }}
+                    disabled={draftQuestions.length === 0 || !saveTitle.trim()}
+                    className="bg-gray-700 disabled:opacity-30 hover:bg-gray-600 px-4 rounded-lg text-xs font-bold shrink-0"
+                  >
+                    💾 Save
                   </button>
                 </div>
 
@@ -1585,8 +2074,8 @@ const STAGE_TEXT: Record<'ku' | 'en', Record<string, string>> = {
 };
 function ST(lang: 'ku' | 'en', key: string) { return STAGE_TEXT[lang][key] || key; }
 
-function QuizLiveStage({ quiz, question, lang, onReveal, onAdvance, isLast }: {
-  quiz: QuizState; question: QuizQuestion; lang: 'ku' | 'en'; onReveal: () => void; onAdvance: () => void; isLast: boolean;
+function QuizLiveStage({ quiz, question, lang, onReveal, onAdvance, onSpotlight, isLast }: {
+  quiz: QuizState; question: QuizQuestion; lang: 'ku' | 'en'; onReveal: () => void; onAdvance: () => void; onSpotlight: (participantId?: string) => void; isLast: boolean;
 }) {
   const [, tick] = useState(0);
   useEffect(() => {
@@ -1595,11 +2084,32 @@ function QuizLiveStage({ quiz, question, lang, onReveal, onAdvance, isLast }: {
     return () => clearInterval(i);
   }, [quiz.status]);
 
-  const answeredCount = Object.values(quiz.participants).filter((p) => p.answers[question.id]).length;
-  const totalParticipants = Object.values(quiz.participants).length;
   const secondsLeft = quiz.questionStartedAt
     ? Math.max(0, Math.ceil((quiz.questionStartedAt + question.timeLimitSeconds * 1000 - Date.now()) / 1000))
     : question.timeLimitSeconds;
+
+  const lastBeepSecondRef = useRef<number | null>(null);
+  const timesUpPlayedRef = useRef(false);
+  useEffect(() => {
+    if (quiz.status === 'question') playQuestionStartChime();
+    lastBeepSecondRef.current = null;
+    timesUpPlayedRef.current = false;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [question.id]);
+  useEffect(() => {
+    if (quiz.status !== 'question') return;
+    if (secondsLeft >= 1 && secondsLeft <= 5 && lastBeepSecondRef.current !== secondsLeft) {
+      lastBeepSecondRef.current = secondsLeft;
+      playTickBeep(secondsLeft <= 3);
+    }
+    if (secondsLeft === 0 && !timesUpPlayedRef.current) {
+      timesUpPlayedRef.current = true;
+      playTimesUpChime();
+    }
+  }, [secondsLeft, quiz.status]);
+
+  const answeredCount = Object.values(quiz.participants).filter((p) => p.answers[question.id]).length;
+  const totalParticipants = Object.values(quiz.participants).length;
   const pct = Math.max(0, Math.min(100, (secondsLeft / question.timeLimitSeconds) * 100));
 
   const votesByOption: Record<string, number> = {};
@@ -1627,29 +2137,33 @@ function QuizLiveStage({ quiz, question, lang, onReveal, onAdvance, isLast }: {
       )}
       {quiz.status === 'question' && <span className="text-4xl font-mono font-bold">{secondsLeft}s</span>}
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full">
-        {question.options.map((opt, i) => {
-          const isCorrect = quiz.status === 'reveal' && opt.id === question.correctOptionId;
-          const votes = votesByOption[opt.id] || 0;
-          const optPct = totalAnswers ? Math.round((votes / totalAnswers) * 100) : 0;
-          return (
-            <div
-              key={opt.id}
-              className={`relative rounded-2xl p-4 overflow-hidden font-semibold text-left ${palette[i % palette.length]} ${quiz.status === 'reveal' && !isCorrect ? 'opacity-40' : ''} ${isCorrect ? 'ring-4 ring-white' : ''}`}
-            >
-              {quiz.status === 'reveal' && (
-                <div className="absolute inset-0 bg-black/30" style={{ width: `${optPct}%` }} />
-              )}
-              <div className="relative flex items-center gap-3">
-                {opt.imageUrl && <img src={opt.imageUrl} alt="" className="w-12 h-12 object-cover rounded-lg" />}
-                <span className="flex-1">{opt.text}</span>
-                {isCorrect && <span className="text-xl">✓</span>}
-                {quiz.status === 'reveal' && <span className="text-xs font-mono">{votes} · {optPct}%</span>}
+      {question.type !== 'mcq' ? (
+        <FreeTextAnswerStage quiz={quiz} question={question} onSpotlight={onSpotlight} lang={lang} />
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full">
+          {question.options.map((opt, i) => {
+            const isCorrect = quiz.status === 'reveal' && opt.id === question.correctOptionId;
+            const votes = votesByOption[opt.id] || 0;
+            const optPct = totalAnswers ? Math.round((votes / totalAnswers) * 100) : 0;
+            return (
+              <div
+                key={opt.id}
+                className={`relative rounded-2xl p-4 overflow-hidden font-semibold text-left ${palette[i % palette.length]} ${quiz.status === 'reveal' && !isCorrect ? 'opacity-40' : ''} ${isCorrect ? 'ring-4 ring-white' : ''}`}
+              >
+                {quiz.status === 'reveal' && (
+                  <div className="absolute inset-0 bg-black/30" style={{ width: `${optPct}%` }} />
+                )}
+                <div className="relative flex items-center gap-3">
+                  {opt.imageUrl && <img src={opt.imageUrl} alt="" className="w-12 h-12 object-cover rounded-lg" />}
+                  <span className="flex-1">{opt.text}</span>
+                  {isCorrect && <span className="text-xl">✓</span>}
+                  {quiz.status === 'reveal' && <span className="text-xs font-mono">{votes} · {optPct}%</span>}
+                </div>
               </div>
-            </div>
-          );
-        })}
-      </div>
+            );
+          })}
+        </div>
+      )}
 
       {quiz.status === 'reveal' && question.source && (
         <p className="text-xs text-indigo-300 max-w-lg text-center">📚 {ST(lang, 'source')}: {question.source}</p>
@@ -1671,25 +2185,132 @@ function QuizLiveStage({ quiz, question, lang, onReveal, onAdvance, isLast }: {
   );
 }
 
-function LeaderboardList({ leaderboard, questionCount }: { leaderboard: QuizParticipant[]; questionCount: number }) {
+// Grid of every submitted short/long answer - name on top of the card, each
+// participant in their own consistent color (see answerCardColorFor above),
+// so a room full of answers is still easy to scan and tell apart. Clicking
+// any card - or the "🎲 Spotlight" button for a random pick - features it
+// big in the middle with the rest dimmed behind, per the "select one to
+// show big, others behind" request.
+function FreeTextAnswerStage({ quiz, question, onSpotlight, lang }: {
+  quiz: QuizState; question: QuizQuestion; onSpotlight: (participantId?: string) => void; lang: 'ku' | 'en';
+}) {
+  const answered = Object.values(quiz.participants)
+    .filter((p) => p.answers[question.id]?.text)
+    .sort((a, b) => (a.answers[question.id]?.answeredAt || 0) - (b.answers[question.id]?.answeredAt || 0));
+  const spotlighted = quiz.spotlightParticipantId ? quiz.participants[quiz.spotlightParticipantId] : null;
+  const spotlightedAnswer = spotlighted?.answers[question.id]?.text;
+
+  if (!answered.length) {
+    return <p className="text-indigo-300 text-sm py-8">{lang === 'ku' ? 'چاوەڕوانی وەڵام...' : 'Waiting for answers...'}</p>;
+  }
+
+  return (
+    <div className="w-full flex flex-col items-center gap-5">
+      <button
+        onClick={() => onSpotlight()}
+        className="bg-white/10 hover:bg-white/20 px-5 py-2 rounded-full font-bold text-sm flex items-center gap-2"
+      >
+        🎲 {lang === 'ku' ? 'وەڵامێک هەڵبژێرە' : 'Spotlight a random answer'}
+      </button>
+
+      {spotlighted && spotlightedAnswer && (
+        <div className="w-full max-w-2xl rounded-3xl p-6 shadow-2xl border-4" style={{ borderColor: answerCardColorFor(spotlighted.id), background: `${answerCardColorFor(spotlighted.id)}22` }}>
+          <div className="flex items-center gap-2 mb-3">
+            <span className="text-2xl">{spotlighted.emoji || autoEmojiFor(spotlighted.id)}</span>
+            <span className="font-bold text-lg">{spotlighted.name}</span>
+          </div>
+          <p className="text-xl leading-relaxed whitespace-pre-wrap">{spotlightedAnswer}</p>
+        </div>
+      )}
+
+      <div className={`grid grid-cols-2 sm:grid-cols-3 gap-3 w-full transition-opacity ${spotlighted ? 'opacity-50' : ''}`}>
+        {answered.map((p) => {
+          const text = p.answers[question.id]?.text || '';
+          const color = answerCardColorFor(p.id);
+          const isSpotlighted = quiz.spotlightParticipantId === p.id;
+          return (
+            <button
+              key={p.id}
+              onClick={() => onSpotlight(p.id)}
+              className={`text-left rounded-xl p-3 border-2 hover:scale-[1.02] transition-transform ${isSpotlighted ? 'ring-2 ring-white' : ''}`}
+              style={{ borderColor: color, background: `${color}18` }}
+            >
+              <p className="text-xs font-bold truncate mb-1">{p.emoji || autoEmojiFor(p.id)} {p.name}</p>
+              <p className="text-sm line-clamp-3 whitespace-pre-wrap">{text}</p>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function LeaderboardList({ leaderboard, questionCount, celebrate }: { leaderboard: QuizParticipant[]; questionCount: number; celebrate?: boolean }) {
   const medals = ['🥇', '🥈', '🥉'];
   return (
     <div className="w-full flex flex-col gap-2">
       {leaderboard.length === 0 && <p className="text-gray-400 text-center text-sm">No participants.</p>}
       {leaderboard.map((p, i) => {
         const correctCount = Object.values(p.answers).filter((a) => a.correct).length;
+        const winnerEmoji = i < 3 ? (p.emoji || autoEmojiFor(p.id)) : null;
         return (
           <div
             key={p.id}
             className={`flex items-center gap-3 rounded-xl px-4 py-3 ${i === 0 ? 'bg-gradient-to-r from-amber-500/30 to-amber-600/10 border border-amber-500' : i < 3 ? 'bg-white/10 border border-white/20' : 'bg-white/5'}`}
           >
             <span className="text-xl w-8 text-center shrink-0">{medals[i] || `#${i + 1}`}</span>
+            {winnerEmoji && celebrate && (
+              <span className="text-2xl shrink-0" style={{ animation: `bounce-emoji 0.9s ease-in-out ${i * 0.15}s infinite` }}>{winnerEmoji}</span>
+            )}
             <span className="flex-1 font-semibold truncate">{p.name}</span>
             <span className="text-xs text-gray-400">{correctCount}/{questionCount} ✓</span>
             <span className="font-mono font-bold text-lg w-16 text-right">{p.totalScore}</span>
           </div>
         );
       })}
+      {celebrate && (
+        <style>{`@keyframes bounce-emoji { 0%,100% { transform: translateY(0) scale(1); } 50% { transform: translateY(-6px) scale(1.2); } }`}</style>
+      )}
     </div>
+  );
+}
+
+// Small persistent countdown chip (bottom corner) plus, at the 59s/3/2/1/0
+// thresholds, a big centered flash - both purely a mirror of whatever
+// MobileRemote.tsx's timer is doing (see ProjectorTimerState above). Renders
+// nothing at all unless the presenter has turned "show on projector" on.
+function formatProjectorTime(totalSeconds: number) {
+  const m = Math.floor(totalSeconds / 60).toString().padStart(2, '0');
+  const s = Math.floor(totalSeconds % 60).toString().padStart(2, '0');
+  return `${m}:${s}`;
+}
+function ProjectorTimer({ state, alert }: { state: ProjectorTimerState; alert: { label: string; key: number; flashMs: number } | null }) {
+  if (!state.visible || state.secondsLeft === null) return null;
+  const urgent = state.secondsLeft <= 60;
+  return (
+    <>
+      <div
+        className={`fixed bottom-5 right-5 z-[250] font-mono font-bold rounded-2xl px-5 py-2.5 text-3xl shadow-2xl border ${
+          state.secondsLeft === 0
+            ? 'bg-red-600/90 text-white border-red-400 animate-pulse'
+            : urgent
+            ? 'bg-amber-500/90 text-black border-amber-300 animate-pulse'
+            : 'bg-black/70 text-white border-white/20'
+        }`}
+      >
+        ⌛ {formatProjectorTime(state.secondsLeft)}
+      </div>
+      {alert && (
+        <div key={alert.key} className="fixed inset-0 z-[280] flex items-center justify-center pointer-events-none bg-black/50">
+          <span
+            className={`font-mono font-black drop-shadow-2xl ${alert.label === '0' ? 'text-red-500' : 'text-amber-400'}`}
+            style={{ fontSize: '22vw', lineHeight: 1, animation: 'timer-flash-pop 0.35s ease-out' }}
+          >
+            {alert.label === '0' ? '⏰' : alert.label}
+          </span>
+          <style>{`@keyframes timer-flash-pop { 0% { transform: scale(0.5); opacity: 0; } 60% { transform: scale(1.15); opacity: 1; } 100% { transform: scale(1); opacity: 1; } }`}</style>
+        </div>
+      )}
+    </>
   );
 }

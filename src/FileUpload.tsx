@@ -1,5 +1,9 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { supabase } from './supabaseClient';
+import { extractPptxMeta } from './pptxParse';
+import { recordSavedItem, formatBytes } from './Account';
+import { useAuth } from './AuthContext';
 
 // Kept in sync with Code.gs's supported types
 const ACCEPTED_MIME_TYPES = [
@@ -63,6 +67,7 @@ interface SlideItem {
   fileId?: string;
   embedUrl?: string;
   platform?: string;
+  sizeBytes?: number;
   status: 'uploading' | 'done' | 'error';
   errorMessage?: string;
 }
@@ -74,6 +79,7 @@ export default function FileUpload() {
   const [message, setMessage] = useState('');
 
   const navigate = useNavigate();
+  const { user, profile, usage, refreshUsage } = useAuth();
 
   // Your newest deployment URL
   const GAS_URL = 'https://script.google.com/macros/s/AKfycbx48s5aNamkERYuvJ-BE7-RBF2zt15mFZ-C-SXL_UIGZkG46RdyuPYIOlO6o0HZcr3N/exec';
@@ -99,7 +105,16 @@ export default function FileUpload() {
 
   const uploadOneFile = (file: File) => {
     const localId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    setSlides((prev) => [...prev, { localId, name: file.name, status: 'uploading' }]);
+    setSlides((prev) => [...prev, { localId, name: file.name, status: 'uploading', sizeBytes: file.size }]);
+
+    // For .pptx specifically: start parsing the file's own XML for speaker
+    // notes + transition info right away, in parallel with the upload
+    // itself (they both read the same File, no conflict). This never
+    // touches Code.gs / the PDF conversion Present.tsx actually renders -
+    // it's a separate, best-effort pass that only feeds Supabase, so a
+    // parsing hiccup here can never break the upload or the presentation.
+    const isPptx = file.name.toLowerCase().endsWith('.pptx');
+    const metaPromise = isPptx ? extractPptxMeta(file) : null;
 
     const reader = new FileReader();
     reader.onload = async () => {
@@ -118,6 +133,23 @@ export default function FileUpload() {
           const result = JSON.parse(textResponse);
           if (result.status === 'success') {
             updateSlide(localId, { status: 'done', fileId: result.fileId, fileType: result.fileType });
+
+            if (metaPromise && result.fileId) {
+              metaPromise
+                .then((meta) => {
+                  if (!Object.keys(meta.notesByPage).length && !Object.keys(meta.transitionsByPage).length) return;
+                  return supabase.from('pptx_meta').upsert({
+                    file_id: result.fileId,
+                    notes: meta.notesByPage,
+                    transitions: meta.transitionsByPage,
+                  });
+                })
+                .catch((err) => {
+                  // Notes/transitions are a nice-to-have layered on top of a
+                  // working upload - never surface this as an upload error.
+                  console.warn('⚠️ Could not save PPTX notes/transitions (does the pptx_meta table exist yet?):', err);
+                });
+            }
           } else {
             updateSlide(localId, { status: 'error', errorMessage: result.message || 'Upload failed' });
           }
@@ -200,11 +232,48 @@ export default function FileUpload() {
   const handleStartLesson = async () => {
     if (readySlides.length === 0) return;
 
+    if (!user) {
+      setMessage('Log in or create a free account to save and open your presentation later.');
+      navigate('/account');
+      return;
+    }
+
+    const totalBytes = readySlides.reduce((sum, s) => sum + (s.sizeBytes || 0), 0);
+    if (usage) {
+      if (usage.presentationCount >= usage.presentationLimit) {
+        setMessage(`You've reached your limit of ${usage.presentationLimit} presentations. Delete one from My Account to add a new one.`);
+        return;
+      }
+      if (usage.storageBytes + totalBytes > usage.storageLimitBytes) {
+        setMessage(
+          `That would put you over your ${formatBytes(usage.storageLimitBytes)} storage limit ` +
+          `(currently using ${formatBytes(usage.storageBytes)}). Delete something from My Account first.`
+        );
+        return;
+      }
+    }
+
     // Single slide: skip the lesson wrapper entirely and behave exactly like
     // the original single-file flow. This keeps plain PDF/PPTX/image uploads
     // working today, independent of whether the viewer understands lessons yet.
     if (readySlides.length === 1) {
       const only = readySlides[0];
+      const result = await recordSavedItem({
+        kind: 'lesson',
+        title: only.name,
+        file_id: only.fileId,
+        file_type: only.fileType,
+        size_bytes: only.sizeBytes || 0,
+      });
+      if (!result.ok && (result.reason === 'presentation_limit' || result.reason === 'storage_limit')) {
+        setMessage(
+          result.reason === 'presentation_limit'
+            ? `You've reached your limit of ${usage?.presentationLimit ?? 5} presentations.`
+            : `That would put you over your storage limit.`
+        );
+        return;
+      }
+      refreshUsage();
       navigate(`/present/${only.fileId}`, {
         state: { fileType: only.fileType, embedUrl: only.embedUrl, platform: only.platform },
       });
@@ -229,6 +298,24 @@ export default function FileUpload() {
         const result = JSON.parse(textResponse);
         if (result.status === 'success') {
           setMessage('Success! Starting lesson...');
+          const title = readySlides.length <= 2
+            ? readySlides.map((s) => s.name).join(' + ')
+            : `${readySlides[0].name} + ${readySlides.length - 1} more`;
+          const saveResult = await recordSavedItem({
+            kind: 'lesson',
+            title,
+            file_id: result.fileId,
+            file_type: 'lesson',
+            size_bytes: totalBytes,
+          });
+          if (!saveResult.ok && (saveResult.reason === 'presentation_limit' || saveResult.reason === 'storage_limit')) {
+            setMessage(
+              saveResult.reason === 'presentation_limit'
+                ? `You've reached your limit of ${usage?.presentationLimit ?? 5} presentations - this lesson wasn't saved to My Account.`
+                : `That would put you over your storage limit - this lesson wasn't saved to My Account.`
+            );
+          }
+          refreshUsage();
           navigate(`/present/${result.fileId}`, { state: { fileType: 'lesson' } });
         } else {
           setMessage('Server returned: ' + JSON.stringify(result));
@@ -245,6 +332,15 @@ export default function FileUpload() {
 
   return (
     <div className="flex flex-col items-center justify-center w-full max-w-2xl mx-auto p-6 mt-20">
+      <div className="w-full flex justify-end mb-2">
+        <button
+          type="button"
+          onClick={() => navigate('/account')}
+          className="text-xs text-gray-400 hover:text-white bg-gray-900 border border-gray-700 rounded-full px-3 py-1.5"
+        >
+          {user ? `👤 ${profile?.display_name || user.email} · My account` : '👤 Log in / Create account'}
+        </button>
+      </div>
       <h1 className="text-3xl font-bold text-white mb-2 text-center">NextSlide Uploader</h1>
       <p className="text-sm text-gray-400 mb-8 text-center">
         Add as many files and video links as you need, then start the lesson.

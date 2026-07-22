@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { supabase } from './supabaseClient';
+import { QuizReportCard, exportReportPDF, exportReportPNG, type QuizReportData } from './quizReport';
 
 // This is the page people land on after scanning the presenter's "Audience"
 // QR code (see the audienceUrl / QRCodeSVG block in Present.tsx). It is
@@ -13,18 +14,21 @@ import { supabase } from './supabaseClient';
 // --- Quiz types - MUST stay byte-for-byte in sync with Present.tsx, since
 // this is all one JSON shape round-tripping through Supabase + broadcast.
 interface QuizOption { id: string; text: string; imageUrl?: string; }
+type QuizQuestionType = 'mcq' | 'short' | 'long';
 interface QuizQuestion {
   id: string;
+  type: QuizQuestionType;
   question: string;
   options: QuizOption[];
   correctOptionId: string;
   source?: string;
   timeLimitSeconds: number;
 }
-interface QuizAnswerRecord { optionId: string; answeredAt: number; correct: boolean; points: number; }
+interface QuizAnswerRecord { optionId: string; text?: string; answeredAt: number; correct: boolean; points: number; }
 interface QuizParticipant {
   id: string;
   name: string;
+  emoji?: string;
   joinedAt: number;
   totalScore: number;
   answers: Record<string, QuizAnswerRecord>;
@@ -36,8 +40,18 @@ interface QuizState {
   status: QuizStatus;
   questionStartedAt: number | null;
   participants: Record<string, QuizParticipant>;
+  spotlightParticipantId?: string | null;
 }
-const DEFAULT_QUIZ_STATE: QuizState = { questions: [], currentIndex: -1, status: 'building', questionStartedAt: null, participants: {} };
+const DEFAULT_QUIZ_STATE: QuizState = { questions: [], currentIndex: -1, status: 'building', questionStartedAt: null, participants: {}, spotlightParticipantId: null };
+interface SavedQuiz { id: string; title: string; questions: QuizQuestion[]; createdAt: number; }
+
+const CELEBRATION_EMOJIS = ['🎉', '🥳', '🌟', '🔥', '🚀', '⭐', '🎊', '💫'];
+const PICKABLE_EMOJIS = ['😀', '😎', '🦁', '🐼', '🦄', '🐸', '🐧', '🦊', '🌈', '⚡', '🍀', '🎯'];
+function autoEmojiFor(participantId: string): string {
+  let hash = 0;
+  for (let i = 0; i < participantId.length; i++) hash = (hash * 31 + participantId.charCodeAt(i)) >>> 0;
+  return CELEBRATION_EMOJIS[hash % CELEBRATION_EMOJIS.length];
+}
 
 interface AudienceQuestion { id: string; text: string; upvotes: number; answered: boolean; createdAt: number; }
 type FeedbackKind = '👍' | '❤️' | '👏' | '🤔' | '🐢' | '🚀';
@@ -46,11 +60,12 @@ const EMPTY_FEEDBACK: FeedbackCounts = { '👍': 0, '❤️': 0, '👏': 0, '�
 interface AudienceState {
   joinCount: number;
   quiz: QuizState;
+  savedQuizzes: SavedQuiz[];
   questions: AudienceQuestion[];
   feedback: FeedbackCounts;
   qnaOpen: boolean;
 }
-const DEFAULT_AUDIENCE_STATE: AudienceState = { joinCount: 0, quiz: DEFAULT_QUIZ_STATE, questions: [], feedback: EMPTY_FEEDBACK, qnaOpen: true };
+const DEFAULT_AUDIENCE_STATE: AudienceState = { joinCount: 0, quiz: DEFAULT_QUIZ_STATE, savedQuizzes: [], questions: [], feedback: EMPTY_FEEDBACK, qnaOpen: true };
 
 const FEEDBACK_OPTIONS: FeedbackKind[] = ['👍', '❤️', '👏', '🤔', '🐢', '🚀'];
 
@@ -59,7 +74,7 @@ type Lang = 'ku' | 'en';
 const TXT: Record<Lang, Record<string, string>> = {
   ku: {
     live: 'ئۆنلاین', connecting: 'پەیوەندی...', quiz: 'کویز', qna: 'پرسیار', react: 'ڕیاکشن',
-    yourName: 'ناوت چیە؟', namePlaceholder: 'ناوت بنووسە...', join: 'بەشداریکردن',
+    yourName: 'ناوت چیە؟', namePlaceholder: 'ناوت بنووسە...', join: 'بەشداریکردن', pickEmoji: 'ئیمۆجیەکت هەڵبژێرە (ئارەزوومەندانە)',
     waitingStart: 'چاوەڕێی دەستپێکردنی کویزەکە بکە...', youAreIn: 'بەشداربوویت وەک',
     noQuiz: 'هیچ کویزێکی ئۆنلاین نییە', noQuizSub: 'کاتێک وانابەخێر کویزێک دەستپێبکات، لێرە دەردەکەوێت.',
     question: 'پرسیار', timeLeft: 'کاتی ماوە', answerLocked: 'وەڵامەکەت نێردرا! چاوەڕێی ئەنجامەکان بکە...',
@@ -73,7 +88,7 @@ const TXT: Record<Lang, Record<string, string>> = {
   },
   en: {
     live: 'Live', connecting: 'Connecting…', quiz: '🧠 Quiz', qna: '❓ Q&A', react: '💬 React',
-    yourName: "What's your name?", namePlaceholder: 'Enter your name...', join: 'Join',
+    yourName: "What's your name?", namePlaceholder: 'Enter your name...', join: 'Join', pickEmoji: 'Pick an emoji (optional)',
     waitingStart: 'Waiting for the quiz to start...', youAreIn: "You're in as",
     noQuiz: 'No live quiz right now', noQuizSub: "The presenter's next quiz will pop up here automatically.",
     question: 'Question', timeLeft: 'Time left', answerLocked: 'Answer locked in! Waiting for results...',
@@ -86,15 +101,6 @@ const TXT: Record<Lang, Record<string, string>> = {
     switchLang: 'کوردی', missingSession: 'This link is missing a session. Ask the presenter for the QR code or link shown on their screen.',
   },
 };
-
-function downloadCsv(filename: string, rows: (string | number)[][]) {
-  const csv = rows.map((r) => r.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(',')).join('\n');
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = filename; a.click();
-  URL.revokeObjectURL(url);
-}
 
 export default function AudienceJoin() {
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -113,6 +119,7 @@ export default function AudienceJoin() {
   const [questionSent, setQuestionSent] = useState(false);
   const [recentFeedback, setRecentFeedback] = useState<FeedbackKind | null>(null);
   const [nameDraft, setNameDraft] = useState('');
+  const [emojiDraft, setEmojiDraft] = useState<string | null>(null);
 
   // Local persistence: which quiz participant am I, and my Q&A upvotes -
   // scoped per session so it survives a refresh but doesn't leak across
@@ -220,6 +227,8 @@ export default function AudienceJoin() {
   const myAnswerForCurrent = currentQuestion && me ? me.answers[currentQuestion.id] : undefined;
   const leaderboard = useMemo(() => Object.values(quiz.participants).sort((a, b) => b.totalScore - a.totalScore), [quiz.participants]);
   const myRank = me ? leaderboard.findIndex((p) => p.id === me.id) + 1 : 0;
+  const quizActive = quiz.status !== 'building';
+  useEffect(() => { if (quizActive && tab !== 'quiz') setTab('quiz'); }, [quizActive]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const joinQuiz = () => {
     const name = nameDraft.trim();
@@ -227,27 +236,52 @@ export default function AudienceJoin() {
     const id = participantId || `p_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
     setParticipantId(id);
     saveLocal({ participantId: id });
-    channelRef.current?.send({ type: 'broadcast', event: 'quiz_join', payload: { participantId: id, name } });
+    channelRef.current?.send({ type: 'broadcast', event: 'quiz_join', payload: { participantId: id, name, emoji: emojiDraft || undefined } });
   };
 
-  const answerQuestion = (optionId: string) => {
+  const answerQuestion = (optionId: string, text?: string) => {
     if (!participantId || !currentQuestion || myAnswerForCurrent) return;
     channelRef.current?.send({
       type: 'broadcast', event: 'quiz_answer',
-      payload: { participantId, questionId: currentQuestion.id, optionId, answeredAt: Date.now() },
+      payload: { participantId, questionId: currentQuestion.id, optionId, text, answeredAt: Date.now() },
     });
   };
 
-  const downloadMyResults = () => {
-    const rows: (string | number)[][] = [['Rank', 'Name', 'Score', 'Correct answers', 'Total questions']];
-    leaderboard.forEach((p, i) => {
-      const correctCount = Object.values(p.answers).filter((a) => a.correct).length;
-      rows.push([i + 1, p.name + (p.id === participantId ? ' (you)' : ''), p.totalScore, correctCount, quiz.questions.length]);
-    });
-    rows.push([]);
-    rows.push(['Question', 'Source / further reading']);
-    quiz.questions.forEach((q) => rows.push([q.question, q.source || '']));
-    downloadCsv(`quiz-results-${sessionId}.csv`, rows);
+  const reportData: QuizReportData = useMemo(() => ({
+    title: 'Quiz Results',
+    dateLabel: new Date().toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }),
+    leaderboard: leaderboard.map((p, i) => ({
+      rank: i + 1,
+      name: p.name + (p.id === participantId ? ' ⭐' : ''),
+      emoji: p.emoji || (i < 3 ? autoEmojiFor(p.id) : ''),
+      score: p.totalScore,
+      correctCount: Object.values(p.answers).filter((a) => a.correct).length,
+      totalQuestions: quiz.questions.length,
+    })),
+    questions: quiz.questions.map((q) => {
+      const answersForQ = leaderboard.map((p) => p.answers[q.id]).filter(Boolean) as QuizAnswerRecord[];
+      return {
+        id: q.id,
+        question: q.question,
+        correctText: q.options.find((o) => o.id === q.correctOptionId)?.text || '',
+        source: q.source,
+        correctCount: answersForQ.filter((a) => a.correct).length,
+        incorrectCount: answersForQ.filter((a) => !a.correct).length,
+      };
+    }),
+  }), [leaderboard, quiz.questions, participantId]);
+
+  const reportNodeRef = useRef<HTMLDivElement>(null);
+  const [exporting, setExporting] = useState<'pdf' | 'png' | null>(null);
+  const downloadReport = async (format: 'pdf' | 'png') => {
+    if (!reportNodeRef.current || exporting) return;
+    setExporting(format);
+    try {
+      if (format === 'pdf') await exportReportPDF(reportNodeRef.current, `quiz-results-${sessionId}.pdf`);
+      else await exportReportPNG(reportNodeRef.current, `quiz-results-${sessionId}.png`);
+    } finally {
+      setExporting(null);
+    }
   };
 
   const submitQuestion = () => {
@@ -296,6 +330,7 @@ export default function AudienceJoin() {
         </div>
       </div>
 
+      {!quizActive && (
       <div className="flex gap-1 mx-4 mt-3 bg-gray-900 rounded-lg p-1 shrink-0">
         {(['quiz', 'qna', 'feedback'] as const).map((tKey) => (
           <button
@@ -307,6 +342,7 @@ export default function AudienceJoin() {
           </button>
         ))}
       </div>
+      )}
 
       <div className="flex-1 overflow-y-auto px-4 py-4">
         {tab === 'quiz' && (
@@ -320,9 +356,12 @@ export default function AudienceJoin() {
             myRank={myRank}
             nameDraft={nameDraft}
             setNameDraft={setNameDraft}
+            emojiDraft={emojiDraft}
+            setEmojiDraft={setEmojiDraft}
             onJoin={joinQuiz}
             onAnswer={answerQuestion}
-            onDownload={downloadMyResults}
+            onDownload={downloadReport}
+            exporting={exporting}
           />
         )}
 
@@ -387,16 +426,25 @@ export default function AudienceJoin() {
           </div>
         )}
       </div>
+
+      {/* Off-screen (not visible, but fully rendered so html2canvas can
+          capture it) - shared PDF/PNG report node, same one Present.tsx uses. */}
+      <div style={{ position: 'fixed', top: 0, left: -9999, pointerEvents: 'none' }}>
+        <div ref={reportNodeRef}><QuizReportCard data={reportData} /></div>
+      </div>
     </div>
   );
 }
 
-function QuizTab({ quiz, t, me, currentQuestion, myAnswer, leaderboard, myRank, nameDraft, setNameDraft, onJoin, onAnswer, onDownload }: {
+function QuizTab({ quiz, t, me, currentQuestion, myAnswer, leaderboard, myRank, nameDraft, setNameDraft, emojiDraft, setEmojiDraft, onJoin, onAnswer, onDownload, exporting }: {
   quiz: QuizState; t: Record<string, string>; me?: QuizParticipant; currentQuestion: QuizQuestion | null;
   myAnswer?: QuizAnswerRecord; leaderboard: QuizParticipant[]; myRank: number;
-  nameDraft: string; setNameDraft: (v: string) => void; onJoin: () => void; onAnswer: (optionId: string) => void; onDownload: () => void;
+  nameDraft: string; setNameDraft: (v: string) => void; emojiDraft: string | null; setEmojiDraft: (v: string | null) => void;
+  onJoin: () => void; onAnswer: (optionId: string, text?: string) => void; onDownload: (format: 'pdf' | 'png') => void; exporting: 'pdf' | 'png' | null;
 }) {
   const [, tick] = useState(0);
+  const [freeTextDraft, setFreeTextDraft] = useState('');
+  useEffect(() => { setFreeTextDraft(''); }, [currentQuestion?.id]);
   useEffect(() => {
     if (quiz.status !== 'question') return;
     const i = setInterval(() => tick((n) => n + 1), 250);
@@ -426,6 +474,20 @@ function QuizTab({ quiz, t, me, currentQuestion, myAnswer, leaderboard, myRank, 
             maxLength={30}
             className="bg-gray-900 border border-gray-800 rounded-lg px-4 py-2.5 text-center text-sm w-full max-w-xs"
           />
+          <div className="w-full max-w-xs">
+            <p className="text-[11px] text-gray-500 mb-1.5">{t.pickEmoji}</p>
+            <div className="grid grid-cols-6 gap-1.5">
+              {PICKABLE_EMOJIS.map((e) => (
+                <button
+                  key={e}
+                  onClick={() => setEmojiDraft(emojiDraft === e ? null : e)}
+                  className={`text-xl py-1.5 rounded-lg border ${emojiDraft === e ? 'bg-emerald-600 border-emerald-400' : 'bg-gray-900 border-gray-800'}`}
+                >
+                  {e}
+                </button>
+              ))}
+            </div>
+          </div>
           <button
             onClick={onJoin}
             disabled={!nameDraft.trim()}
@@ -465,6 +527,45 @@ function QuizTab({ quiz, t, me, currentQuestion, myAnswer, leaderboard, myRank, 
               <span className="text-3xl">📨</span>
               <p className="text-sm text-center">{t.answerLocked}</p>
             </div>
+          ) : currentQuestion.type === 'short' || currentQuestion.type === 'long' ? (
+            <div className="flex flex-col gap-2.5">
+              {currentQuestion.type === 'short' ? (
+                <input
+                  value={freeTextDraft}
+                  onChange={(e) => setFreeTextDraft(e.target.value)}
+                  placeholder="Type your answer..."
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  // "off" is the closest a web page can get to turning off a
+                  // phone's predictive-text bar - some keyboards (Gboard in
+                  // particular) still show word suggestions above the key
+                  // rows regardless, since that's controlled by the
+                  // keyboard app itself, not by the page.
+                  className="bg-gray-900 border border-gray-700 rounded-xl px-4 py-3 text-sm"
+                />
+              ) : (
+                <textarea
+                  value={freeTextDraft}
+                  onChange={(e) => setFreeTextDraft(e.target.value)}
+                  placeholder="Type your answer..."
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  rows={5}
+                  className="bg-gray-900 border border-gray-700 rounded-xl px-4 py-3 text-sm resize-none"
+                />
+              )}
+              <button
+                onClick={() => onAnswer('', freeTextDraft.trim())}
+                disabled={!freeTextDraft.trim()}
+                className="bg-blue-600 disabled:opacity-30 rounded-xl py-3 text-sm font-bold active:scale-[0.97] transition-transform"
+              >
+                Submit answer
+              </button>
+            </div>
           ) : (
             <div className="grid grid-cols-1 gap-2.5">
               {currentQuestion.options.map((opt, i) => (
@@ -486,6 +587,21 @@ function QuizTab({ quiz, t, me, currentQuestion, myAnswer, leaderboard, myRank, 
     // reveal
     const correct = myAnswer?.correct;
     const correctOption = currentQuestion.options.find((o) => o.id === currentQuestion.correctOptionId);
+    if (currentQuestion.type === 'short' || currentQuestion.type === 'long') {
+      return (
+        <div className="flex flex-col gap-4">
+          <div className="rounded-xl p-5 border border-indigo-700 bg-indigo-950/30 text-center flex flex-col items-center gap-1.5">
+            <span className="text-3xl">{myAnswer ? '✍️' : '⏱'}</span>
+            <p className="font-semibold">{myAnswer ? 'Answer submitted' : "Time's up"}</p>
+            {myAnswer?.text && <p className="text-sm text-gray-300 italic">"{myAnswer.text}"</p>}
+          </div>
+          {currentQuestion.source && <p className="text-[11px] text-indigo-300 text-center">📚 {t.source}: {currentQuestion.source}</p>}
+          {me && (
+            <p className="text-xs text-center text-gray-400">{t.yourRank}: <span className="text-white font-bold">#{myRank}</span> · {me.totalScore} {t.points}</p>
+          )}
+        </div>
+      );
+    }
     return (
       <div className="flex flex-col gap-4">
         {myAnswer ? (
@@ -514,20 +630,30 @@ function QuizTab({ quiz, t, me, currentQuestion, myAnswer, leaderboard, myRank, 
       <div className="flex flex-col gap-4">
         <h2 className="text-lg font-bold text-center">{t.quizFinished}</h2>
         <div className="flex flex-col gap-2">
-          {leaderboard.map((p, i) => (
-            <div
-              key={p.id}
-              className={`flex items-center gap-3 rounded-xl px-4 py-2.5 ${p.id === me?.id ? 'bg-emerald-900/40 border border-emerald-600' : 'bg-gray-900 border border-gray-800'}`}
-            >
-              <span className="text-lg w-7 text-center shrink-0">{medals[i] || `#${i + 1}`}</span>
-              <span className="flex-1 text-sm font-semibold truncate">{p.name}{p.id === me?.id ? ` (${t.yourRank.toLowerCase()})` : ''}</span>
-              <span className="font-mono font-bold text-sm">{p.totalScore}</span>
-            </div>
-          ))}
+          {leaderboard.map((p, i) => {
+            const winnerEmoji = i < 3 ? (p.emoji || autoEmojiFor(p.id)) : null;
+            return (
+              <div
+                key={p.id}
+                className={`flex items-center gap-3 rounded-xl px-4 py-2.5 ${p.id === me?.id ? 'bg-emerald-900/40 border border-emerald-600' : 'bg-gray-900 border border-gray-800'}`}
+              >
+                <span className="text-lg w-7 text-center shrink-0">{medals[i] || `#${i + 1}`}</span>
+                {winnerEmoji && <span className="text-xl shrink-0" style={{ animation: `bounce-emoji-a 0.9s ease-in-out ${i * 0.15}s infinite` }}>{winnerEmoji}</span>}
+                <span className="flex-1 text-sm font-semibold truncate">{p.name}{p.id === me?.id ? ` (${t.yourRank.toLowerCase()})` : ''}</span>
+                <span className="font-mono font-bold text-sm">{p.totalScore}</span>
+              </div>
+            );
+          })}
+          <style>{`@keyframes bounce-emoji-a { 0%,100% { transform: translateY(0) scale(1); } 50% { transform: translateY(-5px) scale(1.15); } }`}</style>
         </div>
-        <button onClick={onDownload} className="bg-blue-600 hover:bg-blue-500 rounded-lg py-2.5 text-sm font-bold">
-          {t.downloadResults}
-        </button>
+        <div className="flex gap-2">
+          <button onClick={() => onDownload('pdf')} disabled={!!exporting} className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg py-2.5 text-sm font-bold">
+            {exporting === 'pdf' ? '…' : '⬇ PDF'}
+          </button>
+          <button onClick={() => onDownload('png')} disabled={!!exporting} className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg py-2.5 text-sm font-bold">
+            {exporting === 'png' ? '…' : '⬇ PNG'}
+          </button>
+        </div>
       </div>
     );
   }

@@ -21,5 +21,17 @@ if (supabaseConfigError) {
 // constructs; supabaseConfigError is what actually signals the problem.
 export const supabase = createClient(
   url || 'https://placeholder.supabase.co',
-  key || 'placeholder-key'
+  key || 'placeholder-key',
+  {
+    auth: {
+      // PKCE returns a plain `?code=...` query param on redirect back, which
+      // sits *before* the `#/...` route hash and so is safe to parse with
+      // HashRouter in the URL. The default "implicit" flow instead returns
+      // `#access_token=...`, which HashRouter would try to read as a route.
+      flowType: 'pkce',
+      persistSession: true,
+      autoRefreshToken: true,
+      detectSessionInUrl: true,
+    },
+  }
 );
