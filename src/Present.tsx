@@ -350,6 +350,12 @@ function withPlaybackParams(embedUrl: string, platform?: string): string {
       url.searchParams.set('playsinline', '1');
       return url.toString();
     }
+    if (platform === 'drive' || url.hostname.includes('drive.google.com')) {
+      // Google Drive's preview player also supports this param - without it
+      // the video just sits on its poster frame until someone hits play.
+      url.searchParams.set('autoplay', '1');
+      return url.toString();
+    }
     return embedUrl;
   } catch {
     return embedUrl;
