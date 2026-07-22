@@ -86,17 +86,20 @@ export default function AccountPage() {
     return () => sub.subscription.unsubscribe();
   }, []);
 
-  // Picks up the message main.tsx stashes when Supabase redirects back here
-  // with an auth error (e.g. a failed Google sign-in) instead of it just
-  // silently vanishing - see the comment in main.tsx for the full story.
+  // Picks up an OAuth/email error that main.tsx stashed before HashRouter
+  // ever saw it (see the comment there) - e.g. Google sign-in failing with
+  // "Database error saving new user" lands here as a real message instead
+  // of a blank screen.
   useEffect(() => {
     try {
-      const stashed = sessionStorage.getItem('nextslide_auth_error');
+      const stashed = sessionStorage.getItem('authRedirectError');
       if (stashed) {
         setError(stashed);
-        sessionStorage.removeItem('nextslide_auth_error');
+        sessionStorage.removeItem('authRedirectError');
       }
-    } catch { /* sessionStorage unavailable - nothing to recover */ }
+    } catch {
+      // sessionStorage can throw in locked-down/private-browsing contexts - not fatal.
+    }
   }, []);
 
   const loadItems = async (userId: string) => {

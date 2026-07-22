@@ -344,11 +344,10 @@ const TRANSITION_KEYFRAMES_CSS = `
 function withPlaybackParams(embedUrl: string, platform?: string): string {
   try {
     const url = new URL(embedUrl);
-    if (isYouTubeEmbed(embedUrl, platform)) {
+    if (platform === 'youtube' || url.hostname.includes('youtube.com') || url.hostname.includes('youtu.be')) {
       url.searchParams.set('enablejsapi', '1');
       url.searchParams.set('autoplay', '1');
       url.searchParams.set('playsinline', '1');
-      url.searchParams.set('origin', window.location.origin);
       return url.toString();
     }
     return embedUrl;
@@ -357,44 +356,9 @@ function withPlaybackParams(embedUrl: string, platform?: string): string {
   }
 }
 
-function isYouTubeEmbed(embedUrl: string, platform?: string): boolean {
-  try {
-    const url = new URL(embedUrl);
-    return platform === 'youtube' || url.hostname.includes('youtube.com') || url.hostname.includes('youtu.be');
-  } catch {
-    return false;
-  }
-}
-
-// Loads YouTube's official IFrame Player API script once (safe to call
-// repeatedly/concurrently - later callers just await the same promise) and
-// resolves once window.YT.Player is actually usable. This replaces the old
-// approach of hand-rolling postMessage({event:'listening'}) pings and
-// sniffing raw 'infoDelivery' messages, which only worked once the player
-// happened to volunteer one on its own - in practice that meant the phone's
-// progress bar stayed empty until something like a seek nudged it into
-// talking. The real API fires a proper onReady event as soon as metadata
-// is available, and getCurrentTime()/getDuration()/getVolume() can just be
-// asked for directly instead of guessed at from whatever last flew by.
-let ytApiLoadPromise: Promise<void> | null = null;
-function loadYouTubeIframeAPI(): Promise<void> {
-  if (typeof window === 'undefined') return Promise.resolve();
-  const w = window as any;
-  if (w.YT && w.YT.Player) return Promise.resolve();
-  if (ytApiLoadPromise) return ytApiLoadPromise;
-  ytApiLoadPromise = new Promise((resolve) => {
-    const previous = w.onYouTubeIframeAPIReady;
-    w.onYouTubeIframeAPIReady = () => {
-      previous?.();
-      resolve();
-    };
-    if (!document.querySelector('script[src="https://www.youtube.com/iframe_api"]')) {
-      const tag = document.createElement('script');
-      tag.src = 'https://www.youtube.com/iframe_api';
-      document.head.appendChild(tag);
-    }
-  });
-  return ytApiLoadPromise;
+function postYouTubeCommand(iframe: HTMLIFrameElement | null, func: string, args: any[] = []) {
+  if (!iframe || !iframe.contentWindow) return;
+  iframe.contentWindow.postMessage(JSON.stringify({ event: 'command', func, args }), '*');
 }
 
 export default function Present() {
@@ -463,9 +427,9 @@ export default function Present() {
   // strokes rendering much darker than their final, redrawn appearance).
   const lastStrokePxRef = useRef<{ x: number; y: number } | null>(null);
   const videoIframeRef = useRef<HTMLIFrameElement>(null);
-  // The real YT.Player instance bound to videoIframeRef - see the effect
-  // further down that creates/destroys it as video slides come and go.
-  const ytPlayerRef = useRef<any>(null);
+  // Tracks whether the current video-link slide has actually heard back from
+  // YouTube's postMessage API yet - see the handshake effect below.
+  const videoHandshakeConnectedRef = useRef(false);
 
   const sessionStateSaveTimer = useRef<any>(null);
 
@@ -489,17 +453,6 @@ export default function Present() {
   // include the sidebar/quiz-stage would throw off every stroke's x/y math.
   const fullscreenTargetRef = useRef<HTMLDivElement>(null);
   const channelRef = useRef<any>(null);
-
-  // Tracks real OS-level fullscreen (via the Fullscreen API), separate from
-  // focusMode. Used to hide the Prev/Next/slide-name bar so real fullscreen
-  // shows only the slide - the bar is still useful in the normal windowed
-  // view, just not once the browser has taken over the whole screen.
-  const [isFullscreen, setIsFullscreen] = useState(false);
-  useEffect(() => {
-    const handleFullscreenChange = () => setIsFullscreen(!!document.fullscreenElement);
-    document.addEventListener('fullscreenchange', handleFullscreenChange);
-    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
-  }, []);
 
   // Session PIN (soft lock, see the matching comment in MobileRemote.tsx) -
   // generated once when the session row is first created, then persisted
@@ -739,6 +692,17 @@ export default function Present() {
   // Focus mode gets you the same practical result (no sidebar, slide fills
   // the screen) without that restriction, so it's what the phone controls.
   const [focusMode, setFocusMode] = useState(false);
+  // Real browser fullscreen state (as opposed to focusMode above, which is
+  // the phone-triggerable "theater mode" fake). Needed so the Prev/Next/
+  // filename bar can hide itself once actual fullscreen is active - it lives
+  // inside fullscreenTargetRef so it stays on screen during fullscreen, but
+  // it was never actually checking whether fullscreen was on.
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  useEffect(() => {
+    const onFullscreenChange = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
+  }, []);
   const handleFullscreenRequest = useCallback(() => {
     setFocusMode((prev) => {
       const next = !prev;
@@ -918,19 +882,13 @@ export default function Present() {
 
       channel.on('broadcast', { event: 'video_control' }, (payload) => {
         const { action, value } = payload.payload || {};
-        const player = ytPlayerRef.current;
-        if (!player) return;
-        try {
-          if (action === 'play') player.playVideo();
-          else if (action === 'pause') player.pauseVideo();
-          else if (action === 'seek' && typeof value === 'number') player.seekTo(value, true);
-          else if (action === 'volume' && typeof value === 'number') player.setVolume(value);
-          else if (action === 'mute') player.mute();
-          else if (action === 'unmute') player.unMute();
-        } catch {
-          // Player not fully initialized yet - command is dropped, same
-          // best-effort behavior as before.
-        }
+        const iframe = videoIframeRef.current;
+        if (action === 'play') postYouTubeCommand(iframe, 'playVideo');
+        else if (action === 'pause') postYouTubeCommand(iframe, 'pauseVideo');
+        else if (action === 'seek' && typeof value === 'number') postYouTubeCommand(iframe, 'seekTo', [value, true]);
+        else if (action === 'volume' && typeof value === 'number') postYouTubeCommand(iframe, 'setVolume', [value]);
+        else if (action === 'mute') postYouTubeCommand(iframe, 'mute');
+        else if (action === 'unmute') postYouTubeCommand(iframe, 'unMute');
       });
 
       channel.on('broadcast', { event: 'fullscreen_toggle' }, () => {
@@ -1239,61 +1197,77 @@ export default function Present() {
     };
   }, [currentFlatIndex, redrawCanvasForSlide]);
 
-  // Creates a real YT.Player bound to the video iframe whenever a YouTube
-  // slide is on screen, and tears it down when that slide goes away. Once
-  // it's ready, onReady/onStateChange plus a 400ms poll keep videoState
-  // (playing/time/duration/volume) accurate and broadcast to the phone -
-  // this is what makes the remote's progress bar show up reliably and its
-  // volume slider actually track the real level, instead of both sitting
-  // frozen until some other action happened to jostle the old postMessage
-  // listener into life.
+  // Listens for YouTube's postMessage player updates so we can relay
+  // play/pause/time/duration back to the phone remote's progress bar.
+  // Only fires for YouTube embeds with enablejsapi=1 (see withPlaybackParams).
+  useEffect(() => {
+    let lastBroadcast = 0;
+    let lastPlayerState: number | null = null;
+    function handleMessage(e: MessageEvent) {
+      if (typeof e.data !== 'string') return;
+      let data: any;
+      try { data = JSON.parse(e.data); } catch { return; }
+      if (data.event !== 'infoDelivery' || !data.info) return;
+      // A real reply arrived - the handshake retry loop below can stop pinging.
+      videoHandshakeConnectedRef.current = true;
+      const now = Date.now();
+      const stateChanged = data.info.playerState !== lastPlayerState;
+      // Always let an actual play/pause/state transition through immediately -
+      // only the repetitive "still playing at time X" ticks get throttled.
+      // Otherwise a quick pause right after a play can land inside the
+      // throttle window and get silently dropped, leaving the remote's
+      // Play/Pause button stuck showing the wrong state until the next tick.
+      if (!stateChanged && now - lastBroadcast < 900) return;
+      lastBroadcast = now;
+      lastPlayerState = data.info.playerState;
+      const next: VideoState = {
+        playing: data.info.playerState === 1,
+        time: data.info.currentTime || 0,
+        duration: data.info.duration || 0,
+        volume: typeof data.info.volume === 'number' ? data.info.volume : videoState.volume,
+      };
+      setVideoState(next);
+      channelRef.current?.send({ type: 'broadcast', event: 'video_time_update', payload: next });
+    }
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Establishes the YouTube "listening" handshake whenever a video-link
+  // slide becomes active, so infoDelivery messages (time/duration/play
+  // state) start flowing to the remote's progress bar. A single ping isn't
+  // reliable - if it fires before the iframe's player has actually finished
+  // initializing (slow network, mobile data) it's silently dropped and the
+  // remote never gets a duration, so this keeps retrying once a second until
+  // a real reply comes back (handleMessage above flips
+  // videoHandshakeConnectedRef to stop it). It also clears out whatever the
+  // previous video left in videoState so the remote shows "waiting for
+  // video..." instead of the old video's stale time/duration while this one
+  // is still connecting.
   useEffect(() => {
     if (resolved?.fileType !== 'video-link') return;
-    if (!isYouTubeEmbed(resolved.embedUrl, resolved.platform)) return;
-    const iframe = videoIframeRef.current;
-    if (!iframe) return;
-
-    let cancelled = false;
-    let pollInterval: ReturnType<typeof setInterval> | null = null;
-
-    const syncFromPlayer = () => {
-      const player = ytPlayerRef.current;
-      if (!player || typeof player.getPlayerState !== 'function') return;
-      try {
-        const next: VideoState = {
-          playing: player.getPlayerState() === 1,
-          time: player.getCurrentTime() || 0,
-          duration: player.getDuration() || 0,
-          volume: player.getVolume(),
-        };
-        setVideoState(next);
-        channelRef.current?.send({ type: 'broadcast', event: 'video_time_update', payload: next });
-      } catch {
-        // Player exists but isn't fully initialized yet - next poll retries.
-      }
-    };
-
-    // Reset immediately so the remote doesn't keep showing the previous
-    // video's progress while this one's player spins up.
+    videoHandshakeConnectedRef.current = false;
     setVideoState(DEFAULT_VIDEO_STATE);
     channelRef.current?.send({ type: 'broadcast', event: 'video_time_update', payload: DEFAULT_VIDEO_STATE });
 
-    loadYouTubeIframeAPI().then(() => {
-      if (cancelled) return;
-      const YT = (window as any).YT;
-      ytPlayerRef.current = new YT.Player(iframe, {
-        events: { onReady: syncFromPlayer, onStateChange: syncFromPlayer },
-      });
-      pollInterval = setInterval(syncFromPlayer, 400);
-    });
-
-    return () => {
-      cancelled = true;
-      if (pollInterval) clearInterval(pollInterval);
-      try { ytPlayerRef.current?.destroy?.(); } catch { /* iframe already gone */ }
-      ytPlayerRef.current = null;
+    const ping = () => {
+      if (videoHandshakeConnectedRef.current) return;
+      videoIframeRef.current?.contentWindow?.postMessage(JSON.stringify({ event: 'listening', id: 'present' }), '*');
     };
-  }, [resolved, currentFlatIndex]);
+    const initial = setTimeout(ping, 800);
+    const retry = setInterval(() => {
+      if (videoHandshakeConnectedRef.current) {
+        clearInterval(retry);
+        return;
+      }
+      ping();
+    }, 1000);
+    return () => {
+      clearTimeout(initial);
+      clearInterval(retry);
+    };
+  }, [resolved]);
 
   // Initial load: figure out whether this id is a lesson or a single slide.
   useEffect(() => {
@@ -1558,9 +1532,6 @@ export default function Present() {
     }
   };
 
-  // Hidden once the browser is truly fullscreen or the phone has put us in
-  // focus mode - both cases want the slide to fill the whole screen with no
-  // chrome. Prev/Next still work via keyboard arrows and the phone remote.
   const showNav = flatSlides.length > 1 && !isFullscreen && !focusMode;
   const isFirstSlide = flatSlides.length ? currentFlatIndex === 0 : currentIndex === 0;
   const isLastSlide = flatSlides.length ? currentFlatIndex === flatSlides.length - 1 : true;

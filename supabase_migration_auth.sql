@@ -57,6 +57,7 @@ create policy "trigger can insert profiles" on profiles
   to supabase_auth_admin, postgres, service_role
   with check (true);
 
+grant usage on schema public to supabase_auth_admin;
 grant insert, select, update on public.profiles to supabase_auth_admin, postgres;
 
 -- Auto-create a profile row the moment someone signs up (email/password OR
