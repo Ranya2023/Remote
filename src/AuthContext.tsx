@@ -45,7 +45,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const refreshProfile = useCallback(async () => {
     if (!userId) { setProfile(null); return; }
     try {
-      const { data, error } = await supabase.from('profiles').select('*').eq('id', userId).maybeSingle();
+      const { data, error } = await supabase.from('nextslide_profiles').select('*').eq('id', userId).maybeSingle();
       if (error) throw error;
       setProfile(data || null);
     } catch (err) {
