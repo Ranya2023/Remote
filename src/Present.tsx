@@ -793,6 +793,19 @@ export default function Present() {
     document.addEventListener('fullscreenchange', onFullscreenChange);
     return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
   }, []);
+
+  // Browsers only allow autoplay-with-sound on this page after a genuine
+  // local click has happened here (the Fullscreen button already does this
+  // incidentally). This banner is just a safety net for sessions where
+  // nobody happens to click Fullscreen before the first video plays - any
+  // single click anywhere on the page unlocks sound for the rest of the
+  // session.
+  const [audioUnlocked, setAudioUnlocked] = useState(false);
+  useEffect(() => {
+    const unlock = () => setAudioUnlocked(true);
+    window.addEventListener('click', unlock, { once: true });
+    return () => window.removeEventListener('click', unlock);
+  }, []);
   const handleFullscreenRequest = useCallback(() => {
     setFocusMode((prev) => {
       const next = !prev;
@@ -1780,6 +1793,11 @@ export default function Present() {
 
   return (
     <div className="flex h-screen w-full bg-black text-white overflow-hidden">
+      {!audioUnlocked && (
+        <div className="fixed top-3 left-1/2 -translate-x-1/2 z-[300] bg-amber-500 text-black text-sm font-semibold px-4 py-2 rounded-full shadow-lg animate-pulse">
+          🔊 Tap anywhere to enable video sound
+        </div>
+      )}
       {/* Sidebar: QR code for the phone remote + session info */}
       {!focusMode && (
       <div className="w-80 bg-gray-900 border-r border-gray-800 p-6 flex flex-col items-center justify-between shrink-0">
