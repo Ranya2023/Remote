@@ -498,6 +498,10 @@ export default function Present() {
   // Tracks whether the current video-link slide has actually heard back from
   // YouTube's postMessage API yet - see the handshake effect below.
   const videoHandshakeConnectedRef = useRef(false);
+  // The live Google Slides embed. Focused as soon as it loads so arrow keys
+  // reach Google's own player (which is the only thing that can play that
+  // deck's build animations) - see the google-slides render block below.
+  const gslidesIframeRef = useRef<HTMLIFrameElement>(null);
 
   const sessionStateSaveTimer = useRef<any>(null);
 
@@ -1969,6 +1973,11 @@ export default function Present() {
               // specifically only plays if advancing by clicking inside
               // the iframe directly on the host machine, not via the
               // phone remote.
+              // Because of that, the embed grabs the keyboard as soon as it
+              // loads (see onLoad below): Google's player is the only thing
+              // that can run this deck's build animations, and it only runs
+              // them for arrow keys it receives itself. Focusing it here is
+              // what used to require clicking the slide first.
               const realSlideId = resolved.slideIds[currentPage - 1];
               // Safety net: real IDs come from google_slides_decks.slide_ids,
               // populated at import time via the Slides API. If this deck
@@ -1981,11 +1990,15 @@ export default function Present() {
               return (
                 <iframe
                   key={`gslides-${currentFlatIndex}`}
+                  ref={gslidesIframeRef}
                   src={`https://docs.google.com/presentation/d/${resolved.presentationId}/embed?rm=minimal&slide=id.${slideIdToUse}`}
                   title={resolved.name || 'Google Slides'}
                   className="w-full h-full border-0 bg-white"
                   allow="fullscreen"
                   allowFullScreen
+                  onLoad={() => {
+                    try { gslidesIframeRef.current?.contentWindow?.focus(); } catch { /* cross-origin refusal - user can still click the slide */ }
+                  }}
                 />
               );
             })()}
