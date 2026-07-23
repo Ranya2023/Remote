@@ -340,6 +340,58 @@ const SCHEME_FALLBACK: Record<string, string> = {
   accent4: '#ffc000', accent5: '#5b9bd5', accent6: '#70ad47',
   hlink: '#0563c1', folHlink: '#954f72',
 };
+function clamp01(n: number): number { return Math.max(0, Math.min(1, n)); }
+
+// Approximate DrawingML luminance adjustment. schemeClr is very commonly
+// paired with <a:lumMod>/<a:lumOff> ("this color, but 50% as bright" /
+// "20% lighter") rather than used as-is - ignoring those made a modified
+// color like bg1+lumMod50% (meant to be a mid-gray) resolve to the plain
+// unmodified fallback (white), which is invisible against a white slide
+// background. True theme luminance math works in linear RGB; this uses
+// HSL lightness instead, which is a close enough approximation for the
+// fallback colors here (never exact per-theme values anyway).
+function hexToHsl(hex: string): [number, number, number] {
+  const r = parseInt(hex.slice(1, 3), 16) / 255;
+  const g = parseInt(hex.slice(3, 5), 16) / 255;
+  const b = parseInt(hex.slice(5, 7), 16) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  let h = 0, s = 0;
+  const l = (max + min) / 2;
+  const d = max - min;
+  if (d !== 0) {
+    s = d / (1 - Math.abs(2 * l - 1));
+    switch (max) {
+      case r: h = ((g - b) / d) % 6; break;
+      case g: h = (b - r) / d + 2; break;
+      default: h = (r - g) / d + 4; break;
+    }
+    h *= 60;
+    if (h < 0) h += 360;
+  }
+  return [h, s, l];
+}
+function hslToHex(h: number, s: number, l: number): string {
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c / 2;
+  let [r, g, b] = [0, 0, 0];
+  if (h < 60) [r, g, b] = [c, x, 0];
+  else if (h < 120) [r, g, b] = [x, c, 0];
+  else if (h < 180) [r, g, b] = [0, c, x];
+  else if (h < 240) [r, g, b] = [0, x, c];
+  else if (h < 300) [r, g, b] = [x, 0, c];
+  else [r, g, b] = [c, 0, x];
+  const toHex = (v: number) => Math.round((v + m) * 255).toString(16).padStart(2, '0');
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+function applyLumAdjust(hex: string, lumMod?: number, lumOff?: number): string {
+  if (lumMod == null && lumOff == null) return hex;
+  const [h, s, l] = hexToHsl(hex);
+  let newL = lumMod != null ? l * lumMod : l;
+  if (lumOff != null) newL += lumOff;
+  return hslToHex(h, s, clamp01(newL));
+}
+
 function extractColor(container: Element | null): string | undefined {
   if (!container) return undefined;
   const fill = firstEl(container, 'a:solidFill');
@@ -350,8 +402,17 @@ function extractColor(container: Element | null): string | undefined {
     return val ? `#${val}` : undefined;
   }
   const scheme = firstEl(fill, 'a:schemeClr');
-  const val = scheme?.getAttribute('val');
-  return val ? SCHEME_FALLBACK[val] : undefined;
+  if (!scheme) return undefined;
+  const val = scheme.getAttribute('val');
+  if (!val) return undefined;
+  const base = SCHEME_FALLBACK[val];
+  if (!base) return undefined;
+  // lumMod/lumOff values are in 1000ths of a percent (val="50000" == 50%).
+  const lumModAttr = firstEl(scheme, 'a:lumMod')?.getAttribute('val');
+  const lumOffAttr = firstEl(scheme, 'a:lumOff')?.getAttribute('val');
+  const lumMod = lumModAttr ? Number(lumModAttr) / 100000 : undefined;
+  const lumOff = lumOffAttr ? Number(lumOffAttr) / 100000 : undefined;
+  return applyLumAdjust(base, lumMod, lumOff);
 }
 
 // --- Shapes ----------------------------------------------------------------
@@ -364,6 +425,21 @@ const PLACEHOLDER_DEFAULTS: Record<string, { xPct: number; yPct: number; wPct: n
   ctrTitle: { xPct: 10, yPct: 32, wPct: 80, hPct: 24 },
   subTitle: { xPct: 10, yPct: 58, wPct: 80, hPct: 16 },
   body: { xPct: 6, yPct: 26, wPct: 88, hPct: 66 },
+};
+
+// Same idea as PLACEHOLDER_DEFAULTS above, but for font size: a run with no
+// explicit <a:rPr sz="..."/> is supposed to inherit its size from the
+// placeholder's list style (defined on the slide layout/master, which this
+// file doesn't otherwise parse) - not from nothing. Leaving it unresolved
+// made title runs like a bare-name run before "University of Raparin" fall
+// back to the browser's plain default text size instead of the deck's
+// actual (much larger) title size. These are standard PowerPoint/Google
+// Slides theme defaults, used only when a run's own size is missing.
+const PLACEHOLDER_DEFAULT_FONT_PT: Record<string, number> = {
+  ctrTitle: 52,
+  title: 44,
+  subTitle: 24,
+  body: 18,
 };
 
 function xfrmPct(spPr: Element | null, slideCx: number, slideCy: number): { xPct: number; yPct: number; wPct: number; hPct: number } | null {
@@ -394,7 +470,7 @@ function paragraphHasBullet(pPr: Element | null): boolean {
   return false;
 }
 
-function extractParagraphs(txBody: Element, slideWidthPt: number, buildFor: (paragraphIndex: number) => number | undefined): SlideParagraph[] {
+function extractParagraphs(txBody: Element, slideWidthPt: number, buildFor: (paragraphIndex: number) => number | undefined, defaultSizePt?: number): SlideParagraph[] {
   const paragraphs = allEls(txBody, 'a:p');
   const mapped: SlideParagraph[] = [];
 
@@ -431,7 +507,7 @@ function extractParagraphs(txBody: Element, slideWidthPt: number, buildFor: (par
         const rPr = firstEl(child, 'a:rPr');
         const text = firstEl(child, 'a:t')?.textContent || '';
         const sizeAttr = rPr?.getAttribute('sz'); // centipoints, e.g. "1800" = 18pt
-        const sizePt = sizeAttr ? Number(sizeAttr) / 100 : undefined;
+        const sizePt = sizeAttr ? Number(sizeAttr) / 100 : defaultSizePt;
         currentRuns.push({
           text,
           bold: rPr?.getAttribute('b') === '1',
@@ -505,9 +581,10 @@ async function extractShapesForSlide(
       if (!rect && phType) rect = PLACEHOLDER_DEFAULTS[phType] || PLACEHOLDER_DEFAULTS.body;
       if (!rect) continue; // no position we can determine even approximately - skip rather than guess at 0,0
 
+      const defaultSizePt = phType ? PLACEHOLDER_DEFAULT_FONT_PT[phType] : undefined;
       const txBody = firstEl(child, 'p:txBody');
       const paragraphs = txBody
-        ? extractParagraphs(txBody, slideWidthPt, (i) => buildForParagraph(shapeId, i))
+        ? extractParagraphs(txBody, slideWidthPt, (i) => buildForParagraph(shapeId, i), defaultSizePt)
         : undefined;
       const wholeShapeBuild = buildForShape(shapeId);
       const fill = extractColor(spPr);
