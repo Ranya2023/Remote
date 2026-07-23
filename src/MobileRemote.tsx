@@ -845,7 +845,7 @@ export default function MobileRemote() {
   // copy - a separate column that only this ever writes to has no such risk.
   const persistPointerState = (kind: 'laser' | 'spotlight', value: Record<string, unknown>) => {
     const now = Date.now();
-    if (now - lastPersistedPointerTime.current < 160) return;
+    if (now - lastPersistedPointerTime.current < 60) return;
     lastPersistedPointerTime.current = now;
     supabase.from('sessions').update({ pointer_state: { [kind]: value } }).eq('id', sessionId).then(({ error }) => {
       if (error) console.warn('pointer_state persist skipped (has supabase_migration_desktop.sql been run yet?):', error.message);
