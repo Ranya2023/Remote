@@ -7,19 +7,23 @@
 // and lessons there too, for the same reasons: no artificial growth limit,
 // a real database instead of a flat property bag, and one consistent place
 // instead of two. Google Apps Script itself is only still needed for
-// actual Drive/Slides operations (uploading, converting PPTX/Slides to
-// PDF) - nothing here touches Drive, so none of it needs to go through GAS
-// at all anymore.
+// actual Drive/Slides operations (uploading, converting PPTX to PDF,
+// reading an existing Google Slides deck's slide count/notes) - nothing
+// here touches Drive, so none of it needs to go through GAS at all anymore.
 //
-// The vlink_ / lesson_ prefixes are kept on the generated IDs purely for
-// readability while debugging (e.g. in the Network tab or Supabase table
-// view) - nothing parses them to decide routing anymore the way Code.gs
-// used to; resolveVirtualFileId below just checks for the prefix directly.
+// The vlink_ / lesson_ / gslides_ prefixes are kept on the generated IDs
+// purely for readability while debugging (e.g. in the Network tab or
+// Supabase table view) - nothing parses them to decide routing anymore the
+// way Code.gs used to; resolveVirtualFileId below just checks for the
+// prefix directly.
 
 import { supabase } from './supabaseClient';
 
+const GAS_URL = 'https://script.google.com/macros/s/AKfycbyg305xVtU66xkx9wpiQekiYukNpTrdQVns-u7QZMXe_bmYNBXYX7s--X9HE_tPEiSn/exec';
+
 export const VLINK_PREFIX = 'vlink_';
 export const LESSON_PREFIX = 'lesson_';
+export const GSLIDES_PREFIX = 'gslides_';
 
 function generateId(prefix: string): string {
   return `${prefix}${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -59,12 +63,42 @@ export async function createLesson(slides: { fileId: string; fileType: string; n
   return fileId;
 }
 
+// Registers an existing Google Slides deck WITHOUT converting anything to
+// PDF and WITHOUT creating any new file in Drive - shown natively via
+// Google's own embed viewer instead (see the render branch in Present.tsx),
+// so transitions/animations/formatting are exactly as authored, not an
+// approximation. GAS is used here purely to READ metadata (slide count +
+// speaker notes) via the SlidesApp service - it never writes anything to
+// Drive for this action.
+export async function createGoogleSlidesImport(url: string): Promise<{ fileId: string; slideCount: number } | { error: string }> {
+  const params = new URLSearchParams();
+  params.append('action', 'getSlidesInfo');
+  params.append('url', url);
+  let json: any;
+  try {
+    const response = await fetch(GAS_URL, { method: 'POST', body: params });
+    json = JSON.parse(await response.text());
+  } catch {
+    return { error: 'Google sent an invalid response' };
+  }
+  if (json.status !== 'success') return { error: json.message || 'Could not import that presentation' };
+
+  const fileId = GSLIDES_PREFIX + json.presentationId;
+  const { error } = await supabase.from('google_slides_decks').upsert({
+    presentation_id: json.presentationId,
+    slide_count: json.slideCount,
+    notes_by_page: json.notesByPage || {},
+  });
+  if (error) return { error: error.message };
+  return { fileId, slideCount: json.slideCount };
+}
+
 // Drop-in check to run BEFORE falling back to GAS's getPdf action. Returns
-// null if fileId isn't a vlink_/lesson_ id at all - callers should fall
-// through to the normal GAS fetch in that case. Returns a GAS-getPdf-shaped
-// response object otherwise (same {status, fileType, ...} shape callers
-// already handle), so this is a drop-in replacement, not a new code path
-// callers need to branch on.
+// null if fileId isn't a vlink_/lesson_/gslides_ id at all - callers
+// should fall through to the normal GAS fetch in that case. Returns a
+// GAS-getPdf-shaped response object otherwise (same {status, fileType,
+// ...} shape callers already handle), so this is a drop-in replacement,
+// not a new code path callers need to branch on.
 export async function resolveVirtualFileId(fileId: string): Promise<any | null> {
   if (fileId.startsWith(VLINK_PREFIX)) {
     const { data, error } = await supabase.from('video_links').select('platform, embed_url').eq('id', fileId).maybeSingle();
@@ -75,6 +109,12 @@ export async function resolveVirtualFileId(fileId: string): Promise<any | null> 
     const { data, error } = await supabase.from('lessons').select('slides').eq('id', fileId).maybeSingle();
     if (error || !data) return { status: 'error', message: 'Lesson not found (it may have expired).' };
     return { status: 'success', fileType: 'lesson', slides: data.slides };
+  }
+  if (fileId.startsWith(GSLIDES_PREFIX)) {
+    const presentationId = fileId.slice(GSLIDES_PREFIX.length);
+    const { data, error } = await supabase.from('google_slides_decks').select('slide_count, notes_by_page').eq('presentation_id', presentationId).maybeSingle();
+    if (error || !data) return { status: 'error', message: 'This Google Slides import was not found (it may have expired).' };
+    return { status: 'success', fileType: 'google-slides', presentationId, slideCount: data.slide_count, notesByPage: data.notes_by_page || {} };
   }
   return null;
 }

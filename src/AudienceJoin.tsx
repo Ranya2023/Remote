@@ -14,7 +14,7 @@ import { QuizReportCard, exportReportPDF, exportReportPNG, type QuizReportData }
 // --- Quiz types - MUST stay byte-for-byte in sync with Present.tsx, since
 // this is all one JSON shape round-tripping through Supabase + broadcast.
 interface QuizOption { id: string; text: string; imageUrl?: string; }
-type QuizQuestionType = 'mcq' | 'short' | 'long';
+type QuizQuestionType = 'mcq' | 'short' | 'long' | 'discussion';
 interface QuizQuestion {
   id: string;
   type: QuizQuestionType;
@@ -25,6 +25,8 @@ interface QuizQuestion {
   timeLimitSeconds: number;
 }
 interface QuizAnswerRecord { optionId: string; text?: string; answeredAt: number; correct: boolean; points: number; }
+interface DiscussionComment { id: string; participantId: string; authorName: string; authorEmoji?: string; text: string; createdAt: number; }
+interface DiscussionIdea { id: string; participantId: string; authorName: string; authorEmoji?: string; text: string; createdAt: number; reactedBy: Record<string, string>; comments: DiscussionComment[]; }
 interface QuizParticipant {
   id: string;
   name: string;
@@ -41,17 +43,39 @@ interface QuizState {
   questionStartedAt: number | null;
   participants: Record<string, QuizParticipant>;
   spotlightParticipantId?: string | null;
+  discussions: Record<string, DiscussionIdea[]>;
 }
-const DEFAULT_QUIZ_STATE: QuizState = { questions: [], currentIndex: -1, status: 'building', questionStartedAt: null, participants: {}, spotlightParticipantId: null };
+const DEFAULT_QUIZ_STATE: QuizState = { questions: [], currentIndex: -1, status: 'building', questionStartedAt: null, participants: {}, spotlightParticipantId: null, discussions: {} };
 interface SavedQuiz { id: string; title: string; questions: QuizQuestion[]; createdAt: number; }
 
 const CELEBRATION_EMOJIS = ['🎉', '🥳', '🌟', '🔥', '🚀', '⭐', '🎊', '💫'];
-const PICKABLE_EMOJIS = ['😀', '😎', '🦁', '🐼', '🦄', '🐸', '🐧', '🦊', '🌈', '⚡', '🍀', '🎯'];
+const EMOJI_CATEGORIES: { label: string; emojis: string[] }[] = [
+  { label: 'People', emojis: ['👨', '👩', '🧑', '👦', '👧', '👴', '👵', '🧔', '👶', '🧑‍🎓', '🧑‍🏫', '🕵️'] },
+  { label: 'Animals', emojis: ['🦁', '🐼', '🦄', '🐸', '🐧', '🦊', '🐶', '🐱', '🐨', '🦉', '🐢', '🦋'] },
+  { label: 'Nature & objects', emojis: ['🌳', '🌸', '🌵', '🚗', '✈️', '⚽', '🎸', '🎨', '📚', '🏀', '🎮', '🚀'] },
+  { label: 'Faces & symbols', emojis: ['😀', '😎', '🌈', '⚡', '🍀', '🎯', '🔥', '⭐', '💡', '🎵', '❤️', '🏆'] },
+];
 function autoEmojiFor(participantId: string): string {
   let hash = 0;
   for (let i = 0; i < participantId.length; i++) hash = (hash * 31 + participantId.charCodeAt(i)) >>> 0;
   return CELEBRATION_EMOJIS[hash % CELEBRATION_EMOJIS.length];
 }
+
+// A palette of visually-distinct colors so each participant's discussion
+// card is easy to tell apart at a glance - same idea and same palette as
+// Present.tsx's answerCardColorFor, kept in sync for visual consistency
+// between the phone and the projector.
+const ANSWER_CARD_COLORS = ['#f87171', '#fb923c', '#fbbf24', '#a3e635', '#34d399', '#22d3ee', '#60a5fa', '#a78bfa', '#f472b6', '#fb7185'];
+function answerCardColorFor(participantId: string): string {
+  let hash = 0;
+  for (let i = 0; i < participantId.length; i++) hash = (hash * 31 + participantId.charCodeAt(i)) >>> 0;
+  return ANSWER_CARD_COLORS[hash % ANSWER_CARD_COLORS.length];
+}
+
+// A small, tasteful reaction set - not trying to cover every possible
+// emotion, just enough range to be expressive without turning into a
+// giant picker on a small screen.
+const REACTION_EMOJIS = ['👍', '❤️', '🔥', '💡', '😂', '🤔'];
 
 interface AudienceQuestion { id: string; text: string; upvotes: number; answered: boolean; createdAt: number; }
 type FeedbackKind = '👍' | '❤️' | '👏' | '🤔' | '🐢' | '🚀';
@@ -247,6 +271,30 @@ export default function AudienceJoin() {
     });
   };
 
+  const postIdea = (text: string) => {
+    if (!participantId || !currentQuestion || !text.trim()) return;
+    channelRef.current?.send({
+      type: 'broadcast', event: 'discussion_post',
+      payload: { participantId, questionId: currentQuestion.id, text },
+    });
+  };
+
+  const addComment = (ideaId: string, text: string) => {
+    if (!participantId || !currentQuestion || !text.trim()) return;
+    channelRef.current?.send({
+      type: 'broadcast', event: 'discussion_comment',
+      payload: { participantId, questionId: currentQuestion.id, ideaId, text },
+    });
+  };
+
+  const reactToIdea = (ideaId: string, emoji: string) => {
+    if (!participantId || !currentQuestion) return;
+    channelRef.current?.send({
+      type: 'broadcast', event: 'discussion_react',
+      payload: { participantId, questionId: currentQuestion.id, ideaId, emoji },
+    });
+  };
+
   const reportData: QuizReportData = useMemo(() => ({
     title: 'Quiz Results',
     dateLabel: new Date().toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }),
@@ -350,6 +398,7 @@ export default function AudienceJoin() {
             quiz={quiz}
             t={t}
             me={me}
+            myParticipantId={participantId}
             currentQuestion={currentQuestion}
             myAnswer={myAnswerForCurrent}
             leaderboard={leaderboard}
@@ -360,6 +409,9 @@ export default function AudienceJoin() {
             setEmojiDraft={setEmojiDraft}
             onJoin={joinQuiz}
             onAnswer={answerQuestion}
+            onPostIdea={postIdea}
+            onAddComment={addComment}
+            onReact={reactToIdea}
             onDownload={downloadReport}
             exporting={exporting}
           />
@@ -436,11 +488,13 @@ export default function AudienceJoin() {
   );
 }
 
-function QuizTab({ quiz, t, me, currentQuestion, myAnswer, leaderboard, myRank, nameDraft, setNameDraft, emojiDraft, setEmojiDraft, onJoin, onAnswer, onDownload, exporting }: {
-  quiz: QuizState; t: Record<string, string>; me?: QuizParticipant; currentQuestion: QuizQuestion | null;
+function QuizTab({ quiz, t, me, myParticipantId, currentQuestion, myAnswer, leaderboard, myRank, nameDraft, setNameDraft, emojiDraft, setEmojiDraft, onJoin, onAnswer, onPostIdea, onAddComment, onReact, onDownload, exporting }: {
+  quiz: QuizState; t: Record<string, string>; me?: QuizParticipant; myParticipantId: string | null; currentQuestion: QuizQuestion | null;
   myAnswer?: QuizAnswerRecord; leaderboard: QuizParticipant[]; myRank: number;
   nameDraft: string; setNameDraft: (v: string) => void; emojiDraft: string | null; setEmojiDraft: (v: string | null) => void;
-  onJoin: () => void; onAnswer: (optionId: string, text?: string) => void; onDownload: (format: 'pdf' | 'png') => void; exporting: 'pdf' | 'png' | null;
+  onJoin: () => void; onAnswer: (optionId: string, text?: string) => void;
+  onPostIdea: (text: string) => void; onAddComment: (ideaId: string, text: string) => void; onReact: (ideaId: string, emoji: string) => void;
+  onDownload: (format: 'pdf' | 'png') => void; exporting: 'pdf' | 'png' | null;
 }) {
   const [, tick] = useState(0);
   const [freeTextDraft, setFreeTextDraft] = useState('');
@@ -474,19 +528,24 @@ function QuizTab({ quiz, t, me, currentQuestion, myAnswer, leaderboard, myRank, 
             maxLength={30}
             className="bg-gray-900 border border-gray-800 rounded-lg px-4 py-2.5 text-center text-sm w-full max-w-xs"
           />
-          <div className="w-full max-w-xs">
-            <p className="text-[11px] text-gray-500 mb-1.5">{t.pickEmoji}</p>
-            <div className="grid grid-cols-6 gap-1.5">
-              {PICKABLE_EMOJIS.map((e) => (
-                <button
-                  key={e}
-                  onClick={() => setEmojiDraft(emojiDraft === e ? null : e)}
-                  className={`text-xl py-1.5 rounded-lg border ${emojiDraft === e ? 'bg-emerald-600 border-emerald-400' : 'bg-gray-900 border-gray-800'}`}
-                >
-                  {e}
-                </button>
-              ))}
-            </div>
+          <div className="w-full max-w-xs flex flex-col gap-2.5">
+            <p className="text-[11px] text-gray-500 -mb-1">{t.pickEmoji}</p>
+            {EMOJI_CATEGORIES.map((cat) => (
+              <div key={cat.label}>
+                <p className="text-[10px] text-gray-600 uppercase font-bold mb-1">{cat.label}</p>
+                <div className="grid grid-cols-6 gap-1.5">
+                  {cat.emojis.map((e) => (
+                    <button
+                      key={e}
+                      onClick={() => setEmojiDraft(emojiDraft === e ? null : e)}
+                      className={`text-xl py-1.5 rounded-lg border ${emojiDraft === e ? 'bg-emerald-600 border-emerald-400' : 'bg-gray-900 border-gray-800'}`}
+                    >
+                      {e}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
           </div>
           <button
             onClick={onJoin}
@@ -522,7 +581,12 @@ function QuizTab({ quiz, t, me, currentQuestion, myAnswer, leaderboard, myRank, 
           </div>
           <p className="text-base font-semibold text-center">{currentQuestion.question}</p>
 
-          {myAnswer ? (
+          {currentQuestion.type === 'discussion' ? (
+            <DiscussionWall
+              quiz={quiz} question={currentQuestion} myParticipantId={myParticipantId}
+              onPostIdea={onPostIdea} onAddComment={onAddComment} onReact={onReact}
+            />
+          ) : myAnswer ? (
             <div className="flex flex-col items-center gap-2 py-8 text-gray-400">
               <span className="text-3xl">📨</span>
               <p className="text-sm text-center">{t.answerLocked}</p>
@@ -587,6 +651,14 @@ function QuizTab({ quiz, t, me, currentQuestion, myAnswer, leaderboard, myRank, 
     // reveal
     const correct = myAnswer?.correct;
     const correctOption = currentQuestion.options.find((o) => o.id === currentQuestion.correctOptionId);
+    if (currentQuestion.type === 'discussion') {
+      return (
+        <DiscussionWall
+          quiz={quiz} question={currentQuestion} myParticipantId={myParticipantId}
+          onPostIdea={onPostIdea} onAddComment={onAddComment} onReact={onReact}
+        />
+      );
+    }
     if (currentQuestion.type === 'short' || currentQuestion.type === 'long') {
       return (
         <div className="flex flex-col gap-4">
@@ -659,4 +731,139 @@ function QuizTab({ quiz, t, me, currentQuestion, myAnswer, leaderboard, myRank, 
   }
 
   return null;
+}
+
+// The actual "stunning cards" discussion experience: post your own idea
+// (once - hidden after that), react to and comment on anyone's, sorted so
+// the most-engaged ideas rise to the top. Used both while the question is
+// live and during "reveal" - a discussion doesn't really have a single
+// correct-answer reveal moment, so it just stays interactive throughout.
+function DiscussionWall({ quiz, question, myParticipantId, onPostIdea, onAddComment, onReact }: {
+  quiz: QuizState; question: QuizQuestion; myParticipantId: string | null;
+  onPostIdea: (text: string) => void; onAddComment: (ideaId: string, text: string) => void; onReact: (ideaId: string, emoji: string) => void;
+}) {
+  const [draft, setDraft] = useState('');
+  const [commentDrafts, setCommentDrafts] = useState<Record<string, string>>({});
+  const [expandedComments, setExpandedComments] = useState<Record<string, boolean>>({});
+
+  const ideas = quiz.discussions[question.id] || [];
+  const myIdea = myParticipantId ? ideas.find((i) => i.participantId === myParticipantId) : undefined;
+  const sorted = [...ideas].sort((a, b) => {
+    const scoreA = Object.keys(a.reactedBy).length + a.comments.length;
+    const scoreB = Object.keys(b.reactedBy).length + b.comments.length;
+    return scoreB - scoreA || b.createdAt - a.createdAt;
+  });
+
+  return (
+    <div className="flex flex-col gap-4">
+      {!myIdea && (
+        <div className="flex flex-col gap-2.5">
+          <textarea
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder="Share your idea..."
+            rows={3}
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            className="bg-gray-900 border border-gray-700 rounded-xl px-4 py-3 text-sm resize-none focus:outline-none focus:border-purple-500"
+          />
+          <button
+            onClick={() => { onPostIdea(draft.trim()); setDraft(''); }}
+            disabled={!draft.trim()}
+            className="bg-gradient-to-r from-blue-500 to-purple-500 disabled:opacity-30 rounded-xl py-3 text-sm font-bold active:scale-[0.97] transition-transform"
+          >
+            💡 Share your idea
+          </button>
+        </div>
+      )}
+
+      {sorted.length === 0 && (
+        <p className="text-center text-sm text-gray-500 py-6">Be the first to share an idea!</p>
+      )}
+
+      <div className="flex flex-col gap-3">
+        {sorted.map((idea) => {
+          const color = answerCardColorFor(idea.participantId);
+          const myReaction = myParticipantId ? idea.reactedBy[myParticipantId] : undefined;
+          const reactionCounts: Record<string, number> = {};
+          Object.values(idea.reactedBy).forEach((e) => { reactionCounts[e] = (reactionCounts[e] || 0) + 1; });
+          const isExpanded = !!expandedComments[idea.id];
+          return (
+            <div key={idea.id} className="rounded-2xl overflow-hidden border-2 shadow-lg" style={{ borderColor: color }}>
+              <div className="px-4 py-3" style={{ background: `linear-gradient(135deg, ${color}33, ${color}11)` }}>
+                <div className="flex items-center gap-2 mb-1.5">
+                  <span className="text-lg">{idea.authorEmoji || autoEmojiFor(idea.participantId)}</span>
+                  <span className="font-bold text-sm">{idea.authorName}</span>
+                  {idea.participantId === myParticipantId && <span className="text-[10px] text-gray-400 ml-auto">(you)</span>}
+                </div>
+                <p className="text-[15px] leading-relaxed whitespace-pre-wrap">{idea.text}</p>
+              </div>
+
+              <div className="bg-gray-900/60 px-4 py-2.5 flex flex-col gap-2">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {REACTION_EMOJIS.map((e) => {
+                    const count = reactionCounts[e] || 0;
+                    const isMine = myReaction === e;
+                    return (
+                      <button
+                        key={e}
+                        onClick={() => onReact(idea.id, e)}
+                        className={`text-xs px-2 py-1 rounded-full border transition-colors ${isMine ? 'bg-white/20 border-white' : 'bg-black/20 border-transparent'}`}
+                      >
+                        {e}{count > 0 ? ` ${count}` : ''}
+                      </button>
+                    );
+                  })}
+                  <button
+                    onClick={() => setExpandedComments((prev) => ({ ...prev, [idea.id]: !prev[idea.id] }))}
+                    className="text-xs px-2 py-1 rounded-full bg-black/20 ml-auto"
+                  >
+                    💬 {idea.comments.length}
+                  </button>
+                </div>
+
+                {isExpanded && (
+                  <div className="flex flex-col gap-2 pt-1">
+                    {idea.comments.map((c) => (
+                      <div key={c.id} className="flex items-start gap-1.5 text-xs">
+                        <span>{c.authorEmoji || autoEmojiFor(c.participantId)}</span>
+                        <span className="font-semibold shrink-0">{c.authorName}:</span>
+                        <span className="text-gray-300 break-words">{c.text}</span>
+                      </div>
+                    ))}
+                    <div className="flex gap-1.5 mt-1">
+                      <input
+                        value={commentDrafts[idea.id] || ''}
+                        onChange={(e) => setCommentDrafts((prev) => ({ ...prev, [idea.id]: e.target.value }))}
+                        placeholder="Add a comment..."
+                        autoComplete="off"
+                        autoCorrect="off"
+                        autoCapitalize="off"
+                        spellCheck={false}
+                        className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-2.5 py-1.5 text-xs"
+                      />
+                      <button
+                        onClick={() => {
+                          const text = (commentDrafts[idea.id] || '').trim();
+                          if (!text) return;
+                          onAddComment(idea.id, text);
+                          setCommentDrafts((prev) => ({ ...prev, [idea.id]: '' }));
+                        }}
+                        disabled={!(commentDrafts[idea.id] || '').trim()}
+                        className="bg-blue-600 disabled:opacity-30 rounded-lg px-3 text-xs font-bold shrink-0"
+                      >
+                        Post
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }

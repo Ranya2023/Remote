@@ -251,6 +251,14 @@ export default function AccountPage() {
     try {
       const { error: err } = await supabase.from('saved_items').delete().eq('id', item.id);
       if (err) throw err;
+      // Notes were saved "permanently until you remove this lesson" - this
+      // is that removal. Only lessons/presentations have slide notes
+      // (keyed by file_id), not saved quizzes.
+      if (item.kind === 'lesson' && item.file_id) {
+        supabase.from('slide_notes').delete().eq('file_id', item.file_id).then(({ error: notesErr }) => {
+          if (notesErr) console.warn('⚠️ Could not clean up slide notes for deleted lesson:', notesErr.message);
+        });
+      }
       refreshUsage(); // frees up quota immediately in the UI
     } catch (err) {
       console.warn('⚠️ Could not delete saved item:', err);

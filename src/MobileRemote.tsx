@@ -13,7 +13,10 @@ const texts = {
     draw: 'کێشان', highlight: 'هایلایت', erase: 'پاکەرەوە', color: 'ڕەنگ', clear: 'سڕینەوە', timer: 'کات',
     switchLang: 'EN', connecting: 'پەیوەندی دەکرێت...', loadingPdf: 'خوێندنەوەی سلاید...', error: 'هەڵە',
     spotlight: 'تیشک', zoom: 'زووم', black: 'ڕەشکردنەوە', white: 'سپیکردنەوە', notes: 'تێبینی', hideNotes: 'شاردنەوە',
+    notesFromFile: 'تێبینی لە فایلەکە', yourNotes: 'تێبینی تۆ', notesPlaceholder: 'تێبینیەکانت لێرە بنووسە...',
+    save: 'پاشەکەوتکردن', saved: 'پاشەکەوتکرا', couldNotSave: 'پاشەکەوت نەکرا', notesKeepUntilRemoved: 'هەتا سڕینەوەی وانەکە دەمێنێتەوە',
     spotlightSize: 'قەبارە',
+    laserSize: 'قەبارە', laserColor: 'ڕەنگ',
     play: 'لێدان', pause: 'وەستان', mute: 'بێدەنگ', unmute: 'دەنگ', reset: 'ڕێکخستنەوە', video: 'ڤیدیۆ',
     videoLoading: 'چاوەڕوانی ڤیدیۆ...',
     start: 'دەستپێکردن', minutesLabel: 'خولەک', undo: 'گەڕانەوە', first: 'یەکەم', last: 'کۆتایی',
@@ -27,7 +30,10 @@ const texts = {
     draw: 'Draw', highlight: 'Highlight', erase: 'Erase', color: 'Color', clear: 'Clear', timer: 'Time',
     switchLang: 'کوردی', connecting: 'Connecting...', loadingPdf: 'Loading slide...', error: 'Error',
     spotlight: 'Spotlight', zoom: 'Zoom', black: 'Black screen', white: 'White screen', notes: 'Notes', hideNotes: 'Hide',
+    notesFromFile: 'Notes from the file', yourNotes: 'Your notes', notesPlaceholder: 'Type your notes for this slide...',
+    save: 'Save', saved: 'Saved', couldNotSave: 'Could not save', notesKeepUntilRemoved: 'Kept until you remove this lesson',
     spotlightSize: 'Size',
+    laserSize: 'Size', laserColor: 'Color',
     play: 'Play', pause: 'Pause', mute: 'Mute', unmute: 'Unmute', reset: 'Reset', video: 'Video',
     videoLoading: 'Waiting for video...',
     start: 'Start', minutesLabel: 'min', undo: 'Undo', first: 'First', last: 'Last',
@@ -83,7 +89,7 @@ const TYPE_ICON: Record<string, string> = { pdf: '📄', image: '🖼️', 'vide
 // AudienceJoin.tsx, since this is all one JSON shape round-tripping
 // through Supabase + broadcast.
 interface QuizOption { id: string; text: string; imageUrl?: string; }
-type QuizQuestionType = 'mcq' | 'short' | 'long';
+type QuizQuestionType = 'mcq' | 'short' | 'long' | 'discussion';
 interface QuizQuestion {
   id: string;
   type: QuizQuestionType;
@@ -94,6 +100,8 @@ interface QuizQuestion {
   timeLimitSeconds: number;
 }
 interface QuizAnswerRecord { optionId: string; text?: string; answeredAt: number; correct: boolean; points: number; }
+interface DiscussionComment { id: string; participantId: string; authorName: string; authorEmoji?: string; text: string; createdAt: number; }
+interface DiscussionIdea { id: string; participantId: string; authorName: string; authorEmoji?: string; text: string; createdAt: number; reactedBy: Record<string, string>; comments: DiscussionComment[]; }
 interface QuizParticipant { id: string; name: string; emoji?: string; joinedAt: number; totalScore: number; answers: Record<string, QuizAnswerRecord>; }
 type QuizStatus = 'building' | 'lobby' | 'question' | 'reveal' | 'finished';
 interface QuizState {
@@ -103,8 +111,9 @@ interface QuizState {
   questionStartedAt: number | null;
   participants: Record<string, QuizParticipant>;
   spotlightParticipantId?: string | null;
+  discussions: Record<string, DiscussionIdea[]>;
 }
-const DEFAULT_QUIZ_STATE: QuizState = { questions: [], currentIndex: -1, status: 'building', questionStartedAt: null, participants: {}, spotlightParticipantId: null };
+const DEFAULT_QUIZ_STATE: QuizState = { questions: [], currentIndex: -1, status: 'building', questionStartedAt: null, participants: {}, spotlightParticipantId: null, discussions: {} };
 interface SavedQuiz { id: string; title: string; questions: QuizQuestion[]; createdAt: number; }
 interface AudienceQuestion { id: string; text: string; upvotes: number; answered: boolean; createdAt: number; }
 type FeedbackKind = '👍' | '❤️' | '👏' | '🤔' | '🐢' | '🚀';
@@ -186,6 +195,9 @@ export default function MobileRemote() {
   const [preview, setPreview] = useState<ResolvedPreview>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [spotlightRadius, setSpotlightRadius] = useState(160);
+  const [laserSize, setLaserSize] = useState(16);
+  const LASER_COLORS = ['#ef4444', '#22c55e', '#3b82f6', '#eab308', '#a855f7', '#ffffff'] as const;
+  const [laserColor, setLaserColor] = useState<string>(LASER_COLORS[0]);
 
   // This button controls the PROJECTOR's full screen, not the phone's -
   // just sends a request; Present.tsx does the actual toggling and reports
@@ -264,7 +276,18 @@ export default function MobileRemote() {
   const [screenMode, setScreenMode] = useState<ScreenMode>('normal');
   const [zoom, setZoom] = useState<ZoomState>({ scale: 1, x: 0, y: 0 });
   const [videoTime, setVideoTime] = useState<VideoTime>({ playing: false, time: 0, duration: 0, volume: 100 });
-  const [notesOpen, setNotesOpen] = useState(true);
+  // Custom, presenter-typed notes per slide - separate from activeFlat.notes
+  // (auto-extracted PPTX speaker notes, read-only). Both are shown together
+  // in the notes modal below. Loaded once per fileId/lesson (a single
+  // query for the whole lesson, not one per slide-change) and kept in a
+  // local map so switching slides doesn't need a fresh fetch. Saved
+  // "permanently until the lesson is removed" - see Account.tsx's
+  // deleteItem, which cleans up slide_notes rows when a saved lesson is
+  // deleted.
+  const [slideNotesMap, setSlideNotesMap] = useState<Record<number, string>>({});
+  const [notesModalOpen, setNotesModalOpen] = useState(false);
+  const [notesDraft, setNotesDraft] = useState('');
+  const [notesSaveStatus, setNotesSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
 
   // Local laser preview — mirrors what gets broadcast, so the phone shows
   // the exact same dot (position + on/off) as the projector.
@@ -721,6 +744,40 @@ export default function MobileRemote() {
     fetchFile();
   }, [fileId]);
 
+  // Loads every custom note for this lesson/file in one query (not one
+  // per slide-change), so switching slides and opening the notes modal
+  // both feel instant once this initial load finishes.
+  useEffect(() => {
+    if (!fileId) return;
+    supabase.from('slide_notes').select('slide_number, note').eq('file_id', fileId).then(({ data, error }) => {
+      if (error) { console.warn('⚠️ Could not load slide notes:', error.message); return; }
+      const map: Record<number, string> = {};
+      (data || []).forEach((row: any) => { if (row.note) map[row.slide_number] = row.note; });
+      setSlideNotesMap(map);
+    });
+  }, [fileId]);
+
+  const openNotesModal = () => {
+    setNotesDraft(slideNotesMap[currentSlide] || '');
+    setNotesSaveStatus('idle');
+    setNotesModalOpen(true);
+  };
+
+  const saveSlideNote = async () => {
+    if (!fileId) return;
+    setNotesSaveStatus('saving');
+    const trimmed = notesDraft.trim();
+    const { error } = await supabase.from('slide_notes').upsert({ file_id: fileId, slide_number: currentSlide, note: trimmed });
+    if (error) {
+      console.error('🚨 slide_notes upsert failed:', error.message, error);
+      setNotesSaveStatus('error');
+      return;
+    }
+    setSlideNotesMap((prev) => ({ ...prev, [currentSlide]: trimmed }));
+    setNotesSaveStatus('saved');
+    setTimeout(() => setNotesSaveStatus('idle'), 2000);
+  };
+
   // pdfFile is memoized so react-pdf sees a stable object identity and
   // doesn't re-parse on every re-render.
   const pdfFile = useMemo(() => {
@@ -879,8 +936,8 @@ export default function MobileRemote() {
 
       const isActive = type !== 'end';
       setMyLaser({ x, y, active: isActive });
-      channelRef.current.send({ type: 'broadcast', event: 'laser_move', payload: { x, y, active: isActive } });
-      persistPointerState('laser', { x, y, active: isActive });
+      channelRef.current.send({ type: 'broadcast', event: 'laser_move', payload: { x, y, active: isActive, size: laserSize, color: laserColor } });
+      persistPointerState('laser', { x, y, active: isActive, size: laserSize, color: laserColor });
     } else if (activeMode === 'spotlight') {
       const now = Date.now();
       if (now - lastSentTime.current < 16 && type === 'move') return;
@@ -1129,7 +1186,7 @@ export default function MobileRemote() {
         </div>
       )}
 
-      <div className="flex justify-between items-center p-4 bg-[#12172b]/90 backdrop-blur border-b border-[#232a45]">
+      <div className="flex justify-between items-center p-4 bg-[#12172b] border-b border-[#232a45]">
         <div className="flex items-center gap-3 relative">
           <button
             onClick={() => (timerSecondsLeft === null ? setTimerPanelOpen((o) => !o) : togglePauseTimer())}
@@ -1215,6 +1272,10 @@ export default function MobileRemote() {
             🧠
             {quiz.status !== 'building' && quiz.status !== 'finished' && <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-red-500 animate-pulse" />}
           </button>
+          <button onClick={openNotesModal} aria-label={t.notes} className="bg-[#1b2140] border border-[#2c3560] w-8 h-8 rounded-lg flex items-center justify-center text-base shrink-0 relative">
+            📝
+            {(activeFlat?.notes || slideNotesMap[currentSlide]) && <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-amber-400" />}
+          </button>
           <button
             onClick={requestProjectorFullscreen}
             aria-label={isProjectorFullscreen ? 'Exit projector full screen' : 'Full screen the projector'}
@@ -1230,7 +1291,7 @@ export default function MobileRemote() {
           host's flatSlides list so it always matches the real slide count
           (fixes "slide 6 doesn't show" for good, since this can no longer
           drift from what's actually on screen). */}
-      <div className="w-full bg-[#12172b]/90 backdrop-blur border-b border-[#232a45] py-2">
+      <div className="w-full bg-[#12172b] border-b border-[#232a45] py-2">
         <div className="flex gap-1.5 px-4 opacity-40" style={{ direction: 'ltr' }}>
           {Array.from({ length: 14 }).map((_, i) => <span key={i} className="w-1 h-1 rounded-full bg-gray-500 shrink-0" />)}
         </div>
@@ -1282,18 +1343,6 @@ export default function MobileRemote() {
         <button disabled={!ready} onClick={() => advance(-1)} className={`h-20 rounded-2xl bg-gradient-to-br from-violet-600 to-purple-800 text-white text-xl font-bold shadow-[0_4px_20px_rgba(124,58,237,0.35)] flex items-center justify-center gap-2 ${!ready ? 'opacity-50' : 'active:brightness-90'}`}><span>‹</span> {t.prev}</button>
         <button disabled={!ready} onClick={() => advance(1)} className={`h-20 rounded-2xl bg-gradient-to-br from-blue-500 to-blue-700 text-white text-xl font-bold shadow-[0_4px_20px_rgba(37,99,235,0.4)] flex items-center justify-center gap-2 ${!ready ? 'opacity-50' : 'active:brightness-90'}`}>{t.next} <span>›</span></button>
       </div>
-
-      {/* Presenter notes - only shown when the active slide actually has
-          some (populate `notes` on each slide object from your backend). */}
-      {activeFlat?.notes && (
-        <div className="mx-4 mb-2 bg-gray-900 border border-gray-800 rounded-lg p-3">
-          <div className="flex justify-between items-center mb-1">
-            <span className="text-xs text-gray-400 font-bold uppercase">{t.notes}</span>
-            <button onClick={() => setNotesOpen((o) => !o)} className="text-xs text-blue-400">{notesOpen ? t.hideNotes : t.notes}</button>
-          </div>
-          {notesOpen && <p className="text-sm text-gray-200 whitespace-pre-wrap">{activeFlat.notes}</p>}
-        </div>
-      )}
 
       {/* Screen controls: black/white screen restore-to-color, spotlight,
           zoom - separate row from the draw tools since they apply to the
@@ -1380,6 +1429,44 @@ export default function MobileRemote() {
             </button>
           ))}
         </div>
+
+        {/* Laser size + color - only shown while laser mode is active. */}
+        {activeMode === 'laser' && (
+          <div className="flex flex-col gap-2 mb-2 bg-gray-900 border border-gray-800 rounded-lg px-3 py-2">
+            <div className="flex items-center gap-3">
+              <span className="text-xs text-gray-400 font-bold shrink-0">🔴 {t.laserSize}</span>
+              <button
+                onClick={() => setLaserSize((s) => Math.max(8, s - 4))}
+                className="w-7 h-7 rounded-full bg-gray-800 text-white text-sm font-bold shrink-0"
+              >
+                −
+              </button>
+              <input
+                type="range" min={8} max={48} step={2} value={laserSize}
+                onChange={(e) => setLaserSize(Number(e.target.value))}
+                className="flex-1"
+              />
+              <button
+                onClick={() => setLaserSize((s) => Math.min(48, s + 4))}
+                className="w-7 h-7 rounded-full bg-gray-800 text-white text-sm font-bold shrink-0"
+              >
+                +
+              </button>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-gray-400 font-bold shrink-0">{t.laserColor}</span>
+              {LASER_COLORS.map((c) => (
+                <button
+                  key={c}
+                  onClick={() => setLaserColor(c)}
+                  aria-label={c}
+                  className={`w-7 h-7 rounded-full border-2 shrink-0 ${laserColor === c ? 'border-white scale-110' : 'border-transparent'}`}
+                  style={{ backgroundColor: c }}
+                />
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Spotlight size - only shown while spotlight mode is active. */}
         {activeMode === 'spotlight' && (
@@ -1500,6 +1587,50 @@ export default function MobileRemote() {
           )}
         </div>
       </div>
+
+      {notesModalOpen && (
+        <div className="fixed inset-0 z-[200] bg-black/80 flex items-end sm:items-center justify-center" onClick={() => setNotesModalOpen(false)}>
+          <div
+            className="bg-gray-900 border border-gray-700 rounded-t-2xl sm:rounded-2xl w-full sm:max-w-lg max-h-[85vh] overflow-y-auto p-5 flex flex-col gap-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-bold">📝 {t.notes} <span className="text-gray-500 font-normal text-sm">— {t.slide} {currentSlide}</span></h3>
+              <button onClick={() => setNotesModalOpen(false)} className="text-gray-400 hover:text-white text-xl leading-none">✕</button>
+            </div>
+
+            {activeFlat?.notes && (
+              <div className="bg-[#1b2140] border border-[#2c3560] rounded-xl p-3">
+                <p className="text-[10px] text-gray-400 font-bold uppercase mb-1">{t.notesFromFile}</p>
+                <p className="text-sm text-gray-200 whitespace-pre-wrap leading-relaxed">{activeFlat.notes}</p>
+              </div>
+            )}
+
+            <div className="flex flex-col gap-2">
+              <p className="text-[10px] text-gray-400 font-bold uppercase">{t.yourNotes}</p>
+              <textarea
+                value={notesDraft}
+                onChange={(e) => setNotesDraft(e.target.value)}
+                placeholder={t.notesPlaceholder}
+                rows={6}
+                className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2 text-sm text-gray-100 resize-none focus:outline-none focus:border-blue-500"
+              />
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={saveSlideNote}
+                  disabled={notesSaveStatus === 'saving'}
+                  className="px-4 py-2 rounded-lg bg-gradient-to-r from-blue-500 to-purple-500 text-white text-sm font-bold disabled:opacity-50"
+                >
+                  {notesSaveStatus === 'saving' ? '…' : `💾 ${t.save}`}
+                </button>
+                {notesSaveStatus === 'saved' && <span className="text-xs text-green-400">{t.saved} ✓</span>}
+                {notesSaveStatus === 'error' && <span className="text-xs text-red-400">{t.couldNotSave}</span>}
+                <span className="text-[10px] text-gray-500 ml-auto">{t.notesKeepUntilRemoved}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {quizPanelOpen && (
         <div className="fixed inset-0 z-[200] bg-black/80 flex items-end sm:items-center justify-center" onClick={() => setQuizPanelOpen(false)}>

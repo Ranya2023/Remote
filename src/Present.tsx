@@ -75,6 +75,7 @@ type ResolvedSlide =
   | { fileType: 'pdf'; blobUrl: string; name?: string }
   | { fileType: 'image'; blobUrl: string; name?: string }
   | { fileType: 'video-link'; embedUrl: string; platform?: string; name?: string }
+  | { fileType: 'google-slides'; presentationId: string; slideCount: number; notesByPage: Record<number, string>; name?: string }
   | { fileType: 'other'; blobUrl: string; name?: string };
 
 // One entry per *visible slide*, not per lesson item. A 5-page PDF item
@@ -120,8 +121,11 @@ interface QuizOption { id: string; text: string; imageUrl?: string; }
 // 'mcq' behaves exactly as before. 'short'/'long' skip options/scoring
 // entirely - the audience types an answer instead of picking one, and
 // there's no auto-grading (there's no way to auto-grade free text), just a
-// flat participation score once they submit.
-type QuizQuestionType = 'mcq' | 'short' | 'long';
+// flat participation score once they submit. 'discussion' is different
+// again - not a single answer at all, but an ongoing shared wall: anyone
+// can post one idea, and everyone can comment/react on any idea, live -
+// see DiscussionIdea/DiscussionComment below.
+type QuizQuestionType = 'mcq' | 'short' | 'long' | 'discussion';
 interface QuizQuestion {
   id: string;
   type: QuizQuestionType;
@@ -137,6 +141,28 @@ interface QuizAnswerRecord {
   answeredAt: number;
   correct: boolean;
   points: number;
+}
+interface DiscussionComment {
+  id: string;
+  participantId: string;
+  authorName: string;
+  authorEmoji?: string;
+  text: string;
+  createdAt: number;
+}
+interface DiscussionIdea {
+  id: string;
+  participantId: string;
+  authorName: string;
+  authorEmoji?: string;
+  text: string;
+  createdAt: number;
+  // One reaction per person per idea (participantId -> the emoji they
+  // picked) - posting the same emoji again removes it, a different one
+  // replaces it. Counts per emoji are always derived from this map, never
+  // stored separately, so there's nothing that can drift out of sync.
+  reactedBy: Record<string, string>;
+  comments: DiscussionComment[];
 }
 interface QuizParticipant {
   id: string;
@@ -158,8 +184,11 @@ interface QuizState {
   // card, or "🎲 Spotlight" picked one at random. Reset on every question
   // change.
   spotlightParticipantId?: string | null;
+  // Keyed by questionId - only discussion-type questions ever get an
+  // entry here, and only once someone's actually posted something.
+  discussions: Record<string, DiscussionIdea[]>;
 }
-const DEFAULT_QUIZ_STATE: QuizState = { questions: [], currentIndex: -1, status: 'building', questionStartedAt: null, participants: {}, spotlightParticipantId: null };
+const DEFAULT_QUIZ_STATE: QuizState = { questions: [], currentIndex: -1, status: 'building', questionStartedAt: null, participants: {}, spotlightParticipantId: null, discussions: {} };
 interface SavedQuiz { id: string; title: string; questions: QuizQuestion[]; createdAt: number; }
 
 // A palette of visually-distinct colors for the free-text answer cards, so
@@ -216,6 +245,10 @@ type CanvasDataMap = Record<number, Stroke[]>; // keyed by flat slide number (1-
 function normalizeResponse(json: any, nameHint?: string): ResolvedSlide {
   if (json.embedUrl) {
     return { fileType: 'video-link', embedUrl: json.embedUrl, platform: json.platform, name: nameHint || json.name };
+  }
+
+  if (json.fileType === 'google-slides') {
+    return { fileType: 'google-slides', presentationId: json.presentationId, slideCount: json.slideCount, notesByPage: json.notesByPage || {}, name: nameHint || json.name };
   }
 
   if (json.data && json.mimeType) {
@@ -450,7 +483,7 @@ export default function Present() {
     const id = setTimeout(() => setTimerAlert((cur) => (cur?.key === timerAlert.key ? null : cur)), timerAlert.flashMs);
     return () => clearTimeout(id);
   }, [timerAlert]);
-  const [laser, setLaser] = useState({ x: 0.5, y: 0.5, active: false });
+  const [laser, setLaser] = useState({ x: 0.5, y: 0.5, active: false, size: 16, color: '#ef4444' });
   const [videoState, setVideoState] = useState<VideoState>(DEFAULT_VIDEO_STATE);
 
   const presentCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -515,6 +548,7 @@ export default function Present() {
   const [qSource, setQSource] = useState('');
   const [qTimeLimit, setQTimeLimit] = useState(20);
   const [saveTitle, setSaveTitle] = useState('');
+  const [saveQuizStatus, setSaveQuizStatus] = useState<{ ok: boolean; message: string } | null>(null);
 
   const persistAudienceState = useCallback((next: AudienceState) => {
     audienceStateRef.current = next;
@@ -565,7 +599,7 @@ export default function Present() {
   const startQuizFlow = useCallback((questions: QuizQuestion[]) => {
     if (!questions.length) return;
     setQuizStageMinimized(false);
-    persistAudienceState({ ...audienceStateRef.current, quiz: { questions, currentIndex: -1, status: 'lobby', questionStartedAt: null, participants: {}, spotlightParticipantId: null } });
+    persistAudienceState({ ...audienceStateRef.current, quiz: { questions, currentIndex: -1, status: 'lobby', questionStartedAt: null, participants: {}, spotlightParticipantId: null, discussions: {} } });
   }, [persistAudienceState]);
 
   const advanceQuiz = useCallback(() => {
@@ -645,20 +679,26 @@ export default function Present() {
   // device/browser; fileId is the one thing that's genuinely the same
   // every time this lesson's link is opened, from anywhere. See
   // setupSession's hydration below for the read side.
-  const saveQuiz = useCallback((title: string, questions: QuizQuestion[]) => {
-    if (!title.trim() || !questions.length) return;
+  const saveQuiz = useCallback(async (title: string, questions: QuizQuestion[]): Promise<{ ok: boolean; error?: string }> => {
+    if (!title.trim() || !questions.length) return { ok: false, error: 'Add a title and at least one question first.' };
     const saved: SavedQuiz = { id: `sv_${Date.now().toString(36)}`, title: title.trim(), questions, createdAt: Date.now() };
     const nextSavedQuizzes = [...audienceStateRef.current.savedQuizzes, saved];
     persistAudienceState({ ...audienceStateRef.current, savedQuizzes: nextSavedQuizzes });
+    let persistResult: { ok: boolean; error?: string } = { ok: true };
     if (fileId) {
-      supabase.from('saved_quizzes_by_file').upsert({ file_id: fileId, quizzes: nextSavedQuizzes }).then(({ error }) => {
-        if (error) console.warn('saved_quizzes_by_file upsert skipped (has supabase_migration_saved_quizzes.sql been run yet?):', error.message);
-      });
+      const { error } = await supabase.from('saved_quizzes_by_file').upsert({ file_id: fileId, quizzes: nextSavedQuizzes });
+      if (error) {
+        console.error('🚨 saved_quizzes_by_file upsert failed:', error.message, error);
+        persistResult = { ok: false, error: error.message };
+      }
+    } else {
+      persistResult = { ok: false, error: 'No file ID available yet - try again in a moment.' };
     }
     // Also lands in the presenter's account dashboard (if logged in), so
     // it's reachable from anywhere, not just from inside this one file's
     // saved-quizzes list.
     recordSavedItem({ kind: 'quiz', title: title.trim(), questions });
+    return persistResult;
   }, [persistAudienceState, fileId]);
   const deleteSavedQuiz = useCallback((id: string) => {
     const nextSavedQuizzes = audienceStateRef.current.savedQuizzes.filter((s) => s.id !== id);
@@ -923,8 +963,10 @@ export default function Present() {
       });
 
       channel.on('broadcast', { event: 'laser_move' }, (payload) => {
-        const { x, y, active } = payload.payload || {};
-        if (typeof x === 'number' && typeof y === 'number') setLaser({ x, y, active: !!active });
+        const { x, y, active, size, color } = payload.payload || {};
+        if (typeof x === 'number' && typeof y === 'number') {
+          setLaser((prev) => ({ x, y, active: !!active, size: size ?? prev.size, color: color ?? prev.color }));
+        }
       });
 
       channel.on('broadcast', { event: 'spotlight_move' }, (payload) => {
@@ -1054,6 +1096,65 @@ export default function Present() {
         else if (action === 'reset') resetQuiz();
         else if (action === 'save_quiz' && Array.isArray(questions) && payload.payload?.title) saveQuiz(payload.payload.title, questions);
         else if (action === 'delete_saved' && payload.payload?.id) deleteSavedQuiz(payload.payload.id);
+      });
+
+      // Discussion-type question activity: post an idea, comment on one,
+      // or react to one. All three follow the same shape as quiz_answer
+      // above - the poster's own device broadcasts the raw action, this
+      // (the host/authoritative tab) is what actually applies it to
+      // audience_state and re-persists+re-broadcasts the full result, so
+      // every other connected device (other students, the remote) picks
+      // up the change the same way it picks up everything else.
+      channel.on('broadcast', { event: 'discussion_post' }, (payload) => {
+        const { participantId, questionId, text } = payload.payload || {};
+        const trimmed = (text || '').trim();
+        if (!participantId || !questionId || !trimmed) return;
+        const current = audienceStateRef.current;
+        const participant = current.quiz.participants[participantId];
+        if (!participant) return;
+        const existing = current.quiz.discussions[questionId] || [];
+        if (existing.some((i) => i.participantId === participantId)) return; // one idea per person per question
+        const idea: DiscussionIdea = {
+          id: `idea_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+          participantId, authorName: participant.name, authorEmoji: participant.emoji,
+          text: trimmed.slice(0, 500), createdAt: Date.now(), reactedBy: {}, comments: [],
+        };
+        persistAudienceState({
+          ...current,
+          quiz: { ...current.quiz, discussions: { ...current.quiz.discussions, [questionId]: [...existing, idea] } },
+        });
+      });
+
+      channel.on('broadcast', { event: 'discussion_comment' }, (payload) => {
+        const { participantId, questionId, ideaId, text } = payload.payload || {};
+        const trimmed = (text || '').trim();
+        if (!participantId || !questionId || !ideaId || !trimmed) return;
+        const current = audienceStateRef.current;
+        const participant = current.quiz.participants[participantId];
+        if (!participant) return;
+        const ideas = current.quiz.discussions[questionId] || [];
+        const comment: DiscussionComment = {
+          id: `cmt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+          participantId, authorName: participant.name, authorEmoji: participant.emoji,
+          text: trimmed.slice(0, 300), createdAt: Date.now(),
+        };
+        const nextIdeas = ideas.map((i) => (i.id === ideaId ? { ...i, comments: [...i.comments, comment] } : i));
+        persistAudienceState({ ...current, quiz: { ...current.quiz, discussions: { ...current.quiz.discussions, [questionId]: nextIdeas } } });
+      });
+
+      channel.on('broadcast', { event: 'discussion_react' }, (payload) => {
+        const { participantId, questionId, ideaId, emoji } = payload.payload || {};
+        if (!participantId || !questionId || !ideaId || !emoji) return;
+        const current = audienceStateRef.current;
+        const ideas = current.quiz.discussions[questionId] || [];
+        const nextIdeas = ideas.map((i) => {
+          if (i.id !== ideaId) return i;
+          const reactedBy = { ...i.reactedBy };
+          if (reactedBy[participantId] === emoji) delete reactedBy[participantId]; // tap the same one again to remove it
+          else reactedBy[participantId] = emoji;
+          return { ...i, reactedBy };
+        });
+        persistAudienceState({ ...current, quiz: { ...current.quiz, discussions: { ...current.quiz.discussions, [questionId]: nextIdeas } } });
       });
 
       channel.on('broadcast', { event: 'draw_stroke' }, (payload) => {
@@ -1463,6 +1564,15 @@ export default function Present() {
               const renderData = renderDataByPage[p];
               result.push({ itemIndex: i, pageInItem: p, fileType: 'pdf', name: ref.name, notes: notesByPage[p] || ref.notes, transition: transitionsByPage[p], thumbnail, renderData, buildCount: renderData?.buildCount });
             }
+          } else if (entry.fileType === 'google-slides') {
+            // No thumbnail generation here deliberately - see the note on
+            // GoogleSlidesThumbnail in the render section below for why.
+            // Slide count and notes are already known synchronously (no
+            // pdf.js-style async page-discovery needed), so this expands
+            // in one pass.
+            for (let p = 1; p <= entry.slideCount; p++) {
+              result.push({ itemIndex: i, pageInItem: p, fileType: 'google-slides', name: ref.name, notes: entry.notesByPage[p] });
+            }
           } else {
             const thumbnail = entry.fileType === 'image' ? await renderImageThumbnail(entry.blobUrl) : undefined;
             result.push({ itemIndex: i, pageInItem: 1, fileType: entry.fileType, name: ref.name, notes: ref.notes, thumbnail });
@@ -1499,6 +1609,12 @@ export default function Present() {
           slides.push({ itemIndex: 0, pageInItem: i + 1, fileType: 'pdf', notes: notesByPage[i + 1], transition: transitionsByPage[i + 1], thumbnail, renderData, buildCount: renderData?.buildCount });
           if (!cancelled) setFlatSlides([...slides]);
         }
+      } else if (resolved.fileType === 'google-slides') {
+        const slides: FlatSlide[] = [];
+        for (let p = 1; p <= resolved.slideCount; p++) {
+          slides.push({ itemIndex: 0, pageInItem: p, fileType: 'google-slides', notes: resolved.notesByPage[p] });
+        }
+        if (!cancelled) setFlatSlides(slides);
       } else if (resolved.fileType === 'image') {
         const thumbnail = await renderImageThumbnail(resolved.blobUrl);
         if (!cancelled) setFlatSlides([{ itemIndex: 0, pageInItem: 1, fileType: resolved.fileType, name: resolved.name, thumbnail }]);
@@ -1516,13 +1632,24 @@ export default function Present() {
   // know their real page count before landing on the requested page.
   useEffect(() => {
     if (!resolved) return;
-    if (resolved.fileType !== 'pdf') {
+    if (resolved.fileType === 'pdf') {
+      setNumPages(null);
+      if (landOnPageRef.current == null) setCurrentPage(1);
+    } else if (resolved.fileType === 'google-slides') {
+      // Slide count is already known synchronously here (no pdf.js-style
+      // async load event to wait for), but still respects a requested
+      // landing page the same way pdf does, for consistent lesson
+      // navigation between item types.
+      if (landOnPageRef.current != null) {
+        setCurrentPage(landOnPageRef.current);
+        landOnPageRef.current = null;
+      } else {
+        setCurrentPage(1);
+      }
+    } else {
       setCurrentPage(1);
       setNumPages(null);
       landOnPageRef.current = null;
-    } else {
-      setNumPages(null);
-      if (landOnPageRef.current == null) setCurrentPage(1);
     }
   }, [resolved]);
 
@@ -1812,6 +1939,28 @@ export default function Present() {
               />
             )}
 
+            {!loading && !error && resolved?.fileType === 'google-slides' && (
+              // Google's own live viewer, shown exactly as authored -
+              // transitions/animations/fonts are all real, not an
+              // approximation. The tradeoff: this reloads to the requested
+              // slide rather than smoothly transitioning INTO it, since
+              // Google doesn't expose a live remote-control API for an
+              // already-loaded embed - only "load starting at slide N."
+              // Landing on the right slide, fully built, is exact either
+              // way; the transition animation between consecutive slides
+              // specifically only plays if advancing by clicking inside
+              // the iframe directly on the host machine, not via the
+              // phone remote.
+              <iframe
+                key={`gslides-${currentFlatIndex}`}
+                src={`https://docs.google.com/presentation/d/${resolved.presentationId}/embed?rm=minimal&slide=id.p${currentPage}`}
+                title={resolved.name || 'Google Slides'}
+                className="w-full h-full border-0 bg-white"
+                allow="fullscreen"
+                allowFullScreen
+              />
+            )}
+
             {!loading && !error && resolved?.fileType === 'other' && (
               <div className="flex flex-col items-center gap-4 text-center px-6">
                 <span className="text-gray-300">This file type can't be previewed inline.</span>
@@ -1838,8 +1987,14 @@ export default function Present() {
           {/* Laser pointer dot, screen-fixed regardless of zoom. */}
           {laser.active && (
             <div
-              className="absolute pointer-events-none z-30 rounded-full bg-red-500 shadow-[0_0_16px_#ef4444]"
-              style={{ width: 16, height: 16, left: `${laser.x * 100}%`, top: `${laser.y * 100}%`, transform: 'translate(-50%, -50%)' }}
+              className="absolute pointer-events-none z-30 rounded-full"
+              style={{
+                width: laser.size, height: laser.size,
+                left: `${laser.x * 100}%`, top: `${laser.y * 100}%`,
+                transform: 'translate(-50%, -50%)',
+                backgroundColor: laser.color,
+                boxShadow: `0 0 ${Math.round(laser.size)}px ${laser.color}`,
+              }}
             />
           )}
 
@@ -2014,13 +2169,13 @@ export default function Present() {
                   <p className="text-xs font-bold text-gray-400 uppercase">Add question</p>
 
                   <div className="flex gap-1.5">
-                    {(['mcq', 'short', 'long'] as QuizQuestionType[]).map((t) => (
+                    {(['mcq', 'short', 'long', 'discussion'] as QuizQuestionType[]).map((t) => (
                       <button
                         key={t}
                         onClick={() => setQType(t)}
-                        className={`flex-1 rounded-lg py-1.5 text-xs font-bold ${qType === t ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400'}`}
+                        className={`flex-1 rounded-lg py-1.5 text-[11px] font-bold ${qType === t ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400'}`}
                       >
-                        {t === 'mcq' ? 'Multiple choice' : t === 'short' ? 'Short answer' : 'Long answer'}
+                        {t === 'mcq' ? 'Multiple choice' : t === 'short' ? 'Short answer' : t === 'long' ? 'Long answer' : 'Discussion'}
                       </button>
                     ))}
                   </div>
@@ -2064,9 +2219,14 @@ export default function Present() {
                     ))}
                   </div>
                   )}
-                  {qType !== 'mcq' && (
+                  {(qType === 'short' || qType === 'long') && (
                     <p className="text-[10px] text-gray-500">
                       Everyone types their own {qType === 'short' ? 'short' : 'long'} answer - no options, nothing auto-graded. Their name and answer show up as a card on the projector once they submit.
+                    </p>
+                  )}
+                  {qType === 'discussion' && (
+                    <p className="text-[10px] text-gray-500">
+                      A shared wall, not a single answer: everyone can post their own idea, and everyone can comment or react on anyone's idea, live. Ideas with the most reactions + comments rise to the top.
                     </p>
                   )}
 
@@ -2095,13 +2255,22 @@ export default function Present() {
                     className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs"
                   />
                   <button
-                    onClick={() => { saveQuiz(saveTitle, draftQuestions); setSaveTitle(''); }}
+                    onClick={async () => {
+                      setSaveQuizStatus(null);
+                      const result = await saveQuiz(saveTitle, draftQuestions);
+                      setSaveTitle('');
+                      setSaveQuizStatus(result.ok ? { ok: true, message: 'Saved ✓' } : { ok: false, message: result.error || 'Could not save' });
+                      setTimeout(() => setSaveQuizStatus(null), 5000);
+                    }}
                     disabled={draftQuestions.length === 0 || !saveTitle.trim()}
                     className="bg-gray-700 disabled:opacity-30 hover:bg-gray-600 px-4 rounded-lg text-xs font-bold shrink-0"
                   >
                     💾 Save
                   </button>
                 </div>
+                {saveQuizStatus && (
+                  <p className={`text-xs -mt-1 ${saveQuizStatus.ok ? 'text-green-400' : 'text-red-400'}`}>{saveQuizStatus.message}</p>
+                )}
 
                 <button
                   onClick={() => startQuizFlow(draftQuestions)}
@@ -2199,7 +2368,9 @@ function QuizLiveStage({ quiz, question, lang, onReveal, onAdvance, onSpotlight,
       )}
       {quiz.status === 'question' && <span className="text-4xl font-mono font-bold">{secondsLeft}s</span>}
 
-      {question.type !== 'mcq' ? (
+      {question.type === 'discussion' ? (
+        <DiscussionWallStage quiz={quiz} question={question} lang={lang} />
+      ) : question.type !== 'mcq' ? (
         <FreeTextAnswerStage quiz={quiz} question={question} onSpotlight={onSpotlight} lang={lang} />
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full">
@@ -2303,6 +2474,48 @@ function FreeTextAnswerStage({ quiz, question, onSpotlight, lang }: {
           );
         })}
       </div>
+    </div>
+  );
+}
+
+// Projector-side view of a discussion question - read-only (the actual
+// posting/commenting/reacting happens on each student's own phone, via
+// AudienceJoin.tsx), sorted by engagement so the room can watch the most
+// resonant ideas rise to the top live. Same colored-card language as
+// FreeTextAnswerStage above, for visual consistency across question types.
+function DiscussionWallStage({ quiz, question, lang }: { quiz: QuizState; question: QuizQuestion; lang: 'ku' | 'en' }) {
+  const ideas = quiz.discussions[question.id] || [];
+  const sorted = [...ideas].sort((a, b) => {
+    const scoreA = Object.keys(a.reactedBy).length + a.comments.length;
+    const scoreB = Object.keys(b.reactedBy).length + b.comments.length;
+    return scoreB - scoreA || b.createdAt - a.createdAt;
+  });
+
+  if (!sorted.length) {
+    return <p className="text-indigo-300 text-sm py-8">{lang === 'ku' ? 'چاوەڕوانی بیرۆکەکان...' : 'Waiting for ideas...'}</p>;
+  }
+
+  return (
+    <div className="w-full grid grid-cols-1 sm:grid-cols-2 gap-3">
+      {sorted.map((idea) => {
+        const color = answerCardColorFor(idea.participantId);
+        const reactionCounts: Record<string, number> = {};
+        Object.values(idea.reactedBy).forEach((e) => { reactionCounts[e] = (reactionCounts[e] || 0) + 1; });
+        return (
+          <div key={idea.id} className="text-left rounded-2xl p-4 border-2" style={{ borderColor: color, background: `${color}18` }}>
+            <p className="text-sm font-bold mb-1.5">{idea.authorEmoji || autoEmojiFor(idea.participantId)} {idea.authorName}</p>
+            <p className="text-base leading-relaxed whitespace-pre-wrap mb-2">{idea.text}</p>
+            <div className="flex items-center gap-2 flex-wrap text-xs">
+              {Object.entries(reactionCounts).map(([emoji, count]) => (
+                <span key={emoji} className="bg-black/20 rounded-full px-2 py-0.5">{emoji} {count}</span>
+              ))}
+              {idea.comments.length > 0 && (
+                <span className="bg-black/20 rounded-full px-2 py-0.5">💬 {idea.comments.length}</span>
+              )}
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }
