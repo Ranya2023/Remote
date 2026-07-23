@@ -1957,7 +1957,7 @@ export default function Present() {
               />
             )}
 
-            {!loading && !error && resolved?.fileType === 'google-slides' && (
+            {!loading && !error && resolved?.fileType === 'google-slides' && (() => {
               // Google's own live viewer, shown exactly as authored -
               // transitions/animations/fonts are all real, not an
               // approximation. The tradeoff: this reloads to the requested
@@ -1969,15 +1969,24 @@ export default function Present() {
               // specifically only plays if advancing by clicking inside
               // the iframe directly on the host machine, not via the
               // phone remote.
-              <iframe
-                key={`gslides-${currentFlatIndex}`}
-                src={`https://docs.google.com/presentation/d/${resolved.presentationId}/embed?rm=minimal&slide=id.${resolved.slideIds[currentPage - 1] || `p${currentPage}`}`}
-                title={resolved.name || 'Google Slides'}
-                className="w-full h-full border-0 bg-white"
-                allow="fullscreen"
-                allowFullScreen
-              />
-            )}
+              const realSlideId = resolved.slideIds[currentPage - 1];
+              const slideIdToUse = realSlideId || `p${currentPage}`;
+              // TEMP DIAGNOSTIC - remove once the navigation bug is confirmed/fixed.
+              // If "usingRealId" logs false, resolved.slideIds is empty/short
+              // and we're guessing "pN", which silently fails to navigate
+              // whenever the deck's actual slide IDs aren't sequential p1/p2/p3.
+              console.warn('[gslides-nav]', { currentPage, slideIdToUse, usingRealId: !!realSlideId, totalKnownIds: resolved.slideIds.length });
+              return (
+                <iframe
+                  key={`gslides-${currentFlatIndex}`}
+                  src={`https://docs.google.com/presentation/d/${resolved.presentationId}/embed?rm=minimal&slide=id.${slideIdToUse}`}
+                  title={resolved.name || 'Google Slides'}
+                  className="w-full h-full border-0 bg-white"
+                  allow="fullscreen"
+                  allowFullScreen
+                />
+              );
+            })()}
 
             {!loading && !error && resolved?.fileType === 'other' && (
               <div className="flex flex-col items-center gap-4 text-center px-6">
