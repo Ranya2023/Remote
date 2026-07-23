@@ -6,7 +6,6 @@ import { supabase } from './supabaseClient';
 import { QuizReportCard, exportReportPDF, exportReportPNG, type QuizReportData } from './quizReport';
 import { recordSavedItem } from './Account';
 import type { SlideTransition, SlideRenderData } from './pptxParse';
-import SlideRenderer from './SlideRenderer';
 
 // Best-effort lookup of whatever extractPptxMeta (see FileUpload.tsx) saved
 // for a given uploaded file - speaker notes and transition info, keyed by
@@ -1721,29 +1720,19 @@ export default function Present() {
                 before. */}
             <div key={currentFlatIndex} className="w-full h-full flex items-center justify-center" style={transitionAnimationStyle(flatSlides[currentFlatIndex]?.transition)}>
             {!loading && !error && resolved?.fileType === 'pdf' && (
-              <div className={`w-full h-full flex items-center justify-center bg-white ${flatSlides[currentFlatIndex]?.renderData ? 'overflow-hidden' : 'overflow-auto'}`}>
+              <div className="w-full h-full flex items-center justify-center overflow-auto bg-white">
                 <Document
                   file={resolved.blobUrl}
                   loading={<div className="p-12 text-black">Loading PDF...</div>}
                   onLoadSuccess={onPdfLoadSuccess}
                   onLoadError={(err) => setError(`PDF error: ${err.message}`)}
                 >
-                  {flatSlides[currentFlatIndex]?.renderData ? (
-                    // Real shapes/text/builds, parsed from the PPTX itself -
-                    // used whenever available. <Document> still needs to be
-                    // mounted even here: it's what drives numPages, which
-                    // the flat-slide count for this whole file depends on,
-                    // and it stays ready as the fallback for any other slide
-                    // in the same deck that didn't parse.
-                    <SlideRenderer data={flatSlides[currentFlatIndex]!.renderData!} buildIndex={buildIndex} heightPx={window.innerHeight * 0.85} />
-                  ) : (
-                    <Page
-                      pageNumber={currentPage}
-                      renderTextLayer={false}
-                      renderAnnotationLayer={false}
-                      height={window.innerHeight * 0.85}
-                    />
-                  )}
+                  <Page
+                    pageNumber={currentPage}
+                    renderTextLayer={false}
+                    renderAnnotationLayer={false}
+                    height={window.innerHeight * 0.85}
+                  />
                 </Document>
               </div>
             )}

@@ -175,7 +175,7 @@ function emuToPt(emu: number): number {
   return emu / 12700;
 }
 
-async function getSlideSizeEmu(zip: JSZip): Promise<{ cx: number; cy: number }> {
+export async function getSlideSizeEmu(zip: JSZip): Promise<{ cx: number; cy: number }> {
   const presDoc = await readXml(zip, 'ppt/presentation.xml');
   const sldSz = presDoc && firstEl(presDoc, 'p:sldSz');
   const cx = Number(sldSz?.getAttribute('cx')) || 9144000; // 10in @ 914400 EMU/in - the common 4:3 default
@@ -544,7 +544,7 @@ async function extractBackgroundForSlide(slideDoc: Document): Promise<string | u
   return extractColor(bgPr);
 }
 
-async function extractRenderDataForSlide(zip: JSZip, slidePath: string, slideCx: number, slideCy: number): Promise<SlideRenderData | undefined> {
+export async function extractRenderDataForSlide(zip: JSZip, slidePath: string, slideCx: number, slideCy: number): Promise<SlideRenderData | undefined> {
   try {
     const slideDoc = await readXml(zip, slidePath);
     if (!slideDoc) return undefined;
@@ -600,21 +600,23 @@ export async function extractPptxMeta(file: File): Promise<PptxMeta> {
     const slidePaths = await getOrderedSlidePaths(zip);
     if (!slidePaths.length) return empty;
 
-    const { cx, cy } = await getSlideSizeEmu(zip);
     const notesByPage: Record<number, string> = {};
     const transitionsByPage: Record<number, SlideTransition> = {};
     const renderDataByPage: Record<number, SlideRenderData> = {};
 
     for (let i = 0; i < slidePaths.length; i++) {
       const page = i + 1;
-      const [notes, transition, renderData] = await Promise.all([
+      // Shape/build extraction (extractRenderDataForSlide) is deliberately
+      // not called here anymore - the web app went back to plain PDF page
+      // display, so that parsing was pure overhead on every upload with
+      // nothing left to use its output. The function itself is still in
+      // this file, dormant, in case animated rendering is ever revisited.
+      const [notes, transition] = await Promise.all([
         extractNotesForSlide(zip, slidePaths[i]),
         extractTransitionForSlide(zip, slidePaths[i]),
-        extractRenderDataForSlide(zip, slidePaths[i], cx, cy),
       ]);
       if (notes) notesByPage[page] = notes;
       if (transition) transitionsByPage[page] = transition;
-      if (renderData) renderDataByPage[page] = renderData;
     }
 
     return { notesByPage, transitionsByPage, renderDataByPage, slideCount: slidePaths.length };

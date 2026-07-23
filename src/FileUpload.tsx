@@ -35,6 +35,10 @@ function looksLikeSupportedVideoLink(url: string) {
   return /youtube\.com|youtu\.be|vimeo\.com|drive\.google\.com/i.test(url);
 }
 
+function looksLikeGoogleSlidesLink(url: string) {
+  return /docs\.google\.com\/presentation/i.test(url);
+}
+
 function guessMimeFromName(filename: string): string {
   const lower = filename.toLowerCase();
   if (lower.endsWith('.pdf')) return 'application/pdf';
@@ -75,6 +79,7 @@ interface SlideItem {
 export default function FileUpload() {
   const [slides, setSlides] = useState<SlideItem[]>([]);
   const [videoUrl, setVideoUrl] = useState('');
+  const [slidesLinkUrl, setSlidesLinkUrl] = useState('');
   const [isStarting, setIsStarting] = useState(false);
   const [message, setMessage] = useState('');
 
@@ -223,6 +228,48 @@ export default function FileUpload() {
           });
         } else {
           updateSlide(localId, { status: 'error', errorMessage: result.message || 'Could not add link' });
+        }
+      } catch (parseError) {
+        updateSlide(localId, { status: 'error', errorMessage: 'Google sent an invalid response' });
+      }
+    } catch (error: any) {
+      updateSlide(localId, { status: 'error', errorMessage: error.message || 'Network error' });
+    }
+  };
+
+  const handleSlidesLinkSubmit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const trimmedUrl = slidesLinkUrl.trim();
+    if (!trimmedUrl) return;
+
+    if (!looksLikeGoogleSlidesLink(trimmedUrl)) {
+      setMessage('Please paste a Google Slides link (docs.google.com/presentation/...).');
+      return;
+    }
+
+    const localId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    setSlides((prev) => [...prev, { localId, name: 'Google Slides presentation', status: 'uploading' }]);
+    setSlidesLinkUrl('');
+
+    try {
+      const params = new URLSearchParams();
+      params.append('action', 'importSlideLink');
+      params.append('url', trimmedUrl);
+
+      const response = await fetch(GAS_URL, { method: 'POST', body: params });
+      const textResponse = await response.text();
+
+      try {
+        const result = JSON.parse(textResponse);
+        if (result.status === 'success') {
+          // Comes back as a plain PDF fileId, exactly like an uploaded
+          // PPTX - Code.gs already converted the whole deck server-side,
+          // so this needs zero extra handling here: the same page-count +
+          // per-page thumbnail pipeline that already works for any
+          // multi-page PDF picks it up automatically.
+          updateSlide(localId, { status: 'done', fileId: result.fileId, fileType: result.fileType || 'pdf' });
+        } else {
+          updateSlide(localId, { status: 'error', errorMessage: result.message || 'Could not import that presentation' });
         }
       } catch (parseError) {
         updateSlide(localId, { status: 'error', errorMessage: 'Google sent an invalid response' });
@@ -393,6 +440,29 @@ export default function FileUpload() {
           className="rounded-lg bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 text-white text-sm font-semibold px-6 py-3 transition-colors"
         >
           Add video
+        </button>
+      </form>
+
+      <div className="w-full flex items-center gap-3 my-6">
+        <div className="flex-1 h-px bg-gray-700" />
+        <span className="text-xs text-gray-500 uppercase tracking-wide">or import a google slides link</span>
+        <div className="flex-1 h-px bg-gray-700" />
+      </div>
+
+      <form onSubmit={handleSlidesLinkSubmit} className="w-full flex flex-col sm:flex-row gap-3">
+        <input
+          type="url"
+          value={slidesLinkUrl}
+          onChange={(e) => setSlidesLinkUrl(e.target.value)}
+          placeholder="Paste a Google Slides link"
+          className="flex-1 rounded-lg bg-gray-900 border border-gray-600 text-white text-sm px-4 py-3 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+        />
+        <button
+          type="submit"
+          disabled={!slidesLinkUrl.trim()}
+          className="rounded-lg bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 text-white text-sm font-semibold px-6 py-3 transition-colors"
+        >
+          Import slides
         </button>
       </form>
 
