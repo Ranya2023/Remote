@@ -88,6 +88,12 @@ export async function createGoogleSlidesImport(url: string): Promise<{ fileId: s
     presentation_id: json.presentationId,
     slide_count: json.slideCount,
     notes_by_page: json.notesByPage || {},
+    // Real per-slide object IDs from the Slides API, in presentation order.
+    // Present.tsx needs these to jump the embed to a specific slide - without
+    // them it has to guess "p1"/"p2"/... which silently fails (and just
+    // shows slide 1) on any deck where slides were ever reordered,
+    // duplicated, or inserted, since those slides get non-sequential IDs.
+    slide_ids: json.slideIds || [],
   });
   if (error) return { error: error.message };
   return { fileId, slideCount: json.slideCount };
@@ -112,9 +118,9 @@ export async function resolveVirtualFileId(fileId: string): Promise<any | null> 
   }
   if (fileId.startsWith(GSLIDES_PREFIX)) {
     const presentationId = fileId.slice(GSLIDES_PREFIX.length);
-    const { data, error } = await supabase.from('google_slides_decks').select('slide_count, notes_by_page').eq('presentation_id', presentationId).maybeSingle();
+    const { data, error } = await supabase.from('google_slides_decks').select('slide_count, notes_by_page, slide_ids').eq('presentation_id', presentationId).maybeSingle();
     if (error || !data) return { status: 'error', message: 'This Google Slides import was not found (it may have expired).' };
-    return { status: 'success', fileType: 'google-slides', presentationId, slideCount: data.slide_count, notesByPage: data.notes_by_page || {} };
+    return { status: 'success', fileType: 'google-slides', presentationId, slideCount: data.slide_count, notesByPage: data.notes_by_page || {}, slideIds: data.slide_ids || [] };
   }
   return null;
 }

@@ -1970,12 +1970,14 @@ export default function Present() {
               // the iframe directly on the host machine, not via the
               // phone remote.
               const realSlideId = resolved.slideIds[currentPage - 1];
+              // Safety net: real IDs come from google_slides_decks.slide_ids,
+              // populated at import time via the Slides API. If this deck
+              // was imported before that existed (or the import failed),
+              // this guesses "pN" - which only matches Google's real slide
+              // ID if that slide was never reordered/duplicated/inserted.
+              // Re-import the deck if you see this warning.
+              if (!realSlideId) console.warn(`[gslides-nav] no stored slide id for page ${currentPage} - guessing "p${currentPage}", which may not match this deck's real slide id`);
               const slideIdToUse = realSlideId || `p${currentPage}`;
-              // TEMP DIAGNOSTIC - remove once the navigation bug is confirmed/fixed.
-              // If "usingRealId" logs false, resolved.slideIds is empty/short
-              // and we're guessing "pN", which silently fails to navigate
-              // whenever the deck's actual slide IDs aren't sequential p1/p2/p3.
-              console.warn(`[gslides-nav] currentPage=${currentPage} slideIdToUse=${slideIdToUse} usingRealId=${!!realSlideId} totalKnownIds=${resolved.slideIds.length} allKnownIds=${JSON.stringify(resolved.slideIds)}`);
               return (
                 <iframe
                   key={`gslides-${currentFlatIndex}`}
