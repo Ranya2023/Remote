@@ -169,6 +169,14 @@ export default function MobileRemote() {
   const [timerBigAlert, setTimerBigAlert] = useState<string | null>(null);
   const trackpadRef = useRef<HTMLDivElement>(null);
   const lastSentTime = useRef<number>(0);
+  // Separate, much slower throttle for persisting laser/spotlight position to
+  // the sessions row (see pointer_state below) - the 16ms one above is for
+  // the live broadcast between browser tabs, which is plenty smooth on its
+  // own. This one only exists for consumers that can't subscribe to a live
+  // broadcast channel (e.g. a desktop script polling over plain REST), so
+  // it's throttled far more aggressively - no reason to hammer the DB at
+  // 60fps for something a poll loop will only check a few times a second.
+  const lastPersistedPointerTime = useRef<number>(0);
   const isDrawing = useRef(false);
 
   // Preview state - now generalized to whatever type the active slide is,
@@ -817,6 +825,23 @@ export default function MobileRemote() {
     }
   };
 
+  // Saves laser/spotlight position into sessions.pointer_state, throttled to
+  // ~6/sec - far too slow to feel live if a browser tab were reading it (that
+  // still uses the instant broadcast above), but plenty for a poll-based
+  // consumer. Deliberately its own column rather than folded into
+  // session_state: session_state is a plain column overwrite from
+  // Present.tsx (screenMode/zoom/videoState/pin), and writing into it from
+  // here too would risk one side clobbering the other's fields with a stale
+  // copy - a separate column that only this ever writes to has no such risk.
+  const persistPointerState = (kind: 'laser' | 'spotlight', value: Record<string, unknown>) => {
+    const now = Date.now();
+    if (now - lastPersistedPointerTime.current < 160) return;
+    lastPersistedPointerTime.current = now;
+    supabase.from('sessions').update({ pointer_state: { [kind]: value } }).eq('id', sessionId).then(({ error }) => {
+      if (error) console.warn('pointer_state persist skipped (has supabase_migration_desktop.sql been run yet?):', error.message);
+    });
+  };
+
   const sendPointerData = (e: React.TouchEvent | React.MouseEvent, type: 'start' | 'move' | 'end') => {
     if (!ready || !channelRef.current || activeMode === 'none' || !trackpadRef.current) return;
 
@@ -839,12 +864,14 @@ export default function MobileRemote() {
       const isActive = type !== 'end';
       setMyLaser({ x, y, active: isActive });
       channelRef.current.send({ type: 'broadcast', event: 'laser_move', payload: { x, y, active: isActive } });
+      persistPointerState('laser', { x, y, active: isActive });
     } else if (activeMode === 'spotlight') {
       const now = Date.now();
       if (now - lastSentTime.current < 16 && type === 'move') return;
       lastSentTime.current = now;
       const isActive = type !== 'end';
       channelRef.current.send({ type: 'broadcast', event: 'spotlight_move', payload: { x, y, active: isActive, radius: spotlightRadius } });
+      persistPointerState('spotlight', { x, y, active: isActive, radius: spotlightRadius });
     } else if (activeMode === 'zoom') {
       // Dragging while in zoom mode pans; the +/- buttons (rendered below)
       // handle scale. Kept separate from laser/spotlight since it doesn't
