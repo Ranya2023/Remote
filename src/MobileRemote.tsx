@@ -4,7 +4,7 @@ import { supabase } from './supabaseClient';
 
 pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
 
-const GAS_URL = 'https://script.google.com/macros/s/AKfycbzRtEZeLTAKPwPk-ICcODO_qvpjdN7_EABDi-BMqMcbDCz9pg5zEf_HZs2cR691FAuv/exec';
+const GAS_URL = 'https://script.google.com/macros/s/AKfycbyg305xVtU66xkx9wpiQekiYukNpTrdQVns-u7QZMXe_bmYNBXYX7s--X9HE_tPEiSn/exec';
 
 const texts = {
   ku: {

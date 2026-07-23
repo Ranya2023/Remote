@@ -87,7 +87,7 @@ export default function FileUpload() {
   const { user, profile, usage, refreshUsage } = useAuth();
 
   // Your newest deployment URL
-  const GAS_URL = 'https://script.google.com/macros/s/AKfycbzRtEZeLTAKPwPk-ICcODO_qvpjdN7_EABDi-BMqMcbDCz9pg5zEf_HZs2cR691FAuv/exec';
+  const GAS_URL = 'https://script.google.com/macros/s/AKfycbyg305xVtU66xkx9wpiQekiYukNpTrdQVns-u7QZMXe_bmYNBXYX7s--X9HE_tPEiSn/exec';
 
   const updateSlide = (localId: string, patch: Partial<SlideItem>) => {
     setSlides((prev) => prev.map((s) => (s.localId === localId ? { ...s, ...patch } : s)));

@@ -14,7 +14,7 @@ interface Point { x: number; y: number; }
 type Line = Point[];
 type CanvasDataMap = Record<number, Line[]>;
 
-const GAS_URL = 'https://script.google.com/macros/s/AKfycbzRtEZeLTAKPwPk-ICcODO_qvpjdN7_EABDi-BMqMcbDCz9pg5zEf_HZs2cR691FAuv/exec';
+const GAS_URL = 'https://script.google.com/macros/s/AKfycbyg305xVtU66xkx9wpiQekiYukNpTrdQVns-u7QZMXe_bmYNBXYX7s--X9HE_tPEiSn/exec';
 
 export default function PresentationView() {
   const currentUrl = window.location.href;
