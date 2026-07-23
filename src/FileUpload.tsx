@@ -82,7 +82,7 @@ export default function FileUpload() {
   const { user, profile, usage, refreshUsage } = useAuth();
 
   // Your newest deployment URL
-  const GAS_URL = 'https://script.google.com/macros/s/AKfycbx48s5aNamkERYuvJ-BE7-RBF2zt15mFZ-C-SXL_UIGZkG46RdyuPYIOlO6o0HZcr3N/exec';
+  const GAS_URL = 'https://script.google.com/macros/s/AKfycbzRtEZeLTAKPwPk-ICcODO_qvpjdN7_EABDi-BMqMcbDCz9pg5zEf_HZs2cR691FAuv/exec';
 
   const updateSlide = (localId: string, patch: Partial<SlideItem>) => {
     setSlides((prev) => prev.map((s) => (s.localId === localId ? { ...s, ...patch } : s)));
@@ -137,17 +137,23 @@ export default function FileUpload() {
             if (metaPromise && result.fileId) {
               metaPromise
                 .then((meta) => {
-                  if (!Object.keys(meta.notesByPage).length && !Object.keys(meta.transitionsByPage).length) return;
+                  const hasAnything =
+                    Object.keys(meta.notesByPage).length ||
+                    Object.keys(meta.transitionsByPage).length ||
+                    Object.keys(meta.renderDataByPage).length;
+                  if (!hasAnything) return;
                   return supabase.from('pptx_meta').upsert({
                     file_id: result.fileId,
                     notes: meta.notesByPage,
                     transitions: meta.transitionsByPage,
+                    render_data: meta.renderDataByPage,
                   });
                 })
                 .catch((err) => {
-                  // Notes/transitions are a nice-to-have layered on top of a
-                  // working upload - never surface this as an upload error.
-                  console.warn('⚠️ Could not save PPTX notes/transitions (does the pptx_meta table exist yet?):', err);
+                  // Notes/transitions/render data are a nice-to-have layered
+                  // on top of a working upload - never surface this as an
+                  // upload error.
+                  console.warn('⚠️ Could not save PPTX metadata (has supabase_migration_render.sql been run yet?):', err);
                 });
             }
           } else {

@@ -1,27 +1,31 @@
-// --- Client-side PPTX metadata extraction ----------------------------------
+// --- Client-side PPTX metadata + render-data extraction ---------------------
 //
 // PPTX is just a ZIP of XML parts. This runs once, in the browser, right at
 // upload time (see FileUpload.tsx), completely independent of the existing
 // Code.gs pipeline that converts the file to a PDF for on-screen rendering.
-// It never touches how slides are displayed - it only pulls out two things
-// Code.gs doesn't give us today:
+// Three things get pulled out here, all keyed by slide position (1-based,
+// matching the PDF page numbers Code.gs produces), all best-effort - if
+// anything about a given slide can't be parsed, that slide just falls back
+// to something reasonable (no notes / a plain cut / the existing PDF page
+// image) instead of blowing up the upload or the presentation:
 //
 //   1. Speaker notes per slide (ppt/notesSlides/notesSlideN.xml)
-//   2. The slide's <p:transition> effect + duration, for a CSS-based replay
-//      on "next slide" that approximates what PowerPoint itself would show
+//   2. The slide's <p:transition> effect + duration, for the whole-slide
+//      transition when the presenter advances
+//   3. Render data: each slide's shapes/text/images with percentage-based
+//      layout, plus which paragraphs/shapes are set to build in one at a
+//      time on click - this is what <SlideRenderer/> actually draws,
+//      instead of the flattened PDF page image.
 //
-// Both are keyed by slide position (1-based, matching the PDF page numbers
-// Code.gs produces), and both are best-effort: if anything about a given
-// slide can't be parsed, that slide just ends up with no notes / no
-// transition (falls back to a plain cut) instead of blowing up the upload.
-//
-// NOTE ON SCOPE: this deliberately does NOT attempt full per-object,
-// per-build animation playback (individual bullet reveals, motion paths,
-// Morph, SmartArt) - that would mean replacing the PDF-page rendering
-// pipeline with a from-scratch DrawingML-to-HTML/SVG renderer, which is a
-// much larger project on its own and out of scope for this pass. What's
-// here is real: actual transition type/duration read straight out of the
-// file, applied as a real CSS transition when the presenter advances.
+// SCOPE: this is a *standard, best-effort* renderer, not a pixel-perfect
+// PowerPoint clone. Motion paths, Morph, SmartArt, charts, embedded video,
+// and grouped shapes are not modeled - they're simply left out of a slide's
+// shapes rather than mis-rendered. Every bullet build plays the same
+// standard reveal (fade + small rise) regardless of the file's actual
+// animation effect, and every transition type this file doesn't explicitly
+// recognize falls back to a plain fade. That's a deliberate trade: real
+// PowerPoint animation semantics are a huge surface area, and "close and
+// consistent" beats "occasionally exact, frequently broken."
 
 import JSZip from 'jszip';
 
@@ -31,9 +35,42 @@ export interface SlideTransition {
   durationMs: number;
   direction?: 'l' | 'r' | 'u' | 'd'; // only meaningful for 'slide'
 }
+
+// --- Render data -------------------------------------------------------
+export interface SlideRun {
+  text: string;
+  bold?: boolean;
+  italic?: boolean;
+  color?: string;     // '#rrggbb'
+  sizeCqw?: number;    // font size, pre-converted to "% of slide width" - apply directly as `${sizeCqw}cqw`
+}
+export interface SlideParagraph {
+  runs: SlideRun[];
+  bulletLevel: number;   // 0-based indent level
+  buildOrder?: number;   // undefined = visible from the start; N = revealed on the Nth "Next"
+}
+export interface SlideShape {
+  id: string;
+  kind: 'text' | 'image' | 'rect';
+  xPct: number; yPct: number; wPct: number; hPct: number; // % of slide width/height
+  z: number;
+  paragraphs?: SlideParagraph[];
+  imageDataUrl?: string;
+  fill?: string;          // '#rrggbb', rect/text-box background
+  buildOrder?: number;    // whole-shape build (images/rects, or text shapes with no per-paragraph timing found)
+}
+export interface SlideRenderData {
+  aspectRatio: number;    // slide width / height
+  background?: string;    // '#rrggbb'
+  shapes: SlideShape[];
+  transition: SlideTransition;
+  buildCount: number;     // highest buildOrder + 1 found anywhere on the slide; 0 = nothing builds
+}
+
 export interface PptxMeta {
   notesByPage: Record<number, string>;
   transitionsByPage: Record<number, SlideTransition>;
+  renderDataByPage: Record<number, SlideRenderData>;
   slideCount: number;
 }
 
@@ -52,6 +89,9 @@ function firstEl(doc: Document | Element, tag: string): Element | null {
 }
 function allEls(doc: Document | Element, tag: string): Element[] {
   return Array.from(doc.getElementsByTagName(tag));
+}
+function localName(tag: string): string {
+  return tag.includes(':') ? tag.split(':')[1] : tag;
 }
 
 // Resolves "../slides/slide3.xml" (relative to ppt/_rels/) etc. into a
@@ -76,20 +116,32 @@ async function readXml(zip: JSZip, path: string): Promise<Document | null> {
   return parseXml(text);
 }
 
+function relsPathFor(partPath: string): string {
+  const dir = partPath.split('/').slice(0, -1).join('/');
+  const file = partPath.split('/').pop()!;
+  return `${dir}/_rels/${file}.rels`;
+}
+
+async function loadRelMap(zip: JSZip, partPath: string): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  const relsPath = relsPathFor(partPath);
+  const relsDoc = await readXml(zip, relsPath);
+  if (!relsDoc) return map;
+  for (const rel of allEls(relsDoc, 'Relationship')) {
+    const id = rel.getAttribute('Id');
+    const target = rel.getAttribute('Target');
+    if (id && target) map.set(id, resolveRelPath(relsPath, target));
+  }
+  return map;
+}
+
 // The ordered list of slideN.xml paths, in actual presentation order (NOT
 // necessarily numeric filename order - PowerPoint doesn't guarantee those
 // match, especially after slides have been reordered/duplicated).
 async function getOrderedSlidePaths(zip: JSZip): Promise<string[]> {
   const presDoc = await readXml(zip, 'ppt/presentation.xml');
-  const relsDoc = await readXml(zip, 'ppt/_rels/presentation.xml.rels');
-  if (!presDoc || !relsDoc) return [];
-
-  const relIdToTarget = new Map<string, string>();
-  for (const rel of allEls(relsDoc, 'Relationship')) {
-    const id = rel.getAttribute('Id');
-    const target = rel.getAttribute('Target');
-    if (id && target) relIdToTarget.set(id, resolveRelPath('ppt/_rels/presentation.xml.rels', target));
-  }
+  if (!presDoc) return [];
+  const relIdToTarget = await loadRelMap(zip, 'ppt/presentation.xml');
 
   const sldIdLst = firstEl(presDoc, 'p:sldIdLst');
   if (!sldIdLst) return [];
@@ -105,21 +157,33 @@ async function getOrderedSlidePaths(zip: JSZip): Promise<string[]> {
   return paths;
 }
 
+// EMU (English Metric Units, the unit every OOXML offset/extent is in) ->
+// points, for font sizes: 1pt = 12700 EMU.
+function emuToPt(emu: number): number {
+  return emu / 12700;
+}
+
+async function getSlideSizeEmu(zip: JSZip): Promise<{ cx: number; cy: number }> {
+  const presDoc = await readXml(zip, 'ppt/presentation.xml');
+  const sldSz = presDoc && firstEl(presDoc, 'p:sldSz');
+  const cx = Number(sldSz?.getAttribute('cx')) || 9144000; // 10in @ 914400 EMU/in - the common 4:3 default
+  const cy = Number(sldSz?.getAttribute('cy')) || 6858000;
+  return { cx, cy };
+}
+
 // --- Speaker notes -----------------------------------------------------
 async function extractNotesForSlide(zip: JSZip, slidePath: string): Promise<string | undefined> {
   try {
-    const slideDir = slidePath.split('/').slice(0, -1).join('/');
-    const slideFile = slidePath.split('/').pop()!;
-    const relsPath = `${slideDir}/_rels/${slideFile}.rels`;
-    const relsDoc = await readXml(zip, relsPath);
+    const relMap = await loadRelMap(zip, slidePath);
+    const relsDoc = await readXml(zip, relsPathFor(slidePath));
     if (!relsDoc) return undefined;
 
     let notesPath: string | null = null;
     for (const rel of allEls(relsDoc, 'Relationship')) {
       const type = rel.getAttribute('Type') || '';
       if (type.endsWith('/notesSlide')) {
-        const target = rel.getAttribute('Target');
-        if (target) notesPath = resolveRelPath(relsPath, target);
+        const id = rel.getAttribute('Id');
+        if (id) notesPath = relMap.get(id) || null;
         break;
       }
     }
@@ -168,7 +232,7 @@ async function extractNotesForSlide(zip: JSZip, slidePath: string): Promise<stri
 // Effect tag -> our simplified kind. Anything not listed here (Morph,
 // SmartArt-driven effects, the newer p159:* "gallery" transitions, honeycomb,
 // ripple, etc.) falls through to the 'fade' fallback below, per the graceful-
-// degradation requirement - never 'skip or break the presentation'.
+// degradation requirement - never skip or break the presentation.
 const SLIDE_LIKE = new Set(['push', 'cover', 'pull', 'comb']);
 const FADE_LIKE = new Set(['fade']);
 const CUT_LIKE = new Set(['cut']);
@@ -187,8 +251,7 @@ function parseTransitionEl(transEl: Element): SlideTransition {
   // dir="l"/>, <p:cut/>, <p:wipe .../>, etc. Just look at the first
   // element child's local tag name.
   const child = Array.from(transEl.children).find((c) => !c.tagName.includes(':timing'));
-  const rawTag = child?.tagName || '';
-  const local = rawTag.includes(':') ? rawTag.split(':')[1] : rawTag;
+  const local = localName(child?.tagName || '');
 
   if (FADE_LIKE.has(local)) return { kind: 'fade', durationMs };
   if (CUT_LIKE.has(local)) return { kind: 'cut', durationMs: 0 };
@@ -214,31 +277,271 @@ async function extractTransitionForSlide(zip: JSZip, slidePath: string): Promise
   }
 }
 
+// --- Build (click-to-reveal) order ---------------------------------------
+// Real PowerPoint animation timing is a deeply nested, general tree (par/seq/
+// set/animEffect nodes, "with previous" / "after previous" timing, exit and
+// emphasis effects mixed in with entrances...). Modeling all of that isn't
+// this file's job. What real-world "appear on click, one bullet at a time"
+// decks actually need is much narrower: find every entrance effect
+// (marked by the standard presetClass="entr" attribute PowerPoint itself
+// writes), in the order they appear in the file - that order IS the click
+// order for the overwhelming majority of decks. Each one targets either a
+// whole shape (<p:spTgt spid="X"/>) or a specific paragraph range within a
+// shape's text (<p:spTgt spid="X"><p:txEl><p:pRg st="N" end="N"/>...).
+//
+// Returns a map: shapeId -> (paragraphIndex | 'whole-shape') -> build order.
+interface BuildTarget { shapeId: string; paragraph: number | null; order: number; }
+function extractBuildOrder(slideDoc: Document): BuildTarget[] {
+  const timing = firstEl(slideDoc, 'p:timing');
+  if (!timing) return [];
+
+  const targets: BuildTarget[] = [];
+  const seen = new Set<string>(); // dedupe (spid, paragraph) - only first occurrence (the entrance) counts
+  let order = 0;
+
+  // Every <p:cTn presetClass="entr" ...> node is one entrance effect. Walk
+  // them in document order (their natural order in allEls already is).
+  for (const cTn of allEls(timing, 'p:cTn')) {
+    if (cTn.getAttribute('presetClass') !== 'entr') continue;
+    for (const spTgt of allEls(cTn, 'p:spTgt')) {
+      const shapeId = spTgt.getAttribute('spid');
+      if (!shapeId) continue;
+      const pRg = firstEl(spTgt, 'p:pRg');
+      const paragraph = pRg && pRg.getAttribute('st') != null ? Number(pRg.getAttribute('st')) : null;
+      const key = `${shapeId}:${paragraph ?? 'whole'}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      targets.push({ shapeId, paragraph, order });
+    }
+    order += 1;
+  }
+  return targets;
+}
+
+// --- Color helpers ---------------------------------------------------------
+// Only srgbClr is resolved exactly. schemeClr (theme colors) would need
+// theme1.xml parsed too - out of scope for this pass, so it gets a fixed,
+// reasonable approximation instead of being dropped silently.
+const SCHEME_FALLBACK: Record<string, string> = {
+  dk1: '#1a1a1a', tx1: '#1a1a1a', dk2: '#44546a', tx2: '#44546a',
+  lt1: '#ffffff', bg1: '#ffffff', lt2: '#e7e6e6', bg2: '#e7e6e6',
+  accent1: '#4472c4', accent2: '#ed7d31', accent3: '#a5a5a5',
+  accent4: '#ffc000', accent5: '#5b9bd5', accent6: '#70ad47',
+  hlink: '#0563c1', folHlink: '#954f72',
+};
+function extractColor(container: Element | null): string | undefined {
+  if (!container) return undefined;
+  const fill = firstEl(container, 'a:solidFill');
+  if (!fill) return undefined;
+  const srgb = firstEl(fill, 'a:srgbClr');
+  if (srgb) {
+    const val = srgb.getAttribute('val');
+    return val ? `#${val}` : undefined;
+  }
+  const scheme = firstEl(fill, 'a:schemeClr');
+  const val = scheme?.getAttribute('val');
+  return val ? SCHEME_FALLBACK[val] : undefined;
+}
+
+// --- Shapes ----------------------------------------------------------------
+// Common placeholder layout fallbacks, used only when a shape has a <p:ph>
+// but no explicit <a:xfrm> of its own (very common for title/body text -
+// they usually inherit position from the slide layout, which this file
+// doesn't parse). Percentages are generous, standard title/content zones.
+const PLACEHOLDER_DEFAULTS: Record<string, { xPct: number; yPct: number; wPct: number; hPct: number }> = {
+  title: { xPct: 6, yPct: 6, wPct: 88, hPct: 18 },
+  ctrTitle: { xPct: 10, yPct: 32, wPct: 80, hPct: 24 },
+  subTitle: { xPct: 10, yPct: 58, wPct: 80, hPct: 16 },
+  body: { xPct: 6, yPct: 26, wPct: 88, hPct: 66 },
+};
+
+function xfrmPct(spPr: Element | null, slideCx: number, slideCy: number): { xPct: number; yPct: number; wPct: number; hPct: number } | null {
+  const xfrm = spPr && firstEl(spPr, 'a:xfrm');
+  const off = xfrm && firstEl(xfrm, 'a:off');
+  const ext = xfrm && firstEl(xfrm, 'a:ext');
+  if (!off || !ext) return null;
+  const x = Number(off.getAttribute('x')) || 0;
+  const y = Number(off.getAttribute('y')) || 0;
+  const cx = Number(ext.getAttribute('cx')) || 0;
+  const cy = Number(ext.getAttribute('cy')) || 0;
+  return { xPct: (x / slideCx) * 100, yPct: (y / slideCy) * 100, wPct: (cx / slideCx) * 100, hPct: (cy / slideCy) * 100 };
+}
+
+function extractParagraphs(txBody: Element, slideWidthPt: number, buildFor: (paragraphIndex: number) => number | undefined): SlideParagraph[] {
+  const paragraphs = allEls(txBody, 'a:p');
+  const mapped: (SlideParagraph | null)[] = paragraphs.map((p, idx) => {
+    const pPr = firstEl(p, 'a:pPr');
+    const bulletLevel = pPr?.getAttribute('lvl') ? Number(pPr.getAttribute('lvl')) : 0;
+    const runs: SlideRun[] = allEls(p, 'a:r').map((r) => {
+      const rPr = firstEl(r, 'a:rPr');
+      const text = firstEl(r, 'a:t')?.textContent || '';
+      const sizeAttr = rPr?.getAttribute('sz'); // centipoints, e.g. "1800" = 18pt
+      const sizePt = sizeAttr ? Number(sizeAttr) / 100 : undefined;
+      return {
+        text,
+        bold: rPr?.getAttribute('b') === '1',
+        italic: rPr?.getAttribute('i') === '1',
+        color: extractColor(rPr),
+        sizeCqw: sizePt ? (sizePt / slideWidthPt) * 100 : undefined,
+      };
+    });
+    if (!runs.length) return null;
+    const paragraph: SlideParagraph = { runs, bulletLevel, buildOrder: buildFor(idx) };
+    return paragraph;
+  });
+  return mapped.filter((p): p is SlideParagraph => p !== null && p.runs.some((r) => r.text.trim().length > 0));
+}
+
+function guessImageMime(path: string): string {
+  const ext = path.split('.').pop()?.toLowerCase() || '';
+  if (ext === 'jpg' || ext === 'jpeg') return 'image/jpeg';
+  if (ext === 'gif') return 'image/gif';
+  if (ext === 'svg') return 'image/svg+xml';
+  if (ext === 'bmp') return 'image/bmp';
+  return 'image/png';
+}
+
+async function extractShapesForSlide(
+  zip: JSZip,
+  slideDoc: Document,
+  slidePath: string,
+  slideCx: number,
+  slideCy: number
+): Promise<SlideShape[]> {
+  const slideWidthPt = emuToPt(slideCx);
+  const buildTargets = extractBuildOrder(slideDoc);
+  const buildForShape = (shapeId: string): number | undefined =>
+    buildTargets.find((t) => t.shapeId === shapeId && t.paragraph === null)?.order;
+  const buildForParagraph = (shapeId: string, paragraphIndex: number): number | undefined =>
+    buildTargets.find((t) => t.shapeId === shapeId && t.paragraph === paragraphIndex)?.order;
+
+  const relMap = await loadRelMap(zip, slidePath);
+  const spTree = firstEl(slideDoc, 'p:spTree');
+  if (!spTree) return [];
+
+  const shapes: SlideShape[] = [];
+  let z = 0;
+
+  // Only direct children of spTree - deliberately not recursing into
+  // <p:grpSp> (grouped shapes). Group child coordinates live in the
+  // group's own local coordinate space and need a separate transform to
+  // resolve correctly; skipping groups is safer than mis-placing their
+  // contents, and matches the "leave it out rather than render it wrong"
+  // philosophy used throughout this file.
+  for (const child of Array.from(spTree.children)) {
+    const tag = localName(child.tagName);
+    z += 1;
+
+    if (tag === 'sp') {
+      const spPr = firstEl(child, 'p:spPr');
+      const ph = firstEl(child, 'p:ph');
+      const phType = ph?.getAttribute('type') || (ph ? 'body' : undefined);
+      const shapeId = firstEl(child, 'p:cNvPr')?.getAttribute('id') || `shape-${z}`;
+
+      let rect = xfrmPct(spPr, slideCx, slideCy);
+      if (!rect && phType) rect = PLACEHOLDER_DEFAULTS[phType] || PLACEHOLDER_DEFAULTS.body;
+      if (!rect) continue; // no position we can determine even approximately - skip rather than guess at 0,0
+
+      const txBody = firstEl(child, 'p:txBody');
+      const paragraphs = txBody
+        ? extractParagraphs(txBody, slideWidthPt, (i) => buildForParagraph(shapeId, i))
+        : undefined;
+      const wholeShapeBuild = buildForShape(shapeId);
+      const fill = extractColor(spPr);
+
+      if (paragraphs && paragraphs.length) {
+        shapes.push({ id: shapeId, kind: 'text', ...rect, z, paragraphs, fill, buildOrder: wholeShapeBuild });
+      } else if (fill) {
+        // Text-less shape with an actual fill - render as a plain rect
+        // (covers simple decorative boxes/lines). Shapes with neither
+        // text nor a resolvable fill add nothing visible, so they're
+        // skipped rather than drawn as an invisible placeholder.
+        shapes.push({ id: shapeId, kind: 'rect', ...rect, z, fill, buildOrder: wholeShapeBuild });
+      }
+    } else if (tag === 'pic') {
+      const spPr = firstEl(child, 'p:spPr');
+      const rect = xfrmPct(spPr, slideCx, slideCy);
+      if (!rect) continue;
+      const shapeId = firstEl(child, 'p:cNvPr')?.getAttribute('id') || `shape-${z}`;
+      const blip = firstEl(child, 'a:blip');
+      const embedId = blip?.getAttribute('r:embed');
+      const imagePath = embedId ? relMap.get(embedId) : undefined;
+      if (!imagePath) continue;
+      try {
+        const entry = zip.file(imagePath);
+        if (!entry) continue;
+        const base64 = await entry.async('base64');
+        const imageDataUrl = `data:${guessImageMime(imagePath)};base64,${base64}`;
+        shapes.push({ id: shapeId, kind: 'image', ...rect, z, imageDataUrl, buildOrder: buildForShape(shapeId) });
+      } catch {
+        continue; // one bad image reference shouldn't drop the rest of the slide
+      }
+    }
+    // graphicFrame (tables/charts/SmartArt) and grpSp (groups) are
+    // deliberately not handled - see the file-level scope note up top.
+  }
+
+  return shapes;
+}
+
+async function extractBackgroundForSlide(slideDoc: Document): Promise<string | undefined> {
+  const cSld = firstEl(slideDoc, 'p:cSld');
+  const bg = cSld && firstEl(cSld, 'p:bg');
+  const bgPr = bg && firstEl(bg, 'p:bgPr');
+  return extractColor(bgPr);
+}
+
+async function extractRenderDataForSlide(zip: JSZip, slidePath: string, slideCx: number, slideCy: number): Promise<SlideRenderData | undefined> {
+  try {
+    const slideDoc = await readXml(zip, slidePath);
+    if (!slideDoc) return undefined;
+    const shapes = await extractShapesForSlide(zip, slideDoc, slidePath, slideCx, slideCy);
+    if (!shapes.length) return undefined; // nothing we could parse - caller falls back to the PDF page image
+
+    const background = await extractBackgroundForSlide(slideDoc);
+    const transEl = firstEl(slideDoc, 'p:transition');
+    const transition = transEl ? parseTransitionEl(transEl) : { kind: 'cut' as const, durationMs: 0 };
+    const buildCount = shapes.reduce((max, s) => {
+      let shapeMax = s.buildOrder ?? -1;
+      s.paragraphs?.forEach((p) => { if (p.buildOrder != null) shapeMax = Math.max(shapeMax, p.buildOrder); });
+      return Math.max(max, shapeMax + 1);
+    }, 0);
+
+    return { aspectRatio: slideCx / slideCy, background, shapes, transition, buildCount };
+  } catch {
+    return undefined;
+  }
+}
+
 // --- Entry point -----------------------------------------------------------
 // Runs the whole extraction pass once per upload. Never throws - always
 // resolves to *something* usable (possibly empty maps), so a parsing
 // hiccup never blocks the actual upload/conversion flow in FileUpload.tsx.
 export async function extractPptxMeta(file: File): Promise<PptxMeta> {
-  const empty: PptxMeta = { notesByPage: {}, transitionsByPage: {}, slideCount: 0 };
+  const empty: PptxMeta = { notesByPage: {}, transitionsByPage: {}, renderDataByPage: {}, slideCount: 0 };
   try {
     const zip = await JSZip.loadAsync(file);
     const slidePaths = await getOrderedSlidePaths(zip);
     if (!slidePaths.length) return empty;
 
+    const { cx, cy } = await getSlideSizeEmu(zip);
     const notesByPage: Record<number, string> = {};
     const transitionsByPage: Record<number, SlideTransition> = {};
+    const renderDataByPage: Record<number, SlideRenderData> = {};
 
     for (let i = 0; i < slidePaths.length; i++) {
       const page = i + 1;
-      const [notes, transition] = await Promise.all([
+      const [notes, transition, renderData] = await Promise.all([
         extractNotesForSlide(zip, slidePaths[i]),
         extractTransitionForSlide(zip, slidePaths[i]),
+        extractRenderDataForSlide(zip, slidePaths[i], cx, cy),
       ]);
       if (notes) notesByPage[page] = notes;
       if (transition) transitionsByPage[page] = transition;
+      if (renderData) renderDataByPage[page] = renderData;
     }
 
-    return { notesByPage, transitionsByPage, slideCount: slidePaths.length };
+    return { notesByPage, transitionsByPage, renderDataByPage, slideCount: slidePaths.length };
   } catch (err) {
     console.warn('⚠️ PPTX metadata extraction skipped:', err);
     return empty;

@@ -4,7 +4,7 @@ import { supabase } from './supabaseClient';
 
 pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
 
-const GAS_URL = 'https://script.google.com/macros/s/AKfycbx48s5aNamkERYuvJ-BE7-RBF2zt15mFZ-C-SXL_UIGZkG46RdyuPYIOlO6o0HZcr3N/exec';
+const GAS_URL = 'https://script.google.com/macros/s/AKfycbzRtEZeLTAKPwPk-ICcODO_qvpjdN7_EABDi-BMqMcbDCz9pg5zEf_HZs2cR691FAuv/exec';
 
 const texts = {
   ku: {
@@ -51,6 +51,7 @@ interface FlatSlide {
   name?: string;
   notes?: string;
   thumbnail?: string;
+  buildCount?: number;
 }
 
 type ScreenMode = 'normal' | 'black' | 'white';
@@ -119,6 +120,7 @@ const DEFAULT_AUDIENCE_STATE: AudienceState = { joinCount: 0, quiz: DEFAULT_QUIZ
 export default function MobileRemote() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [currentSlide, setCurrentSlide] = useState(1);
+  const [currentBuild, setCurrentBuild] = useState(0);
   const [flatSlides, setFlatSlides] = useState<FlatSlide[]>([]);
 
   const [ready, setReady] = useState(false);
@@ -270,6 +272,7 @@ export default function MobileRemote() {
   // Keeps a reliable "current slide" value for use inside refs/effects
   // that shouldn't go stale (canvas resize callbacks, etc).
   const currentSlideRef = useRef(1);
+  const currentBuildRef = useRef(0);
 
   // Local drawing overlay — same idea as the one in Present.tsx, so strokes
   // you draw show up on your own phone screen too, not just the projector.
@@ -282,6 +285,9 @@ export default function MobileRemote() {
   const lastStrokePxRef = useRef<{ x: number; y: number } | null>(null);
 
   const activeFlat = flatSlides[currentSlide - 1];
+  // How many builds (bullet/shape reveals) the current slide has, so
+  // Next/Prev below know whether to step a build or move to a new slide.
+  const currentBuildCount = activeFlat?.buildCount || 0;
 
   // Replays every stroke for a slide in order, each with its own
   // color/width/mode. Erase strokes use destination-out compositing, so
@@ -330,7 +336,7 @@ export default function MobileRemote() {
     const fetchCurrentSessionState = async () => {
       const { data, error } = await supabase
         .from('sessions')
-        .select('current_slide, file_id, slide_map')
+        .select('current_slide, current_build, file_id, slide_map')
         .eq('id', session)
         .maybeSingle();
       if (error) console.error('🚨 DB Fetch Error:', error.message);
@@ -339,6 +345,8 @@ export default function MobileRemote() {
           setCurrentSlide(data.current_slide);
           currentSlideRef.current = data.current_slide;
         }
+        setCurrentBuild(data.current_build || 0);
+        currentBuildRef.current = data.current_build || 0;
         if (data.file_id) setFileId(data.file_id);
         if (Array.isArray(data.slide_map)) setFlatSlides(data.slide_map);
       } else if (!cancelled) {
@@ -404,6 +412,9 @@ export default function MobileRemote() {
         if (typeof n !== 'number') return;
         setCurrentSlide(n);
         currentSlideRef.current = n;
+        const build = payload.payload?.build;
+        setCurrentBuild(typeof build === 'number' ? build : 0);
+        currentBuildRef.current = typeof build === 'number' ? build : 0;
         redrawCanvasForSlide(n, allDrawingsRef.current);
 
         // The presenter may have moved to a different lesson item entirely,
@@ -773,15 +784,37 @@ export default function MobileRemote() {
   // Jumps straight to any global slide number - this now actually works
   // across item boundaries (a PDF's pages, then a link, then images, ...)
   // instead of only paging through whatever item happened to be on screen.
-  const updateSlide = async (newSlideNumber: number) => {
+  // newBuildIndex defaults to 0 (land on the slide's base state) - correct
+  // for thumbnail taps / First / Last, which are always deliberate jumps to
+  // a specific slide, not a step through its builds. advance() below is
+  // the one place that ever passes something other than 0.
+  const updateSlide = async (newSlideNumber: number, newBuildIndex: number = 0) => {
     if (!ready || !channelRef.current || !flatSlides.length) return;
     if (newSlideNumber < 1 || newSlideNumber > flatSlides.length) return;
     setCurrentSlide(newSlideNumber);
     currentSlideRef.current = newSlideNumber;
+    setCurrentBuild(newBuildIndex);
+    currentBuildRef.current = newBuildIndex;
     redrawCanvasForSlide(newSlideNumber, allDrawingsRef.current);
 
-    await channelRef.current.send({ type: 'broadcast', event: 'slide_change', payload: { slide: newSlideNumber } });
-    await supabase.from('sessions').update({ current_slide: newSlideNumber }).eq('id', sessionId);
+    await channelRef.current.send({ type: 'broadcast', event: 'slide_change', payload: { slide: newSlideNumber, build: newBuildIndex } });
+    await supabase.from('sessions').update({ current_slide: newSlideNumber, current_build: newBuildIndex }).eq('id', sessionId);
+  };
+
+  // What Prev/Next actually do: reveal the next/previous bullet or shape on
+  // the current slide if there's one left to reveal, otherwise move to the
+  // next/previous slide. Stepping backward off a slide lands on the
+  // *fully built* previous slide (not its blank start), matching how
+  // PowerPoint's own Prev behaves.
+  const advance = (direction: 1 | -1) => {
+    if (direction === 1) {
+      if (currentBuild < currentBuildCount) { updateSlide(currentSlide, currentBuild + 1); return; }
+      updateSlide(currentSlide + 1, 0);
+    } else {
+      if (currentBuild > 0) { updateSlide(currentSlide, currentBuild - 1); return; }
+      const prevBuildCount = flatSlides[currentSlide - 2]?.buildCount || 0;
+      updateSlide(currentSlide - 1, prevBuildCount);
+    }
   };
 
   const sendPointerData = (e: React.TouchEvent | React.MouseEvent, type: 'start' | 'move' | 'end') => {
@@ -1182,9 +1215,21 @@ export default function MobileRemote() {
         </button>
       </div>
 
+      {currentBuildCount > 0 && (
+        <div className="px-4 pt-2 flex items-center justify-center gap-1.5">
+          {Array.from({ length: currentBuildCount + 1 }).map((_, i) => (
+            <span
+              key={i}
+              className={`w-2 h-2 rounded-full transition-colors ${i <= currentBuild ? 'bg-blue-500' : 'bg-gray-700'}`}
+            />
+          ))}
+          <span className="text-[10px] text-gray-500 ml-1.5 font-mono">{currentBuild + 1}/{currentBuildCount + 1}</span>
+        </div>
+      )}
+
       <div className="p-4 grid grid-cols-2 gap-4">
-        <button disabled={!ready} onClick={() => updateSlide(currentSlide - 1)} className={`h-20 rounded-xl bg-gray-800 text-white text-xl font-bold ${!ready ? 'opacity-50' : 'active:bg-gray-700'}`}>{t.prev}</button>
-        <button disabled={!ready} onClick={() => updateSlide(currentSlide + 1)} className={`h-20 rounded-xl bg-blue-600 text-white text-xl font-bold shadow-lg ${!ready ? 'opacity-50' : 'active:bg-blue-700'}`}>{t.next}</button>
+        <button disabled={!ready} onClick={() => advance(-1)} className={`h-20 rounded-xl bg-gray-800 text-white text-xl font-bold ${!ready ? 'opacity-50' : 'active:bg-gray-700'}`}>{t.prev}</button>
+        <button disabled={!ready} onClick={() => advance(1)} className={`h-20 rounded-xl bg-blue-600 text-white text-xl font-bold shadow-lg ${!ready ? 'opacity-50' : 'active:bg-blue-700'}`}>{t.next}</button>
       </div>
 
       {/* Presenter notes - only shown when the active slide actually has
@@ -1230,19 +1275,19 @@ export default function MobileRemote() {
             <button onClick={() => sendVideoControl('seek', Math.max(0, videoTime.time - 10))} className="px-3 py-2 rounded-lg bg-gray-800 text-sm">-10s</button>
             <button onClick={() => sendVideoControl('seek', videoTime.time + 10)} className="px-3 py-2 rounded-lg bg-gray-800 text-sm">+10s</button>
           </div>
-          {videoTime.duration > 0 ? (
-            <div className="flex items-center gap-2">
-              <span className="text-[10px] text-gray-500 font-mono w-9 text-right shrink-0">{formatTime(videoTime.time)}</span>
-              <input
-                type="range" min={0} max={videoTime.duration} value={videoTime.time}
-                onChange={(e) => sendVideoControl('seek', Number(e.target.value))}
-                className="w-full"
-              />
-              <span className="text-[10px] text-gray-500 font-mono w-9 shrink-0">{formatTime(videoTime.duration)}</span>
-            </div>
-          ) : (
-            <p className="text-[10px] text-gray-500 italic">{t.videoLoading}</p>
+          {videoTime.duration === 0 && (
+            <p className="text-[10px] text-gray-500 italic -mb-1">{t.videoLoading}</p>
           )}
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] text-gray-500 font-mono w-9 text-right shrink-0">{formatTime(videoTime.time)}</span>
+            <input
+              type="range" min={0} max={Math.max(videoTime.duration, 1)} value={Math.min(videoTime.time, Math.max(videoTime.duration, 1))}
+              disabled={videoTime.duration === 0}
+              onChange={(e) => sendVideoControl('seek', Number(e.target.value))}
+              className="w-full disabled:opacity-40"
+            />
+            <span className="text-[10px] text-gray-500 font-mono w-9 shrink-0">{formatTime(videoTime.duration)}</span>
+          </div>
           <div className="flex items-center gap-2">
             <span className="text-xs text-gray-400">🔊</span>
             <input

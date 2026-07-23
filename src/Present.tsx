@@ -5,19 +5,24 @@ import { Document, Page, pdfjs } from 'react-pdf';
 import { supabase } from './supabaseClient';
 import { QuizReportCard, exportReportPDF, exportReportPNG, type QuizReportData } from './quizReport';
 import { recordSavedItem } from './Account';
-import type { SlideTransition } from './pptxParse';
+import type { SlideTransition, SlideRenderData } from './pptxParse';
+import SlideRenderer from './SlideRenderer';
 
 // Best-effort lookup of whatever extractPptxMeta (see FileUpload.tsx) saved
 // for a given uploaded file - speaker notes and transition info, keyed by
 // slide/page number. Returns empty maps (never throws) if the table
 // doesn't exist yet, the file wasn't a pptx, or nothing was ever saved for
 // it - none of that should ever block a slide from loading.
-async function fetchPptxMeta(fileId: string): Promise<{ notesByPage: Record<number, string>; transitionsByPage: Record<number, SlideTransition> }> {
-  const empty = { notesByPage: {}, transitionsByPage: {} };
+async function fetchPptxMeta(fileId: string): Promise<{ notesByPage: Record<number, string>; transitionsByPage: Record<number, SlideTransition>; renderDataByPage: Record<number, SlideRenderData> }> {
+  const empty = { notesByPage: {}, transitionsByPage: {}, renderDataByPage: {} };
   try {
-    const { data, error } = await supabase.from('pptx_meta').select('notes, transitions').eq('file_id', fileId).maybeSingle();
+    const { data, error } = await supabase.from('pptx_meta').select('notes, transitions, render_data').eq('file_id', fileId).maybeSingle();
     if (error || !data) return empty;
-    return { notesByPage: (data.notes as Record<number, string>) || {}, transitionsByPage: (data.transitions as Record<number, SlideTransition>) || {} };
+    return {
+      notesByPage: (data.notes as Record<number, string>) || {},
+      transitionsByPage: (data.transitions as Record<number, SlideTransition>) || {},
+      renderDataByPage: (data.render_data as Record<number, SlideRenderData>) || {},
+    };
   } catch {
     return empty;
   }
@@ -57,7 +62,7 @@ function playTimesUpChime() { playBeep(880, 150, 0.16); setTimeout(() => playBee
 pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
 
 // Same deployment URL as FileUpload.tsx - keep these in sync.
-const GAS_URL = 'https://script.google.com/macros/s/AKfycbx48s5aNamkERYuvJ-BE7-RBF2zt15mFZ-C-SXL_UIGZkG46RdyuPYIOlO6o0HZcr3N/exec';
+const GAS_URL = 'https://script.google.com/macros/s/AKfycbzRtEZeLTAKPwPk-ICcODO_qvpjdN7_EABDi-BMqMcbDCz9pg5zEf_HZs2cR691FAuv/exec';
 
 interface LessonSlideRef {
   fileId: string;
@@ -86,6 +91,8 @@ interface FlatSlide {
   notes?: string;
   transition?: SlideTransition; // this slide's own PPTX transition - how it should animate IN when navigated to
   thumbnail?: string; // small data-URL preview, shown on the remote's thumbnail strip
+  renderData?: SlideRenderData; // parsed shapes/builds for <SlideRenderer/> - host-only, stripped before slide_map is shared (see the slide_map upsert below)
+  buildCount?: number; // just the count, mirrored to the remote so its Next/Prev can be build-aware without shipping the full renderData
 }
 
 type ScreenMode = 'normal' | 'black' | 'white';
@@ -350,12 +357,6 @@ function withPlaybackParams(embedUrl: string, platform?: string): string {
       url.searchParams.set('playsinline', '1');
       return url.toString();
     }
-    if (platform === 'drive' || url.hostname.includes('drive.google.com')) {
-      // Google Drive's preview player also supports this param - without it
-      // the video just sits on its poster frame until someone hits play.
-      url.searchParams.set('autoplay', '1');
-      return url.toString();
-    }
     return embedUrl;
   } catch {
     return embedUrl;
@@ -408,6 +409,14 @@ export default function Present() {
   // inside the mount-once broadcast handlers below (declared ahead of them
   // on purpose, even though currentFlatIndex itself is computed further down).
   const currentFlatIndexRef = useRef(0);
+
+  // Which build (bullet/shape reveal step) is showing on the *current* flat
+  // slide - 0 is the slide's base "just landed" state. Only meaningful when
+  // that slide has renderData with buildCount > 0; see goNext/goPrev below
+  // for how this interacts with moving between slides.
+  const [buildIndex, setBuildIndex] = useState(0);
+  const buildIndexRef = useRef(0);
+  useEffect(() => { buildIndexRef.current = buildIndex; }, [buildIndex]);
 
   // --- New presentation-tools state (laser/draw already existed on the
   // remote; everything else here is new) ---------------------------------
@@ -803,7 +812,7 @@ export default function Present() {
         const pin = String(Math.floor(1000 + Math.random() * 9000));
         setSessionPin(pin);
         await supabase.from('sessions').insert([{
-          id: sessionId, file_id: fileId, current_slide: 1, canvas_data: {},
+          id: sessionId, file_id: fileId, current_slide: 1, current_build: 0, canvas_data: {},
           session_state: { ...DEFAULT_SESSION_STATE, pin },
           audience_state: DEFAULT_AUDIENCE_STATE,
         }]);
@@ -849,6 +858,8 @@ export default function Present() {
         const clamped = Math.min(Math.max(0, flatNum - 1), list.length - 1);
         const target = list[clamped];
         if (!target) return;
+        const build = payload.payload?.build;
+        setBuildIndex(typeof build === 'number' ? build : 0);
         if (target.itemIndex !== currentIndexRef.current) {
           landOnPageRef.current = target.pageInItem;
           setCurrentIndex(target.itemIndex);
@@ -1138,12 +1149,13 @@ export default function Present() {
   // for the mount-once broadcast handlers.
   useEffect(() => { currentFlatIndexRef.current = currentFlatIndex; }, [currentFlatIndex]);
 
-  // Persist + broadcast the current global slide number whenever it
-  // changes - this is what lets the phone's thumbnail strip and the main
-  // screen agree on "slide 6", regardless of which lesson item that is.
+  // Persist + broadcast the current global slide number (and build step)
+  // whenever either changes - this is what lets the phone's thumbnail strip
+  // and the main screen agree on "slide 6, build 2", regardless of which
+  // lesson item that is.
   useEffect(() => {
     if (!flatSlides.length || !activeFileId) return;
-    supabase.from('sessions').upsert({ id: sessionId, file_id: activeFileId, current_slide: currentFlatIndex + 1 });
+    supabase.from('sessions').upsert({ id: sessionId, file_id: activeFileId, current_slide: currentFlatIndex + 1, current_build: buildIndex });
     // fileId is included here (not just the slide number) so the remote can
     // tell when the presenter has switched to a different lesson item -
     // without this, the phone has no way to know its cached preview is now
@@ -1153,18 +1165,23 @@ export default function Present() {
     channelRef.current?.send({
       type: 'broadcast',
       event: 'slide_change',
-      payload: { slide: currentFlatIndex + 1, fileId: activeFileId },
+      payload: { slide: currentFlatIndex + 1, build: buildIndex, fileId: activeFileId },
     });
-  }, [currentFlatIndex, activeFileId, flatSlides.length, sessionId]);
+  }, [currentFlatIndex, buildIndex, activeFileId, flatSlides.length, sessionId]);
 
   // Share the flat slide list itself with the remote (thumbnail strip,
-  // total count, per-slide type/name/notes) whenever it's built or changes.
+  // total count, per-slide type/name/notes/buildCount) whenever it's built
+  // or changes. renderData is deliberately stripped first - it can carry
+  // full-size embedded images per slide, and the remote never draws slides
+  // itself, so shipping it would only bloat the DB row and every broadcast
+  // for no benefit. buildCount (just the number) is kept.
   useEffect(() => {
     if (!flatSlides.length) return;
-    supabase.from('sessions').upsert({ id: sessionId, slide_map: flatSlides }).then(({ error }) => {
+    const remoteSlides = flatSlides.map(({ renderData: _renderData, ...rest }) => rest);
+    supabase.from('sessions').upsert({ id: sessionId, slide_map: remoteSlides }).then(({ error }) => {
       if (error) console.error('🚨 slide_map upsert failed:', error.message, error);
     });
-    channelRef.current?.send({ type: 'broadcast', event: 'slide_map_update', payload: { slideMap: flatSlides } });
+    channelRef.current?.send({ type: 'broadcast', event: 'slide_map_update', payload: { slideMap: remoteSlides } });
   }, [flatSlides, sessionId]);
 
   // Resize + redraw the annotation canvas to match the stage, and redraw
@@ -1380,10 +1397,11 @@ export default function Present() {
           }
           if (entry.fileType === 'pdf') {
             const n = await getPdfPageCount(entry.blobUrl);
-            const { notesByPage, transitionsByPage } = await fetchPptxMeta(ref.fileId);
+            const { notesByPage, transitionsByPage, renderDataByPage } = await fetchPptxMeta(ref.fileId);
             for (let p = 1; p <= n; p++) {
               const thumbnail = await renderPdfThumbnail(entry.blobUrl, p);
-              result.push({ itemIndex: i, pageInItem: p, fileType: 'pdf', name: ref.name, notes: notesByPage[p] || ref.notes, transition: transitionsByPage[p], thumbnail });
+              const renderData = renderDataByPage[p];
+              result.push({ itemIndex: i, pageInItem: p, fileType: 'pdf', name: ref.name, notes: notesByPage[p] || ref.notes, transition: transitionsByPage[p], thumbnail, renderData, buildCount: renderData?.buildCount });
             }
           } else {
             const thumbnail = entry.fileType === 'image' ? await renderImageThumbnail(entry.blobUrl) : undefined;
@@ -1412,12 +1430,13 @@ export default function Present() {
     (async () => {
       if (resolved.fileType === 'pdf') {
         if (!numPages) return;
-        const { notesByPage, transitionsByPage } = fileId ? await fetchPptxMeta(fileId) : { notesByPage: {}, transitionsByPage: {} };
+        const { notesByPage, transitionsByPage, renderDataByPage } = fileId ? await fetchPptxMeta(fileId) : { notesByPage: {}, transitionsByPage: {}, renderDataByPage: {} };
         const slides: FlatSlide[] = [];
         for (let i = 0; i < numPages; i++) {
           if (cancelled) return;
           const thumbnail = await renderPdfThumbnail(resolved.blobUrl, i + 1);
-          slides.push({ itemIndex: 0, pageInItem: i + 1, fileType: 'pdf', notes: notesByPage[i + 1], transition: transitionsByPage[i + 1], thumbnail });
+          const renderData = renderDataByPage[i + 1];
+          slides.push({ itemIndex: 0, pageInItem: i + 1, fileType: 'pdf', notes: notesByPage[i + 1], transition: transitionsByPage[i + 1], thumbnail, renderData, buildCount: renderData?.buildCount });
           if (!cancelled) setFlatSlides([...slides]);
         }
       } else if (resolved.fileType === 'image') {
@@ -1469,11 +1488,16 @@ export default function Present() {
 
   // Jump straight to any global slide number - used by both the Prev/Next
   // buttons below and incoming remote slide_change events.
-  const goToFlatIndex = useCallback((flatIdx: number) => {
+  // landBuild: which build to show on arrival - 0 (default) for a fresh
+  // "just landed on this slide" state, or an explicit later build when
+  // stepping backward onto a slide that should land fully built (see
+  // goPrev below - that's how PowerPoint's own back-navigation behaves).
+  const goToFlatIndex = useCallback((flatIdx: number, landBuild: number = 0) => {
     const list = flatSlides;
     if (!list.length) return;
     const clamped = Math.min(Math.max(0, flatIdx), list.length - 1);
     const target = list[clamped];
+    setBuildIndex(landBuild);
     if (target.itemIndex !== currentIndex) {
       landOnPageRef.current = target.pageInItem;
       setCurrentIndex(target.itemIndex);
@@ -1483,19 +1507,36 @@ export default function Present() {
   }, [flatSlides, currentIndex]);
 
   const goPrev = useCallback(() => {
-    if (flatSlides.length) { goToFlatIndex(currentFlatIndex - 1); return; }
+    if (flatSlides.length) {
+      // Still mid-build on this slide? Step back one bullet/shape instead
+      // of leaving the slide.
+      if (buildIndex > 0) { setBuildIndex((b) => b - 1); return; }
+      const prevIdx = currentFlatIndex - 1;
+      const prevBuildCount = flatSlides[prevIdx]?.buildCount || 0;
+      // Land on the *fully built* previous slide, not its blank starting
+      // state - matches how PowerPoint's own Prev behaves.
+      goToFlatIndex(prevIdx, prevBuildCount);
+      return;
+    }
     // Fallback for the brief window before flatSlides has been prepared.
     if (resolved?.fileType === 'pdf' && currentPage > 1) { setCurrentPage(currentPage - 1); return; }
     if (!lessonSlides || currentIndex === 0) return;
     setCurrentIndex((i) => i - 1);
-  }, [flatSlides, currentFlatIndex, goToFlatIndex, resolved, currentPage, lessonSlides, currentIndex]);
+  }, [flatSlides, currentFlatIndex, buildIndex, goToFlatIndex, resolved, currentPage, lessonSlides, currentIndex]);
 
   const goNext = useCallback(() => {
-    if (flatSlides.length) { goToFlatIndex(currentFlatIndex + 1); return; }
+    if (flatSlides.length) {
+      const buildCount = flatSlides[currentFlatIndex]?.buildCount || 0;
+      // More bullets/shapes still to reveal on this slide? Reveal the next
+      // one instead of moving on.
+      if (buildIndex < buildCount) { setBuildIndex((b) => b + 1); return; }
+      goToFlatIndex(currentFlatIndex + 1);
+      return;
+    }
     if (resolved?.fileType === 'pdf' && numPages && currentPage < numPages) { setCurrentPage(currentPage + 1); return; }
     if (!lessonSlides || currentIndex >= lessonSlides.length - 1) return;
     setCurrentIndex((i) => i + 1);
-  }, [flatSlides, currentFlatIndex, goToFlatIndex, resolved, numPages, currentPage, lessonSlides, currentIndex]);
+  }, [flatSlides, currentFlatIndex, buildIndex, goToFlatIndex, resolved, numPages, currentPage, lessonSlides, currentIndex]);
 
   // Keyboard shortcuts on the main screen: arrows to navigate, B/W for
   // black/white screen, Escape to restore to color.
@@ -1674,19 +1715,29 @@ export default function Present() {
                 before. */}
             <div key={currentFlatIndex} className="w-full h-full flex items-center justify-center" style={transitionAnimationStyle(flatSlides[currentFlatIndex]?.transition)}>
             {!loading && !error && resolved?.fileType === 'pdf' && (
-              <div className="w-full h-full flex items-center justify-center overflow-auto bg-white">
+              <div className={`w-full h-full flex items-center justify-center bg-white ${flatSlides[currentFlatIndex]?.renderData ? 'overflow-hidden' : 'overflow-auto'}`}>
                 <Document
                   file={resolved.blobUrl}
                   loading={<div className="p-12 text-black">Loading PDF...</div>}
                   onLoadSuccess={onPdfLoadSuccess}
                   onLoadError={(err) => setError(`PDF error: ${err.message}`)}
                 >
-                  <Page
-                    pageNumber={currentPage}
-                    renderTextLayer={false}
-                    renderAnnotationLayer={false}
-                    height={window.innerHeight * 0.85}
-                  />
+                  {flatSlides[currentFlatIndex]?.renderData ? (
+                    // Real shapes/text/builds, parsed from the PPTX itself -
+                    // used whenever available. <Document> still needs to be
+                    // mounted even here: it's what drives numPages, which
+                    // the flat-slide count for this whole file depends on,
+                    // and it stays ready as the fallback for any other slide
+                    // in the same deck that didn't parse.
+                    <SlideRenderer data={flatSlides[currentFlatIndex]!.renderData!} buildIndex={buildIndex} />
+                  ) : (
+                    <Page
+                      pageNumber={currentPage}
+                      renderTextLayer={false}
+                      renderAnnotationLayer={false}
+                      height={window.innerHeight * 0.85}
+                    />
+                  )}
                 </Document>
               </div>
             )}
