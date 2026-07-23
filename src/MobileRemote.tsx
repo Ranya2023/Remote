@@ -639,7 +639,17 @@ export default function MobileRemote() {
       event: 'timer_state',
       payload: { secondsLeft: timerSecondsLeft, running: timerRunning, visible: timerShowOnProjector },
     });
-  }, [timerSecondsLeft, timerRunning, timerShowOnProjector, ready]);
+    // Same reasoning as persistPointerState above for laser/spotlight: a
+    // desktop-script consumer can't subscribe to this broadcast, so it also
+    // gets saved somewhere pollable. Timer changes at most once a second
+    // (unlike laser/spotlight's continuous drag), so no extra throttling
+    // is needed here beyond "only writes when something actually changed".
+    supabase.from('sessions').update({
+      pointer_state: { timer: { secondsLeft: timerSecondsLeft, running: timerRunning, visible: timerShowOnProjector } },
+    }).eq('id', sessionId).then(({ error }) => {
+      if (error) console.warn('timer pointer_state persist skipped:', error.message);
+    });
+  }, [timerSecondsLeft, timerRunning, timerShowOnProjector, ready, sessionId]);
 
   // Fetches whatever the active slide actually is - pdf, image, or just
   // metadata for video/other (video is controlled remotely, not mirrored,
