@@ -1735,7 +1735,7 @@ export default function Present() {
                     // the flat-slide count for this whole file depends on,
                     // and it stays ready as the fallback for any other slide
                     // in the same deck that didn't parse.
-                    <SlideRenderer data={flatSlides[currentFlatIndex]!.renderData!} buildIndex={buildIndex} />
+                    <SlideRenderer data={flatSlides[currentFlatIndex]!.renderData!} buildIndex={buildIndex} heightPx={window.innerHeight * 0.85} />
                   ) : (
                     <Page
                       pageNumber={currentPage}
