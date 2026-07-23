@@ -6,6 +6,7 @@ import { supabase } from './supabaseClient';
 import { QuizReportCard, exportReportPDF, exportReportPNG, type QuizReportData } from './quizReport';
 import { recordSavedItem } from './Account';
 import type { SlideTransition, SlideRenderData } from './pptxParse';
+import { resolveVirtualFileId } from './sessionData';
 
 // Best-effort lookup of whatever extractPptxMeta (see FileUpload.tsx) saved
 // for a given uploaded file - speaker notes and transition info, keyed by
@@ -239,6 +240,12 @@ function normalizeResponse(json: any, nameHint?: string): ResolvedSlide {
 }
 
 async function fetchGetPdf(fileId: string) {
+  const virtual = await resolveVirtualFileId(fileId);
+  if (virtual) {
+    if (virtual.status !== 'success') throw new Error(virtual.message || 'Failed to load this slide.');
+    return virtual;
+  }
+
   const url = `${GAS_URL}?action=getPdf&fileId=${encodeURIComponent(fileId)}`;
   const response = await fetch(url);
   const text = await response.text();

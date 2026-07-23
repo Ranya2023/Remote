@@ -4,6 +4,7 @@ import { supabase } from './supabaseClient';
 import { extractPptxMeta } from './pptxParse';
 import { recordSavedItem, formatBytes } from './Account';
 import { useAuth } from './AuthContext';
+import { createVideoLink, createLesson } from './sessionData';
 
 // Kept in sync with Code.gs's supported types
 const ACCEPTED_MIME_TYPES = [
@@ -208,32 +209,21 @@ export default function FileUpload() {
     setVideoUrl('');
 
     try {
-      const params = new URLSearchParams();
-      params.append('action', 'addVideoLink');
-      params.append('url', trimmedUrl);
-
-      const response = await fetch(GAS_URL, { method: 'POST', body: params });
-      const textResponse = await response.text();
-
-      try {
-        const result = JSON.parse(textResponse);
-        if (result.status === 'success') {
-          updateSlide(localId, {
-            status: 'done',
-            fileId: result.fileId,
-            fileType: result.fileType,
-            embedUrl: result.embedUrl,
-            platform: result.platform,
-            name: result.platform ? `${result.platform} video` : trimmedUrl,
-          });
-        } else {
-          updateSlide(localId, { status: 'error', errorMessage: result.message || 'Could not add link' });
-        }
-      } catch (parseError) {
-        updateSlide(localId, { status: 'error', errorMessage: 'Google sent an invalid response' });
+      const result = await createVideoLink(trimmedUrl);
+      if (result) {
+        updateSlide(localId, {
+          status: 'done',
+          fileId: result.fileId,
+          fileType: 'video-link',
+          embedUrl: result.embedUrl,
+          platform: result.platform,
+          name: `${result.platform} video`,
+        });
+      } else {
+        updateSlide(localId, { status: 'error', errorMessage: 'Unsupported video link. Please use a YouTube, Vimeo, or Google Drive share link.' });
       }
     } catch (error: any) {
-      updateSlide(localId, { status: 'error', errorMessage: error.message || 'Network error' });
+      updateSlide(localId, { status: 'error', errorMessage: error.message || 'Could not save this video link' });
     }
   };
 
@@ -337,47 +327,32 @@ export default function FileUpload() {
     setMessage('Saving lesson...');
 
     try {
-      const params = new URLSearchParams();
-      params.append('action', 'saveLesson');
-      params.append(
-        'slides',
-        JSON.stringify(readySlides.map((s) => ({ fileId: s.fileId, fileType: s.fileType, name: s.name })))
-      );
-
-      const response = await fetch(GAS_URL, { method: 'POST', body: params });
-      const textResponse = await response.text();
-
-      try {
-        const result = JSON.parse(textResponse);
-        if (result.status === 'success') {
-          setMessage('Success! Starting lesson...');
-          const title = readySlides.length <= 2
-            ? readySlides.map((s) => s.name).join(' + ')
-            : `${readySlides[0].name} + ${readySlides.length - 1} more`;
-          const saveResult = await recordSavedItem({
-            kind: 'lesson',
-            title,
-            file_id: result.fileId,
-            file_type: 'lesson',
-            size_bytes: totalBytes,
-          });
-          if (!saveResult.ok && (saveResult.reason === 'presentation_limit' || saveResult.reason === 'storage_limit')) {
-            setMessage(
-              saveResult.reason === 'presentation_limit'
-                ? `You've reached your limit of ${usage?.presentationLimit ?? 5} presentations - this lesson wasn't saved to My Account.`
-                : `That would put you over your storage limit - this lesson wasn't saved to My Account.`
-            );
-          }
-          refreshUsage();
-          navigate(`/present/${result.fileId}`, { state: { fileType: 'lesson' } });
-        } else {
-          setMessage('Server returned: ' + JSON.stringify(result));
-        }
-      } catch (parseError) {
-        setMessage('Google sent invalid format: ' + textResponse.substring(0, 100));
+      const lessonSlides = readySlides
+        .filter((s): s is typeof s & { fileId: string; fileType: string } => !!s.fileId && !!s.fileType)
+        .map((s) => ({ fileId: s.fileId, fileType: s.fileType, name: s.name }));
+      const fileId = await createLesson(lessonSlides);
+      setMessage('Success! Starting lesson...');
+      const title = readySlides.length <= 2
+        ? readySlides.map((s) => s.name).join(' + ')
+        : `${readySlides[0].name} + ${readySlides.length - 1} more`;
+      const saveResult = await recordSavedItem({
+        kind: 'lesson',
+        title,
+        file_id: fileId,
+        file_type: 'lesson',
+        size_bytes: totalBytes,
+      });
+      if (!saveResult.ok && (saveResult.reason === 'presentation_limit' || saveResult.reason === 'storage_limit')) {
+        setMessage(
+          saveResult.reason === 'presentation_limit'
+            ? `You've reached your limit of ${usage?.presentationLimit ?? 5} presentations - this lesson wasn't saved to My Account.`
+            : `That would put you over your storage limit - this lesson wasn't saved to My Account.`
+        );
       }
+      refreshUsage();
+      navigate(`/present/${fileId}`, { state: { fileType: 'lesson' } });
     } catch (error: any) {
-      setMessage('Network Error: ' + error.message);
+      setMessage('Could not save lesson: ' + (error.message || 'Unknown error'));
     } finally {
       setIsStarting(false);
     }

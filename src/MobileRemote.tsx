@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Document, Page, pdfjs } from 'react-pdf';
 import { supabase } from './supabaseClient';
+import { resolveVirtualFileId } from './sessionData';
 
 pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
 
@@ -667,18 +668,23 @@ export default function MobileRemote() {
       const timeoutId = setTimeout(() => controller.abort(), 15000);
 
       try {
-        const response = await fetch(`${GAS_URL}?action=getPdf&fileId=${fileId}`, { signal: controller.signal });
+        const virtual = await resolveVirtualFileId(fileId);
+        const response = virtual ? null : await fetch(`${GAS_URL}?action=getPdf&fileId=${fileId}`, { signal: controller.signal });
         clearTimeout(timeoutId);
 
-        const text = await response.text();
         let result: any;
-        try {
-          result = JSON.parse(text);
-        } catch {
-          // We got something back, but it wasn't JSON - most likely a
-          // Google sign-in redirect page instead of the actual API response.
-          setPreviewError('Server did not return valid data (possibly a Google sign-in redirect)');
-          return;
+        if (virtual) {
+          result = virtual;
+        } else {
+          const text = await response!.text();
+          try {
+            result = JSON.parse(text);
+          } catch {
+            // We got something back, but it wasn't JSON - most likely a
+            // Google sign-in redirect page instead of the actual API response.
+            setPreviewError('Server did not return valid data (possibly a Google sign-in redirect)');
+            return;
+          }
         }
 
         if (result.status !== 'success') {
