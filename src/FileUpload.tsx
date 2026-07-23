@@ -242,27 +242,39 @@ export default function FileUpload() {
     setSlidesLinkUrl('');
 
     try {
-      const params = new URLSearchParams();
-      params.append('action', 'importSlideLink');
-      params.append('url', trimmedUrl);
-
-      const response = await fetch(GAS_URL, { method: 'POST', body: params });
-      const textResponse = await response.text();
-
-      try {
-        const result = JSON.parse(textResponse);
-        if (result.status === 'success') {
-          // Comes back as a plain PDF fileId, exactly like an uploaded
-          // PPTX - Code.gs already converted the whole deck server-side,
-          // so this needs zero extra handling here: the same page-count +
-          // per-page thumbnail pipeline that already works for any
-          // multi-page PDF picks it up automatically.
-          updateSlide(localId, { status: 'done', fileId: result.fileId, fileType: result.fileType || 'pdf' });
-        } else {
-          updateSlide(localId, { status: 'error', errorMessage: result.message || 'Could not import that presentation' });
+      // Two different spellings of this action name have shown up across
+      // versions of Code.gs in this project (importSlideLink vs
+      // importSlidesLink). Rather than guess which one is actually live,
+      // try the first and automatically retry with the other if the
+      // backend reports it as an unrecognized action - so this works
+      // regardless of which version is currently deployed.
+      const tryAction = async (actionName: string) => {
+        const params = new URLSearchParams();
+        params.append('action', actionName);
+        params.append('url', trimmedUrl);
+        const response = await fetch(GAS_URL, { method: 'POST', body: params });
+        const text = await response.text();
+        try {
+          return JSON.parse(text);
+        } catch {
+          return { status: 'error', message: 'Google sent an invalid response' };
         }
-      } catch (parseError) {
-        updateSlide(localId, { status: 'error', errorMessage: 'Google sent an invalid response' });
+      };
+
+      let result = await tryAction('importSlideLink');
+      if (result.status !== 'success' && /invalid action/i.test(result.message || '')) {
+        result = await tryAction('importSlidesLink');
+      }
+
+      if (result.status === 'success') {
+        // Comes back as a plain PDF fileId, exactly like an uploaded
+        // PPTX - Code.gs already converted the whole deck server-side,
+        // so this needs zero extra handling here: the same page-count +
+        // per-page thumbnail pipeline that already works for any
+        // multi-page PDF picks it up automatically.
+        updateSlide(localId, { status: 'done', fileId: result.fileId, fileType: result.fileType || 'pdf' });
+      } else {
+        updateSlide(localId, { status: 'error', errorMessage: result.message || 'Could not import that presentation' });
       }
     } catch (error: any) {
       updateSlide(localId, { status: 'error', errorMessage: error.message || 'Network error' });

@@ -637,23 +637,38 @@ export default function Present() {
   }, [presetQuizToken]);
 
   // Saved quizzes - prepared once, started whenever ("any day, same lesson
-  // link"). Lives in the same audience_state row as everything else, so no
-  // extra Supabase setup is needed - just note this ties saved quizzes to
-  // whichever browser/device is used to open the presenter link, since
-  // that's what session_id itself is tied to (see the sessionId comment
-  // above). Same device each time -> saved quizzes are always there.
+  // link"). The quiz *content* still lives in audience_state for live in-
+  // session sync (so an already-open remote/audience tab sees a save
+  // immediately) - but it's ALSO persisted here, keyed by fileId rather
+  // than sessionId. sessionId is stored in localStorage per browser (see
+  // the sessionId useState above), so it's only stable on the exact same
+  // device/browser; fileId is the one thing that's genuinely the same
+  // every time this lesson's link is opened, from anywhere. See
+  // setupSession's hydration below for the read side.
   const saveQuiz = useCallback((title: string, questions: QuizQuestion[]) => {
     if (!title.trim() || !questions.length) return;
     const saved: SavedQuiz = { id: `sv_${Date.now().toString(36)}`, title: title.trim(), questions, createdAt: Date.now() };
-    persistAudienceState({ ...audienceStateRef.current, savedQuizzes: [...audienceStateRef.current.savedQuizzes, saved] });
+    const nextSavedQuizzes = [...audienceStateRef.current.savedQuizzes, saved];
+    persistAudienceState({ ...audienceStateRef.current, savedQuizzes: nextSavedQuizzes });
+    if (fileId) {
+      supabase.from('saved_quizzes_by_file').upsert({ file_id: fileId, quizzes: nextSavedQuizzes }).then(({ error }) => {
+        if (error) console.warn('saved_quizzes_by_file upsert skipped (has supabase_migration_saved_quizzes.sql been run yet?):', error.message);
+      });
+    }
     // Also lands in the presenter's account dashboard (if logged in), so
     // it's reachable from anywhere, not just from inside this one file's
     // saved-quizzes list.
     recordSavedItem({ kind: 'quiz', title: title.trim(), questions });
-  }, [persistAudienceState]);
+  }, [persistAudienceState, fileId]);
   const deleteSavedQuiz = useCallback((id: string) => {
-    persistAudienceState({ ...audienceStateRef.current, savedQuizzes: audienceStateRef.current.savedQuizzes.filter((s) => s.id !== id) });
-  }, [persistAudienceState]);
+    const nextSavedQuizzes = audienceStateRef.current.savedQuizzes.filter((s) => s.id !== id);
+    persistAudienceState({ ...audienceStateRef.current, savedQuizzes: nextSavedQuizzes });
+    if (fileId) {
+      supabase.from('saved_quizzes_by_file').upsert({ file_id: fileId, quizzes: nextSavedQuizzes }).then(({ error }) => {
+        if (error) console.warn('saved_quizzes_by_file delete-sync skipped:', error.message);
+      });
+    }
+  }, [persistAudienceState, fileId]);
 
   // Auto-reveal when the countdown for the current question runs out -
   // the presenter tab is the single timer authority so everyone's clock
@@ -848,6 +863,25 @@ export default function Present() {
         if (data.audience_state) {
           audienceStateRef.current = data.audience_state as AudienceState;
           setAudienceState(data.audience_state as AudienceState);
+        }
+      }
+
+      // savedQuizzes specifically also gets hydrated from a fileId-keyed
+      // table, on top of whatever the session row above had - see the
+      // comment on saveQuiz for why: the session row above is only
+      // reliably the same across opens on the exact same device/browser,
+      // but a saved quiz should show up no matter which device opens this
+      // lesson's link.
+      if (fileId) {
+        const { data: savedQuizRow } = await supabase
+          .from('saved_quizzes_by_file')
+          .select('quizzes')
+          .eq('file_id', fileId)
+          .maybeSingle();
+        if (savedQuizRow?.quizzes?.length) {
+          const merged = { ...audienceStateRef.current, savedQuizzes: savedQuizRow.quizzes as SavedQuiz[] };
+          audienceStateRef.current = merged;
+          setAudienceState(merged);
         }
       }
     };
