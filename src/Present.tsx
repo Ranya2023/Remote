@@ -1975,7 +1975,7 @@ export default function Present() {
               // If "usingRealId" logs false, resolved.slideIds is empty/short
               // and we're guessing "pN", which silently fails to navigate
               // whenever the deck's actual slide IDs aren't sequential p1/p2/p3.
-              console.warn('[gslides-nav]', { currentPage, slideIdToUse, usingRealId: !!realSlideId, totalKnownIds: resolved.slideIds.length });
+              console.warn(`[gslides-nav] currentPage=${currentPage} slideIdToUse=${slideIdToUse} usingRealId=${!!realSlideId} totalKnownIds=${resolved.slideIds.length} allKnownIds=${JSON.stringify(resolved.slideIds)}`);
               return (
                 <iframe
                   key={`gslides-${currentFlatIndex}`}
