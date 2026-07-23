@@ -511,11 +511,34 @@ async function extractRenderDataForSlide(zip: JSZip, slidePath: string, slideCx:
     const background = await extractBackgroundForSlide(slideDoc);
     const transEl = firstEl(slideDoc, 'p:transition');
     const transition = transEl ? parseTransitionEl(transEl) : { kind: 'cut' as const, durationMs: 0 };
-    const buildCount = shapes.reduce((max, s) => {
+    let buildCount = shapes.reduce((max, s) => {
       let shapeMax = s.buildOrder ?? -1;
       s.paragraphs?.forEach((p) => { if (p.buildOrder != null) shapeMax = Math.max(shapeMax, p.buildOrder); });
       return Math.max(max, shapeMax + 1);
     }, 0);
+
+    // Safety net: a slide should never open completely blank. Some
+    // transition types (Morph in particular) generate their own per-shape
+    // timing metadata that isn't really a "click to reveal this bullet"
+    // animation, and the entrance-effect heuristic above can't always tell
+    // the difference. If every single shape/paragraph ended up gated
+    // behind a build - nothing visible the moment the slide is landed on -
+    // that's the tell. Rather than risk a blank slide, drop all build
+    // gating for this slide and show its real content immediately; the
+    // layout/text/images are still exactly what was parsed, just without
+    // the click-to-reveal behavior.
+    const visibleAtStart = shapes.some((s) => {
+      if (s.buildOrder != null && s.buildOrder > 0) return false;
+      if (!s.paragraphs) return s.buildOrder == null || s.buildOrder === 0;
+      return s.paragraphs.some((p) => p.buildOrder == null || p.buildOrder === 0);
+    });
+    if (!visibleAtStart && buildCount > 0) {
+      for (const s of shapes) {
+        s.buildOrder = undefined;
+        s.paragraphs?.forEach((p) => { p.buildOrder = undefined; });
+      }
+      buildCount = 0;
+    }
 
     return { aspectRatio: slideCx / slideCy, background, shapes, transition, buildCount };
   } catch {
