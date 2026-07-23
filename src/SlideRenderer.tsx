@@ -28,10 +28,8 @@ function paragraphVisible(p: SlideParagraph, buildIndex: number): boolean {
   return p.buildOrder == null || p.buildOrder <= buildIndex;
 }
 
-const BULLET_CHARS = ['•', '◦', '▪'];
-
 function ParagraphView({ p, visible, widthPx }: { p: SlideParagraph; visible: boolean; widthPx: number }) {
-  const bullet = p.hasBullet ? BULLET_CHARS[Math.min(p.bulletLevel, 2)] : '';
+  const bullet = !p.isContinuation ? p.bulletChar : undefined;
   return (
     <div
       style={{
