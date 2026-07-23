@@ -356,6 +356,20 @@ function withPlaybackParams(embedUrl: string, platform?: string): string {
       url.searchParams.set('playsinline', '1');
       return url.toString();
     }
+    if (platform === 'vimeo' || url.hostname.includes('vimeo.com')) {
+      url.searchParams.set('autoplay', '1');
+      // Vimeo's docs note some browsers only honor autoplay if the embed
+      // is also muted at start - unlike YouTube, this isn't optional
+      // there's no separate unmute-after-load trick available here, so a
+      // presenter would need to manually unmute via the player's own
+      // controls if audio is needed. Given the alternative is the video
+      // sometimes not autoplaying at all, autoplaying muted is the safer
+      // default.
+      url.searchParams.set('muted', '1');
+      return url.toString();
+    }
+    // Google Drive's /preview embed doesn't have a documented autoplay
+    // parameter the way YouTube/Vimeo do - nothing reliable to add here.
     return embedUrl;
   } catch {
     return embedUrl;
