@@ -804,7 +804,7 @@ export default function Present() {
         .from('sessions')
         .select('id, canvas_data, session_state, audience_state')
         .eq('id', sessionId)
-        .single();
+        .maybeSingle();
 
       if (!data) {
         // New session: mint a 4-digit PIN so the presenter can require it
@@ -1176,13 +1176,19 @@ export default function Present() {
   // itself, so shipping it would only bloat the DB row and every broadcast
   // for no benefit. buildCount (just the number) is kept.
   useEffect(() => {
-    if (!flatSlides.length) return;
+    if (!flatSlides.length || !activeFileId) return;
     const remoteSlides = flatSlides.map(({ renderData: _renderData, ...rest }) => rest);
-    supabase.from('sessions').upsert({ id: sessionId, slide_map: remoteSlides }).then(({ error }) => {
+    // file_id is included here even though the session-creation effect
+    // above also sets it - this upsert can fire before that one finishes
+    // (both start around mount), and sessions.file_id is NOT NULL. Without
+    // it, an upsert that lands first tries to INSERT a row with no
+    // file_id and fails the constraint, which was showing up as a repeated
+    // "slide_map upsert failed" error in the console on every new slide.
+    supabase.from('sessions').upsert({ id: sessionId, file_id: activeFileId, slide_map: remoteSlides }).then(({ error }) => {
       if (error) console.error('🚨 slide_map upsert failed:', error.message, error);
     });
     channelRef.current?.send({ type: 'broadcast', event: 'slide_map_update', payload: { slideMap: remoteSlides } });
-  }, [flatSlides, sessionId]);
+  }, [flatSlides, activeFileId, sessionId]);
 
   // Resize + redraw the annotation canvas to match the stage, and redraw
   // whenever the visible slide changes.
