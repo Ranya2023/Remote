@@ -47,6 +47,7 @@ export interface SlideRun {
 export interface SlideParagraph {
   runs: SlideRun[];
   bulletLevel: number;   // 0-based indent level
+  hasBullet: boolean;    // true only when the source <a:pPr> explicitly sets a bullet
   buildOrder?: number;   // undefined = visible from the start; N = revealed on the Nth "Next"
 }
 export interface SlideShape {
@@ -377,29 +378,81 @@ function xfrmPct(spPr: Element | null, slideCx: number, slideCy: number): { xPct
   return { xPct: (x / slideCx) * 100, yPct: (y / slideCy) * 100, wPct: (cx / slideCx) * 100, hPct: (cy / slideCy) * 100 };
 }
 
+// Whether a paragraph actually has a bullet marker, per its own <a:pPr> -
+// explicit <a:buNone/> means no, an explicit <a:buChar/>/<a:buAutoNum/>
+// means yes. This deck's real bullet list (slide 3) writes <a:buChar
+// char="§"/> on the item and <a:buNone/> everywhere else; titles and plain
+// text boxes commonly have neither. Absent any explicit marker we default
+// to *no* bullet - list styling inherited purely from the slide layout/
+// master (which this file doesn't parse) is the one case this can't see,
+// but "no spurious dot on ordinary text" is the much more common and much
+// less jarring failure mode than "silent bullet on every paragraph".
+function paragraphHasBullet(pPr: Element | null): boolean {
+  if (!pPr) return false;
+  if (firstEl(pPr, 'a:buNone')) return false;
+  if (firstEl(pPr, 'a:buChar') || firstEl(pPr, 'a:buAutoNum')) return true;
+  return false;
+}
+
 function extractParagraphs(txBody: Element, slideWidthPt: number, buildFor: (paragraphIndex: number) => number | undefined): SlideParagraph[] {
   const paragraphs = allEls(txBody, 'a:p');
-  const mapped: (SlideParagraph | null)[] = paragraphs.map((p, idx) => {
+  const mapped: SlideParagraph[] = [];
+
+  paragraphs.forEach((p, idx) => {
     const pPr = firstEl(p, 'a:pPr');
     const bulletLevel = pPr?.getAttribute('lvl') ? Number(pPr.getAttribute('lvl')) : 0;
-    const runs: SlideRun[] = allEls(p, 'a:r').map((r) => {
-      const rPr = firstEl(r, 'a:rPr');
-      const text = firstEl(r, 'a:t')?.textContent || '';
-      const sizeAttr = rPr?.getAttribute('sz'); // centipoints, e.g. "1800" = 18pt
-      const sizePt = sizeAttr ? Number(sizeAttr) / 100 : undefined;
-      return {
-        text,
-        bold: rPr?.getAttribute('b') === '1',
-        italic: rPr?.getAttribute('i') === '1',
-        color: extractColor(rPr),
-        sizeCqw: sizePt ? (sizePt / slideWidthPt) * 100 : undefined,
-      };
-    });
-    if (!runs.length) return null;
-    const paragraph: SlideParagraph = { runs, bulletLevel, buildOrder: buildFor(idx) };
-    return paragraph;
+    const bulletOnThisParagraph = paragraphHasBullet(pPr);
+    const order = buildFor(idx);
+
+    // A single <a:p> can contain manual line breaks (<a:br/>) interleaved
+    // with its <a:r> runs - PowerPoint/Google Slides use this constantly
+    // for things like title slides ("name" / blank / blank / "Title" /
+    // "subtitle" all as ONE paragraph). Walking p's children in document
+    // order - rather than grabbing every <a:r> via getElementsByTagName,
+    // which discards where the <a:br> elements sat - lets each forced line
+    // become its own rendered line instead of every run bleeding into the
+    // next with no separation at all.
+    let currentRuns: SlideRun[] = [];
+    let isFirstLine = true;
+    const flushLine = () => {
+      mapped.push({
+        runs: currentRuns,
+        bulletLevel,
+        hasBullet: isFirstLine && bulletOnThisParagraph && currentRuns.length > 0,
+        buildOrder: order,
+      });
+      currentRuns = [];
+      isFirstLine = false;
+    };
+
+    for (const child of Array.from(p.children)) {
+      const tag = localName(child.tagName);
+      if (tag === 'r') {
+        const rPr = firstEl(child, 'a:rPr');
+        const text = firstEl(child, 'a:t')?.textContent || '';
+        const sizeAttr = rPr?.getAttribute('sz'); // centipoints, e.g. "1800" = 18pt
+        const sizePt = sizeAttr ? Number(sizeAttr) / 100 : undefined;
+        currentRuns.push({
+          text,
+          bold: rPr?.getAttribute('b') === '1',
+          italic: rPr?.getAttribute('i') === '1',
+          color: extractColor(rPr),
+          sizeCqw: sizePt ? (sizePt / slideWidthPt) * 100 : undefined,
+        });
+      } else if (tag === 'br') {
+        flushLine(); // forced line break - end the current line here, even if empty (preserves spacer lines)
+      }
+    }
+    flushLine(); // whatever's left after the last run (there's rarely a trailing <a:br>)
   });
-  return mapped.filter((p): p is SlideParagraph => p !== null && p.runs.some((r) => r.text.trim().length > 0));
+
+  // Only bail out entirely (caller falls back to the plain-fill/rect path)
+  // if literally nothing on this shape has real text - blank lines *within*
+  // an otherwise-real paragraph (spacer <a:br>s, or a trailing empty <a:p>
+  // used purely for bottom padding) are kept, since they're doing real
+  // layout work, not noise.
+  const hasRealText = mapped.some((p) => p.runs.some((r) => r.text.trim().length > 0));
+  return hasRealText ? mapped : [];
 }
 
 function guessImageMime(path: string): string {

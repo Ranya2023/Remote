@@ -31,7 +31,7 @@ function paragraphVisible(p: SlideParagraph, buildIndex: number): boolean {
 const BULLET_CHARS = ['•', '◦', '▪'];
 
 function ParagraphView({ p, visible, widthPx }: { p: SlideParagraph; visible: boolean; widthPx: number }) {
-  const bullet = p.bulletLevel > 0 || p.runs.length ? BULLET_CHARS[Math.min(p.bulletLevel, 2)] : '';
+  const bullet = p.hasBullet ? BULLET_CHARS[Math.min(p.bulletLevel, 2)] : '';
   return (
     <div
       style={{
