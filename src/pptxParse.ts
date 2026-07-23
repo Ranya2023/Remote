@@ -130,7 +130,17 @@ async function loadRelMap(zip: JSZip, partPath: string): Promise<Map<string, str
   for (const rel of allEls(relsDoc, 'Relationship')) {
     const id = rel.getAttribute('Id');
     const target = rel.getAttribute('Target');
-    if (id && target) map.set(id, resolveRelPath(relsPath, target));
+    // Resolved against partPath (the part the .rels file describes, e.g.
+    // "ppt/presentation.xml"), NOT relsPath (the .rels file's own location,
+    // e.g. "ppt/_rels/presentation.xml.rels") - relationship targets are
+    // spec'd relative to the owning part's directory. Slide-level rels
+    // targets conventionally write an explicit "../" and so happened to
+    // resolve correctly either way, which is what let this go unnoticed:
+    // presentation.xml.rels targets (e.g. "slides/slide1.xml") don't have
+    // that "../", so resolving against relsPath's directory instead of
+    // partPath's produced a path with a phantom extra "_rels" segment -
+    // silently pointing at a zip entry that doesn't exist.
+    if (id && target) map.set(id, resolveRelPath(partPath, target));
   }
   return map;
 }
