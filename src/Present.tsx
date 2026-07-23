@@ -6,6 +6,7 @@ import { supabase } from './supabaseClient';
 import { QuizReportCard, exportReportPDF, exportReportPNG, type QuizReportData } from './quizReport';
 import { recordSavedItem } from './Account';
 import type { SlideTransition, SlideRenderData } from './pptxParse';
+import SlideRenderer from './SlideRenderer';
 import { resolveVirtualFileId } from './sessionData';
 
 // Best-effort lookup of whatever extractPptxMeta (see FileUpload.tsx) saved
@@ -421,6 +422,72 @@ function postYouTubeCommand(iframe: HTMLIFrameElement | null, func: string, args
   iframe.contentWindow.postMessage(JSON.stringify({ event: 'command', func, args }), '*');
 }
 
+// Google's published embed has no postMessage/remote-control API - the
+// only way it plays its own real build/transition animations is by
+// receiving clicks or arrow-key presses directly inside the iframe itself
+// (which is exactly why handleLoad below focuses it: so the keyboard, at
+// least, keeps working). Advancing from the phone remote or the on-screen
+// Prev/Next buttons has no such option; it can only reload the iframe
+// pointed at the new slide's id - Google doesn't expose "advance with
+// animation" to the embedding page.
+//
+// A plain remount-on-change faded in against a blank white iframe while
+// Google's page loaded over the network, which read as "no animation"
+// even with a CSS fade applied - there was nothing underneath yet to fade
+// in *over*. This instead keeps the previous slide mounted and fully
+// visible, loads the next one hidden on top of it, waits for its onLoad,
+// then crossfades the two - so there's always real slide content on
+// screen for the transition to fade between, and the old one only gets
+// dropped once the new one has visibly taken over.
+interface GoogleSlidesLayer { id: number; src: string; loaded: boolean; visible: boolean }
+function GoogleSlidesFrame({ src, title }: { src: string; title?: string }) {
+  const [layers, setLayers] = useState<GoogleSlidesLayer[]>([{ id: 0, src, loaded: false, visible: true }]);
+  const nextIdRef = useRef(1);
+  const activeSrcRef = useRef(src);
+
+  useEffect(() => {
+    if (src === activeSrcRef.current) return;
+    activeSrcRef.current = src;
+    const id = nextIdRef.current++;
+    setLayers((prev) => [...prev, { id, src, loaded: false, visible: false }]);
+  }, [src]);
+
+  const handleLoad = (id: number, frame: HTMLIFrameElement | null) => {
+    try { frame?.contentWindow?.focus(); } catch { /* cross-origin refusal - user can still click the slide */ }
+    setLayers((prev) => prev.map((l) => (l.id === id ? { ...l, loaded: true, visible: true } : l)));
+    // Give the crossfade time to finish, then drop every older layer -
+    // keeps the DOM (and the number of live Google iframes, each a real
+    // page load) from growing across a long presentation. Any layer still
+    // mid-load is kept regardless, in case Next got clicked again before
+    // the previous transition finished.
+    setTimeout(() => {
+      setLayers((prev) => {
+        const loadedIds = prev.filter((l) => l.loaded).map((l) => l.id);
+        if (!loadedIds.length) return prev;
+        const newest = Math.max(...loadedIds);
+        return prev.filter((l) => l.id === newest || !l.loaded);
+      });
+    }, 420);
+  };
+
+  return (
+    <div className="relative w-full h-full">
+      {layers.map((l) => (
+        <iframe
+          key={l.id}
+          src={l.src}
+          title={title || 'Google Slides'}
+          className="absolute inset-0 w-full h-full border-0 bg-white"
+          style={{ opacity: l.visible ? 1 : 0, transition: 'opacity 380ms ease' }}
+          allow="fullscreen"
+          allowFullScreen
+          onLoad={(e) => handleLoad(l.id, e.currentTarget)}
+        />
+      ))}
+    </div>
+  );
+}
+
 export default function Present() {
   const { fileId } = useParams<{ fileId: string }>();
   const [searchParams] = useSearchParams();
@@ -498,10 +565,6 @@ export default function Present() {
   // Tracks whether the current video-link slide has actually heard back from
   // YouTube's postMessage API yet - see the handshake effect below.
   const videoHandshakeConnectedRef = useRef(false);
-  // The live Google Slides embed. Focused as soon as it loads so arrow keys
-  // reach Google's own player (which is the only thing that can play that
-  // deck's build animations) - see the google-slides render block below.
-  const gslidesIframeRef = useRef<HTMLIFrameElement>(null);
 
   const sessionStateSaveTimer = useRef<any>(null);
 
@@ -1588,16 +1651,7 @@ export default function Present() {
             // pdf.js-style async page-discovery needed), so this expands
             // in one pass.
             for (let p = 1; p <= entry.slideCount; p++) {
-              // Google's embed has no live remote-control API, so advancing
-              // via the phone (or the on-screen Next button) has to reload
-              // the iframe to the target slide id - a hard cut with no
-              // animation, unlike clicking/arrow-keying inside the iframe
-              // itself (which Google animates natively). Giving every
-              // google-slides flat slide a default fade transition means
-              // that hard cut at least crossfades in via the same
-              // transitionAnimationStyle wrapper the pdf/pptx path already
-              // uses, instead of popping instantly.
-              result.push({ itemIndex: i, pageInItem: p, fileType: 'google-slides', name: ref.name, notes: entry.notesByPage[p], transition: { kind: 'fade', durationMs: 400 } });
+              result.push({ itemIndex: i, pageInItem: p, fileType: 'google-slides', name: ref.name, notes: entry.notesByPage[p] });
             }
           } else {
             const thumbnail = entry.fileType === 'image' ? await renderImageThumbnail(entry.blobUrl) : undefined;
@@ -1638,12 +1692,7 @@ export default function Present() {
       } else if (resolved.fileType === 'google-slides') {
         const slides: FlatSlide[] = [];
         for (let p = 1; p <= resolved.slideCount; p++) {
-          // See the matching comment in the lesson-mode branch above: this
-          // fallback fade is what makes remote/on-screen-button navigation
-          // crossfade instead of hard-cutting, since Google's embed can
-          // only be driven with real animation by interacting with it
-          // directly.
-          slides.push({ itemIndex: 0, pageInItem: p, fileType: 'google-slides', notes: resolved.notesByPage[p], transition: { kind: 'fade', durationMs: 400 } });
+          slides.push({ itemIndex: 0, pageInItem: p, fileType: 'google-slides', notes: resolved.notesByPage[p] });
         }
         if (!cancelled) setFlatSlides(slides);
       } else if (resolved.fileType === 'image') {
@@ -1885,22 +1934,37 @@ export default function Present() {
       <div ref={fullscreenTargetRef} className="flex-1 flex flex-col min-w-0 relative">
       <div className="flex-1 flex flex-col min-w-0">
         {showNav && (
-          <div className="flex items-center justify-between px-4 py-3 bg-gray-900 border-b border-gray-800">
-            <button
-              onClick={goPrev}
-              disabled={isFirstSlide}
-              className="px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 disabled:opacity-30 text-sm font-semibold"
-            >
-              Prev
-            </button>
-            <span className="text-sm text-gray-300">{navLabel}</span>
-            <button
-              onClick={goNext}
-              disabled={isLastSlide}
-              className="px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 disabled:opacity-30 text-sm font-semibold"
-            >
-              Next
-            </button>
+          <div className="flex flex-col bg-gray-900 border-b border-gray-800">
+            <div className="flex items-center justify-between px-4 py-3">
+              <button
+                onClick={goPrev}
+                disabled={isFirstSlide}
+                className="px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 disabled:opacity-30 text-sm font-semibold"
+              >
+                Prev
+              </button>
+              <span className="text-sm text-gray-300">{navLabel}</span>
+              <button
+                onClick={goNext}
+                disabled={isLastSlide}
+                className="px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 disabled:opacity-30 text-sm font-semibold"
+              >
+                Next
+              </button>
+            </div>
+            {/* Google's live embed has no remote-control API - it only
+                accepts "load starting at slide N" from us. Its own build
+                animations play only for input Google's player receives
+                itself (a real click on the slide, or an arrow key while
+                it's focused), which browsers won't let this Prev/Next bar
+                forward across the cross-origin boundary. So the buttons
+                stay a straight slide-to-slide jump, and this just tells the
+                presenter where the animated route actually is. */}
+            {resolved?.fileType === 'google-slides' && (
+              <div className="px-4 pb-2 text-center text-xs text-gray-500">
+                Prev/Next here jump straight to the slide. For the built-in animations, click the slide itself or use the ← → arrow keys.
+              </div>
+            )}
           </div>
         )}
 
@@ -1929,31 +1993,78 @@ export default function Present() {
             className="w-full h-full flex items-center justify-center"
             style={{ transform: zoomTransform, transformOrigin: 'center center', transition: 'transform 0.15s ease-out' }}
           >
+            {/* Google Slides gets its own persistent layer, deliberately
+                *outside* the keyed transition div below - it needs to stay
+                mounted across slide changes so it can crossfade old/new
+                iframes itself (see GoogleSlidesFrame above); remounting it
+                on every currentFlatIndex change (like the keyed div does
+                for everything else) would throw that state away and put us
+                right back at a hard cut. */}
+            {!loading && !error && resolved?.fileType === 'google-slides' && (() => {
+              // Real IDs come from google_slides_decks.slide_ids, populated
+              // at import time via the Slides API. If this deck was
+              // imported before that existed (or the import failed), this
+              // guesses "pN" - which only matches Google's real slide ID if
+              // that slide was never reordered/duplicated/inserted.
+              // Re-import the deck if you see this warning.
+              const realSlideId = resolved.slideIds[currentPage - 1];
+              if (!realSlideId) console.warn(`[gslides-nav] no stored slide id for page ${currentPage} - guessing "p${currentPage}", which may not match this deck's real slide id`);
+              const slideIdToUse = realSlideId || `p${currentPage}`;
+              const src = `https://docs.google.com/presentation/d/${resolved.presentationId}/embed?rm=minimal&slide=id.${slideIdToUse}`;
+              return <GoogleSlidesFrame src={src} title={resolved.name} />;
+            })()}
+
             {/* Transition layer - remounts (and replays its entrance
                 animation) every time the flat slide index changes, using
                 whatever transition pptxParse.ts read off this specific
                 slide. flatSlides[currentFlatIndex] is undefined outside
                 pptx/lesson mode (e.g. plain PDFs with no extracted meta),
                 in which case this is just a plain instant cut, same as
-                before. */}
+                before. Google Slides is handled above instead, not here. */}
             <div key={currentFlatIndex} className="w-full h-full flex items-center justify-center" style={transitionAnimationStyle(flatSlides[currentFlatIndex]?.transition)}>
-            {!loading && !error && resolved?.fileType === 'pdf' && (
-              <div className="w-full h-full flex items-center justify-center overflow-auto bg-white">
-                <Document
-                  file={resolved.blobUrl}
-                  loading={<div className="p-12 text-black">Loading PDF...</div>}
-                  onLoadSuccess={onPdfLoadSuccess}
-                  onLoadError={(err) => setError(`PDF error: ${err.message}`)}
-                >
-                  <Page
-                    pageNumber={currentPage}
-                    renderTextLayer={false}
-                    renderAnnotationLayer={false}
-                    height={window.innerHeight * 0.85}
-                  />
-                </Document>
-              </div>
-            )}
+            {!loading && !error && resolved?.fileType === 'pdf' && (() => {
+              // Render switch. If pptxParse extracted real shapes for this
+              // slide, draw it ourselves so its bullet builds can animate
+              // under this app's control - that's what makes Next/Prev and
+              // the phone remote able to reveal one bullet at a time.
+              // Without render data (plain PDFs, or a pptx imported before
+              // extraction existed) this falls back to the flat PDF page,
+              // exactly as before.
+              //
+              // The <Document> stays mounted either way, just hidden when
+              // the renderer is in charge: its onLoadSuccess is still what
+              // tells single-file mode how many pages this file has, and
+              // flatSlides - which is where renderData itself comes from -
+              // is built from that number. Unmounting it would deadlock.
+              const renderData = flatSlides[currentFlatIndex]?.renderData;
+              const useRenderer = !!renderData && renderData.shapes.length > 0;
+              return (
+                <div className="w-full h-full flex items-center justify-center overflow-auto bg-white">
+                  <div className={useRenderer ? 'hidden' : 'contents'}>
+                    <Document
+                      file={resolved.blobUrl}
+                      loading={<div className="p-12 text-black">Loading PDF...</div>}
+                      onLoadSuccess={onPdfLoadSuccess}
+                      onLoadError={(err) => setError(`PDF error: ${err.message}`)}
+                    >
+                      <Page
+                        pageNumber={currentPage}
+                        renderTextLayer={false}
+                        renderAnnotationLayer={false}
+                        height={window.innerHeight * 0.85}
+                      />
+                    </Document>
+                  </div>
+                  {useRenderer && (
+                    <SlideRenderer
+                      data={renderData}
+                      buildIndex={buildIndex}
+                      heightPx={window.innerHeight * 0.85}
+                    />
+                  )}
+                </div>
+              );
+            })()}
 
             {!loading && !error && resolved?.fileType === 'image' && (
               <img
@@ -1974,48 +2085,6 @@ export default function Present() {
                 allowFullScreen
               />
             )}
-
-            {!loading && !error && resolved?.fileType === 'google-slides' && (() => {
-              // Google's own live viewer, shown exactly as authored -
-              // transitions/animations/fonts are all real, not an
-              // approximation. The tradeoff: this reloads to the requested
-              // slide rather than smoothly transitioning INTO it, since
-              // Google doesn't expose a live remote-control API for an
-              // already-loaded embed - only "load starting at slide N."
-              // Landing on the right slide, fully built, is exact either
-              // way; the transition animation between consecutive slides
-              // specifically only plays if advancing by clicking inside
-              // the iframe directly on the host machine, not via the
-              // phone remote.
-              // Because of that, the embed grabs the keyboard as soon as it
-              // loads (see onLoad below): Google's player is the only thing
-              // that can run this deck's build animations, and it only runs
-              // them for arrow keys it receives itself. Focusing it here is
-              // what used to require clicking the slide first.
-              const realSlideId = resolved.slideIds[currentPage - 1];
-              // Safety net: real IDs come from google_slides_decks.slide_ids,
-              // populated at import time via the Slides API. If this deck
-              // was imported before that existed (or the import failed),
-              // this guesses "pN" - which only matches Google's real slide
-              // ID if that slide was never reordered/duplicated/inserted.
-              // Re-import the deck if you see this warning.
-              if (!realSlideId) console.warn(`[gslides-nav] no stored slide id for page ${currentPage} - guessing "p${currentPage}", which may not match this deck's real slide id`);
-              const slideIdToUse = realSlideId || `p${currentPage}`;
-              return (
-                <iframe
-                  key={`gslides-${currentFlatIndex}`}
-                  ref={gslidesIframeRef}
-                  src={`https://docs.google.com/presentation/d/${resolved.presentationId}/embed?rm=minimal&slide=id.${slideIdToUse}`}
-                  title={resolved.name || 'Google Slides'}
-                  className="w-full h-full border-0 bg-white"
-                  allow="fullscreen"
-                  allowFullScreen
-                  onLoad={() => {
-                    try { gslidesIframeRef.current?.contentWindow?.focus(); } catch { /* cross-origin refusal - user can still click the slide */ }
-                  }}
-                />
-              );
-            })()}
 
             {!loading && !error && resolved?.fileType === 'other' && (
               <div className="flex flex-col items-center gap-4 text-center px-6">
