@@ -75,7 +75,7 @@ type ResolvedSlide =
   | { fileType: 'pdf'; blobUrl: string; name?: string }
   | { fileType: 'image'; blobUrl: string; name?: string }
   | { fileType: 'video-link'; embedUrl: string; platform?: string; name?: string }
-  | { fileType: 'google-slides'; presentationId: string; slideCount: number; notesByPage: Record<number, string>; name?: string }
+  | { fileType: 'google-slides'; presentationId: string; slideCount: number; notesByPage: Record<number, string>; slideIds: string[]; name?: string }
   | { fileType: 'other'; blobUrl: string; name?: string };
 
 // One entry per *visible slide*, not per lesson item. A 5-page PDF item
@@ -248,7 +248,7 @@ function normalizeResponse(json: any, nameHint?: string): ResolvedSlide {
   }
 
   if (json.fileType === 'google-slides') {
-    return { fileType: 'google-slides', presentationId: json.presentationId, slideCount: json.slideCount, notesByPage: json.notesByPage || {}, name: nameHint || json.name };
+    return { fileType: 'google-slides', presentationId: json.presentationId, slideCount: json.slideCount, notesByPage: json.notesByPage || {}, slideIds: json.slideIds || [], name: nameHint || json.name };
   }
 
   if (json.data && json.mimeType) {
@@ -1971,7 +1971,7 @@ export default function Present() {
               // phone remote.
               <iframe
                 key={`gslides-${currentFlatIndex}`}
-                src={`https://docs.google.com/presentation/d/${resolved.presentationId}/embed?rm=minimal&slide=id.p${currentPage}`}
+                src={`https://docs.google.com/presentation/d/${resolved.presentationId}/embed?rm=minimal&slide=id.${resolved.slideIds[currentPage - 1] || `p${currentPage}`}`}
                 title={resolved.name || 'Google Slides'}
                 className="w-full h-full border-0 bg-white"
                 allow="fullscreen"
