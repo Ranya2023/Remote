@@ -1588,7 +1588,16 @@ export default function Present() {
             // pdf.js-style async page-discovery needed), so this expands
             // in one pass.
             for (let p = 1; p <= entry.slideCount; p++) {
-              result.push({ itemIndex: i, pageInItem: p, fileType: 'google-slides', name: ref.name, notes: entry.notesByPage[p] });
+              // Google's embed has no live remote-control API, so advancing
+              // via the phone (or the on-screen Next button) has to reload
+              // the iframe to the target slide id - a hard cut with no
+              // animation, unlike clicking/arrow-keying inside the iframe
+              // itself (which Google animates natively). Giving every
+              // google-slides flat slide a default fade transition means
+              // that hard cut at least crossfades in via the same
+              // transitionAnimationStyle wrapper the pdf/pptx path already
+              // uses, instead of popping instantly.
+              result.push({ itemIndex: i, pageInItem: p, fileType: 'google-slides', name: ref.name, notes: entry.notesByPage[p], transition: { kind: 'fade', durationMs: 400 } });
             }
           } else {
             const thumbnail = entry.fileType === 'image' ? await renderImageThumbnail(entry.blobUrl) : undefined;
@@ -1629,7 +1638,12 @@ export default function Present() {
       } else if (resolved.fileType === 'google-slides') {
         const slides: FlatSlide[] = [];
         for (let p = 1; p <= resolved.slideCount; p++) {
-          slides.push({ itemIndex: 0, pageInItem: p, fileType: 'google-slides', notes: resolved.notesByPage[p] });
+          // See the matching comment in the lesson-mode branch above: this
+          // fallback fade is what makes remote/on-screen-button navigation
+          // crossfade instead of hard-cutting, since Google's embed can
+          // only be driven with real animation by interacting with it
+          // directly.
+          slides.push({ itemIndex: 0, pageInItem: p, fileType: 'google-slides', notes: resolved.notesByPage[p], transition: { kind: 'fade', durationMs: 400 } });
         }
         if (!cancelled) setFlatSlides(slides);
       } else if (resolved.fileType === 'image') {
