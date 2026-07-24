@@ -2054,6 +2054,38 @@ export default function Present() {
             />
           )}
 
+          {/* Floating Prev/Next arrow buttons, overlaid directly on the
+              slide. They call the exact same goPrev/goNext used by the
+              ArrowLeft/ArrowRight keyboard shortcuts above, so clicking
+              behaves identically (build-step-then-advance, landing fully
+              built when stepping back, etc). Shown in every mode, including
+              fullscreen/focus mode, since the keyboard shortcuts also work
+              in every mode - this just gives the same control as a clickable
+              on-screen option. z-40 keeps them under the black/white screen
+              (z-50) so they hide along with the slide during a blackout. */}
+          {flatSlides.length > 1 && !loading && !error && (
+            <>
+              {!isFirstSlide && (
+                <button
+                  onClick={goPrev}
+                  aria-label="Previous slide"
+                  className="absolute left-4 top-1/2 -translate-y-1/2 z-40 w-12 h-12 flex items-center justify-center rounded-full bg-black/40 hover:bg-black/70 text-white text-3xl font-bold leading-none transition-colors"
+                >
+                  ‹
+                </button>
+              )}
+              {!isLastSlide && (
+                <button
+                  onClick={goNext}
+                  aria-label="Next slide"
+                  className="absolute right-4 top-1/2 -translate-y-1/2 z-40 w-12 h-12 flex items-center justify-center rounded-full bg-black/40 hover:bg-black/70 text-white text-3xl font-bold leading-none transition-colors"
+                >
+                  ›
+                </button>
+              )}
+            </>
+          )}
+
           {/* Black/White screen - fully covers the stage, topmost layer. */}
           {screenMode !== 'normal' && (
             <div className={`absolute inset-0 z-50 ${screenMode === 'black' ? 'bg-black' : 'bg-white'}`} />
