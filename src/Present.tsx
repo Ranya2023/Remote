@@ -1196,6 +1196,7 @@ export default function Present() {
         else if (action === 'reset') resetQuiz();
         else if (action === 'save_quiz' && Array.isArray(questions) && payload.payload?.title) saveQuiz(payload.payload.title, questions);
         else if (action === 'delete_saved' && payload.payload?.id) deleteSavedQuiz(payload.payload.id);
+        else if (action === 'refresh_saved') refreshSavedQuizzes();
       });
 
       // Discussion-type question activity: post an idea, comment on one,

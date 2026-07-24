@@ -1295,7 +1295,7 @@ export default function MobileRemote() {
         </div>
         <div className="flex items-center gap-3">
           <button onClick={() => setLang(lang === 'ku' ? 'en' : 'ku')} className="bg-gray-800 px-3 py-1 rounded text-sm font-bold">{t.switchLang}</button>
-          <button onClick={() => setQuizPanelOpen(true)} className="bg-gray-800 w-8 h-8 rounded flex items-center justify-center text-base shrink-0 relative">
+          <button onClick={() => { setQuizPanelOpen(true); sendQuizControl('refresh_saved'); }} className="bg-gray-800 w-8 h-8 rounded flex items-center justify-center text-base shrink-0 relative">
             🧠
             {quiz.status !== 'building' && quiz.status !== 'finished' && <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-red-500 animate-pulse" />}
           </button>
