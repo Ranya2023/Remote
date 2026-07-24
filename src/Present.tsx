@@ -112,60 +112,6 @@ const DEFAULT_ZOOM: ZoomState = { scale: 1, x: 0, y: 0 };
 const DEFAULT_VIDEO_STATE: VideoState = { playing: false, time: 0, duration: 0, volume: 100 };
 const DEFAULT_SESSION_STATE: SessionState = { screenMode: 'normal', zoom: DEFAULT_ZOOM, videoState: DEFAULT_VIDEO_STATE };
 
-// --- Remote mouse + remote keyboard ----------------------------------------
-// Virtual cursor driven from the phone (`remote_cursor` / `remote_click`).
-// x/y are 0..1 fractions of the *viewport*, not of the slide stage, so the
-// phone's trackpad maps 1:1 onto the whole projector screen and can reach
-// the toolbar/sidebar too, not just the slide itself.
-interface RemoteCursorState { x: number; y: number; active: boolean; }
-const DEFAULT_REMOTE_CURSOR: RemoteCursorState = { x: 0.5, y: 0.5, active: false };
-
-// IMPORTANT / please read before filing a bug about this:
-// A web page is sandboxed by the browser and physically cannot move the
-// operating system's mouse pointer or inject OS-level keystrokes - there is
-// no such API, in any browser, by design. What the two helpers below do
-// instead is dispatch *real* DOM events into this page. For anything inside
-// the presentation tab that is genuinely identical to a physical key press /
-// click: the very same listeners fire, through the very same code path.
-// What it cannot do is reach outside this browser tab (the desktop,
-// PowerPoint.exe, another Chrome tab) or into a cross-origin iframe such as
-// the Google Slides embed, which the browser walls off from us.
-
-// Fires a real KeyboardEvent at the page, exactly as if the key had been
-// pressed on the projector computer's own keyboard. Present.tsx's arrow-key
-// handler is bound to `window`, so this reaches it verbatim.
-// Dispatched at document.activeElement (falling back to body) so the event
-// bubbles up through the normal target->window path a physical press takes,
-// rather than materialising at window out of nowhere.
-function dispatchRealKey(key: string, code: string, keyCode: number) {
-  const target: EventTarget = document.activeElement || document.body;
-  const init: KeyboardEventInit = {
-    key, code, keyCode, which: keyCode,
-    bubbles: true, cancelable: true, composed: true, view: window,
-  } as KeyboardEventInit;
-  target.dispatchEvent(new KeyboardEvent('keydown', init));
-  target.dispatchEvent(new KeyboardEvent('keyup', init));
-}
-
-// Performs a real click at a viewport point: finds whatever element is
-// actually under the virtual cursor and sends it the full pointer/mouse
-// event sequence a physical click produces. React's delegated listeners at
-// the root pick this up like any other click, so onClick handlers, links,
-// buttons and video controls all respond normally.
-function dispatchRealClick(clientX: number, clientY: number) {
-  const el = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
-  if (!el) return;
-  const base = { bubbles: true, cancelable: true, composed: true, view: window, clientX, clientY, button: 0, buttons: 1 };
-  // Focus first - matches what a real click does, and makes clicked inputs
-  // and the Google Slides embed actually take the keyboard afterwards.
-  try { el.focus({ preventScroll: true }); } catch { /* not focusable, fine */ }
-  el.dispatchEvent(new PointerEvent('pointerdown', { ...base, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
-  el.dispatchEvent(new MouseEvent('mousedown', base));
-  el.dispatchEvent(new PointerEvent('pointerup', { ...base, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
-  el.dispatchEvent(new MouseEvent('mouseup', { ...base, buttons: 0 }));
-  el.dispatchEvent(new MouseEvent('click', { ...base, buttons: 0, detail: 1 }));
-}
-
 // --- Audience-facing live quiz ---------------------------------------------
 // These shapes must stay in sync with AudienceJoin.tsx (voting/answer UI,
 // leaderboard, Q&A, reactions) and MobileRemote.tsx (phone-side quiz
@@ -244,6 +190,51 @@ interface QuizState {
 }
 const DEFAULT_QUIZ_STATE: QuizState = { questions: [], currentIndex: -1, status: 'building', questionStartedAt: null, participants: {}, spotlightParticipantId: null, discussions: {} };
 interface SavedQuiz { id: string; title: string; questions: QuizQuestion[]; createdAt: number; }
+
+// Saved quizzes are also mirrored into the presenter's account (saved_items,
+// kind: 'quiz' - see recordSavedItem in saveQuiz below) whenever the
+// presenter is logged in. Reading them back here means "my saved quizzes"
+// show up on ANY lesson this presenter opens - not just the exact fileId
+// they were saved from. That matters because re-uploading the same PPTX for
+// a new class period mints a brand new Drive fileId every time, and the
+// fileId-scoped saved_quizzes_by_file table has no way to recognize that as
+// "the same lesson" the quiz was originally saved under.
+async function fetchAccountSavedQuizzes(): Promise<SavedQuiz[]> {
+  try {
+    const { data: userData } = await supabase.auth.getUser();
+    const user = userData.user;
+    if (!user) return [];
+    const { data, error } = await supabase
+      .from('saved_items')
+      .select('id, title, questions, created_at')
+      .eq('user_id', user.id)
+      .eq('kind', 'quiz')
+      .order('created_at', { ascending: false });
+    if (error || !data) return [];
+    return data
+      .filter((item: any) => Array.isArray(item.questions) && item.questions.length)
+      .map((item: any) => ({
+        id: item.id as string,
+        title: item.title as string,
+        questions: item.questions as QuizQuestion[],
+        createdAt: item.created_at ? new Date(item.created_at).getTime() : Date.now(),
+      }));
+  } catch {
+    return [];
+  }
+}
+
+// 20 minutes - discussion questions need much longer than a quick MCQ/short-
+// answer timer (previously capped at 60s for every question type). Kept as
+// a constant since both this file's builder and MobileRemote.tsx's need the
+// exact same cap.
+const DISCUSSION_MAX_TIME_SECONDS = 1200;
+function formatQuizTimeLimit(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return s ? `${m}m ${s}s` : `${m}m`;
+}
 
 // A palette of visually-distinct colors for the free-text answer cards, so
 // each participant's card is easy to tell apart at a glance. Deterministic
@@ -538,15 +529,6 @@ export default function Present() {
     return () => clearTimeout(id);
   }, [timerAlert]);
   const [laser, setLaser] = useState({ x: 0.5, y: 0.5, active: false, size: 16, color: '#ef4444' });
-  // Virtual mouse driven from the phone. `clickFlash` is just the visual
-  // ping that confirms a click landed; it clears itself after ~300ms.
-  const [remoteCursor, setRemoteCursor] = useState<RemoteCursorState>(DEFAULT_REMOTE_CURSOR);
-  const [clickFlash, setClickFlash] = useState<{ x: number; y: number; key: number } | null>(null);
-  useEffect(() => {
-    if (!clickFlash) return;
-    const id = setTimeout(() => setClickFlash((cur) => (cur?.key === clickFlash.key ? null : cur)), 320);
-    return () => clearTimeout(id);
-  }, [clickFlash]);
   const [videoState, setVideoState] = useState<VideoState>(DEFAULT_VIDEO_STATE);
 
   const presentCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -775,6 +757,14 @@ export default function Present() {
         if (error) console.warn('saved_quizzes_by_file delete-sync skipped:', error.message);
       });
     }
+    // Account-level saves (see fetchAccountSavedQuizzes) use saved_items'
+    // own id format (si_...) rather than the sv_... ids minted above - clean
+    // those up there too, or they'd just reappear on next load.
+    if (id.startsWith('si_')) {
+      supabase.from('saved_items').delete().eq('id', id).then(({ error }) => {
+        if (error) console.warn('saved_items delete-sync skipped:', error.message);
+      });
+    }
   }, [persistAudienceState, fileId]);
 
   // Auto-reveal when the countdown for the current question runs out -
@@ -986,22 +976,30 @@ export default function Present() {
         }
       }
 
-      // savedQuizzes specifically also gets hydrated from a fileId-keyed
-      // table, on top of whatever the session row above had - see the
-      // comment on saveQuiz for why: the session row above is only
-      // reliably the same across opens on the exact same device/browser,
-      // but a saved quiz should show up no matter which device opens this
-      // lesson's link.
+      // savedQuizzes gets hydrated from two places on top of whatever the
+      // session row above had:
+      //  - a fileId-keyed table (saved_quizzes_by_file), so a saved quiz
+      //    shows up no matter which device opens THIS SAME lesson link -
+      //    see the comment on saveQuiz for why fileId (not sessionId) is
+      //    the key there.
+      //  - the presenter's account (fetchAccountSavedQuizzes above), so a
+      //    saved quiz shows up on ANY lesson, even one re-uploaded under a
+      //    brand new fileId.
+      // Merged (deduped by title) and written back with persistAudienceState
+      // - not just set locally - so the phone remote (which reads this same
+      // session row on its own mount) reliably sees the full list too,
+      // instead of only picking it up once something else happens to call
+      // persistAudienceState later.
       if (fileId) {
-        const { data: savedQuizRow } = await supabase
-          .from('saved_quizzes_by_file')
-          .select('quizzes')
-          .eq('file_id', fileId)
-          .maybeSingle();
-        if (savedQuizRow?.quizzes?.length) {
-          const merged = { ...audienceStateRef.current, savedQuizzes: savedQuizRow.quizzes as SavedQuiz[] };
-          audienceStateRef.current = merged;
-          setAudienceState(merged);
+        const [{ data: savedQuizRow }, accountQuizzes] = await Promise.all([
+          supabase.from('saved_quizzes_by_file').select('quizzes').eq('file_id', fileId).maybeSingle(),
+          fetchAccountSavedQuizzes(),
+        ]);
+        const fileScoped = (savedQuizRow?.quizzes as SavedQuiz[] | undefined) || [];
+        const seenTitles = new Set(fileScoped.map((q) => q.title.trim().toLowerCase()));
+        const merged = [...fileScoped, ...accountQuizzes.filter((q) => !seenTitles.has(q.title.trim().toLowerCase()))];
+        if (merged.length) {
+          persistAudienceState({ ...audienceStateRef.current, savedQuizzes: merged });
         }
       }
     };
@@ -1047,41 +1045,6 @@ export default function Present() {
         if (typeof x === 'number' && typeof y === 'number') {
           setLaser((prev) => ({ x, y, active: !!active, size: size ?? prev.size, color: color ?? prev.color }));
         }
-      });
-
-      // --- Remote mouse: position updates from the phone's trackpad. ------
-      // Purely visual; nothing is clicked until `remote_click` arrives.
-      channel.on('broadcast', { event: 'remote_cursor' }, (payload) => {
-        const { x, y, active } = payload.payload || {};
-        if (typeof x !== 'number' || typeof y !== 'number') return;
-        setRemoteCursor({ x, y, active: active !== false });
-      });
-
-      // --- Remote mouse: the actual click. --------------------------------
-      // Uses the coordinates carried in the payload rather than the cursor
-      // state, so a tap always lands exactly where the phone last drew the
-      // cursor even if a position update is still in flight.
-      channel.on('broadcast', { event: 'remote_click' }, (payload) => {
-        const { x, y } = payload.payload || {};
-        if (typeof x !== 'number' || typeof y !== 'number') return;
-        const clientX = x * window.innerWidth;
-        const clientY = y * window.innerHeight;
-        setRemoteCursor({ x, y, active: true });
-        setClickFlash({ x, y, key: Date.now() });
-        dispatchRealClick(clientX, clientY);
-      });
-
-      // --- Remote keyboard: real arrow-key presses on this machine. -------
-      // The phone's ‹ / › buttons send this. Deliberately NOT wired to
-      // goNext/goPrev directly: dispatching the key event means the remote
-      // buttons and the projector's own keyboard run identical code, so the
-      // two can never drift apart.
-      channel.on('broadcast', { event: 'remote_key' }, (payload) => {
-        const key = payload.payload?.key;
-        if (key === 'ArrowRight') dispatchRealKey('ArrowRight', 'ArrowRight', 39);
-        else if (key === 'ArrowLeft') dispatchRealKey('ArrowLeft', 'ArrowLeft', 37);
-        else if (key === 'ArrowUp') dispatchRealKey('ArrowUp', 'ArrowUp', 38);
-        else if (key === 'ArrowDown') dispatchRealKey('ArrowDown', 'ArrowDown', 40);
       });
 
       channel.on('broadcast', { event: 'spotlight_move' }, (payload) => {
@@ -2236,42 +2199,6 @@ export default function Present() {
           fullscreenTargetRef (see the comment above) so it stays visible
           while the presenter is in real full screen. */}
       <ProjectorTimer state={projectorTimer} alert={timerAlert} />
-
-      {/* Virtual mouse pointer driven from the phone. Sits inside
-          fullscreenTargetRef so it survives real full screen, above every
-          other layer, and is strictly pointer-events-none - if it ever
-          captured events it would sit under itself and
-          document.elementFromPoint would only ever find this arrow instead
-          of the thing being clicked. */}
-      {remoteCursor.active && (
-        <div
-          className="fixed z-[400] pointer-events-none"
-          style={{
-            left: `${remoteCursor.x * 100}%`,
-            top: `${remoteCursor.y * 100}%`,
-            transform: 'translate(-2px, -2px)',
-            transition: 'left 0.05s linear, top 0.05s linear',
-          }}
-        >
-          <svg width="26" height="26" viewBox="0 0 24 24" style={{ filter: 'drop-shadow(0 2px 3px rgba(0,0,0,0.6))' }}>
-            <path d="M5 2 L5 20 L10 15.5 L13 22 L16 20.5 L13 14.5 L19.5 14.5 Z" fill="#ffffff" stroke="#111827" strokeWidth="1.5" strokeLinejoin="round" />
-          </svg>
-        </div>
-      )}
-      {clickFlash && (
-        <div
-          key={clickFlash.key}
-          className="fixed z-[399] pointer-events-none rounded-full border-2 border-sky-400"
-          style={{
-            left: `${clickFlash.x * 100}%`,
-            top: `${clickFlash.y * 100}%`,
-            width: 34, height: 34,
-            marginLeft: -17, marginTop: -17,
-            animation: 'remote-click-ping 0.32s ease-out forwards',
-          }}
-        />
-      )}
-      <style>{`@keyframes remote-click-ping { 0% { transform: scale(0.3); opacity: 1; } 100% { transform: scale(1.5); opacity: 0; } }`}</style>
       </div>
 
       {/* Off-screen (not visually visible, but fully rendered so html2canvas
@@ -2362,7 +2289,15 @@ export default function Present() {
                     {(['mcq', 'short', 'long', 'discussion'] as QuizQuestionType[]).map((t) => (
                       <button
                         key={t}
-                        onClick={() => setQType(t)}
+                        onClick={() => {
+                          setQType(t);
+                          // Discussions need much longer than a quick MCQ timer -
+                          // jump to a sensible 5-minute default rather than
+                          // leaving a stale 20s value; and back down again if
+                          // leaving discussion with a now out-of-range value.
+                          if (t === 'discussion' && qTimeLimit < 30) setQTimeLimit(300);
+                          else if (t !== 'discussion' && qTimeLimit > 60) setQTimeLimit(20);
+                        }}
                         className={`flex-1 rounded-lg py-1.5 text-[11px] font-bold ${qType === t ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400'}`}
                       >
                         {t === 'mcq' ? 'Multiple choice' : t === 'short' ? 'Short answer' : t === 'long' ? 'Long answer' : 'Discussion'}
@@ -2424,8 +2359,16 @@ export default function Present() {
 
                   <div className="flex items-center gap-2">
                     <span className="text-xs text-gray-400">⏱ Time limit</span>
-                    <input type="range" min={5} max={60} step={5} value={qTimeLimit} onChange={(e) => setQTimeLimit(Number(e.target.value))} className="flex-1" />
-                    <span className="text-xs font-mono w-10 text-right">{qTimeLimit}s</span>
+                    <input
+                      type="range"
+                      min={qType === 'discussion' ? 30 : 5}
+                      max={qType === 'discussion' ? DISCUSSION_MAX_TIME_SECONDS : 60}
+                      step={qType === 'discussion' ? 30 : 5}
+                      value={qTimeLimit}
+                      onChange={(e) => setQTimeLimit(Number(e.target.value))}
+                      className="flex-1"
+                    />
+                    <span className="text-xs font-mono w-14 text-right">{formatQuizTimeLimit(qTimeLimit)}</span>
                   </div>
 
                   <button

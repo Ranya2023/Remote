@@ -24,8 +24,6 @@ const texts = {
     nextQ: 'دواتر', revealNow: 'دەرخستنی ئێستا', newQuiz: 'کویزی نوێ', question: 'پرسیار',
     correctMark: 'کرتە لەسەر بازنە بکە بۆ دیاریکردنی وەڵامی ڕاست', timeLimit: 'کاتی پرسیار',
     inProgress: 'کویز لە جێبەجێکردندایە', participants: 'بەشداربووان', downloadResults: 'داگرتنی ئەنجامەکان',
-    mouse: 'ماوس', click: 'کرتە', keyboardKeys: 'کلیلی کیبۆرد',
-    mouseHint: 'پەنجەت بجوڵێنە بۆ جوڵاندنی ئاماژەکەر، کرتەیەکی خێرا بکە بۆ کلیک',
   },
   en: {
     session: 'Session', slide: 'Slide', next: 'NEXT', prev: 'PREV', controller: 'Controller Area', laser: 'Laser',
@@ -43,8 +41,6 @@ const texts = {
     nextQ: 'Next', revealNow: 'Reveal now', newQuiz: 'New quiz', question: 'Question',
     correctMark: 'Tap the circle to mark the correct answer', timeLimit: 'Time limit',
     inProgress: 'Quiz in progress', participants: 'participants', downloadResults: 'Download results',
-    mouse: 'Mouse', click: 'CLICK', keyboardKeys: 'Keyboard keys',
-    mouseHint: 'Drag to move the pointer, quick tap to click',
   },
 };
 
@@ -85,9 +81,20 @@ const PRESET_COLORS = ['#eab308', '#ef4444', '#3b82f6', '#22c55e', '#f97316', '#
 // stroke shape matters — but it still needs a width.
 const STROKE_WIDTHS: Record<DrawMode, number> = { draw: 4, highlight: 22, erase: 28 };
 
-type ToolMode = 'none' | 'laser' | DrawMode | 'spotlight' | 'zoom' | 'mouse';
+type ToolMode = 'none' | 'laser' | DrawMode | 'spotlight' | 'zoom';
 
 const TYPE_ICON: Record<string, string> = { pdf: '📄', image: '🖼️', 'video-link': '▶️', other: '📁' };
+
+// 20 minutes - discussion questions need much longer than a quick MCQ/short-
+// answer timer (previously capped at 60s for every question type, same as
+// Present.tsx). Kept in sync with the matching constant there.
+const DISCUSSION_MAX_TIME_SECONDS = 1200;
+function formatQuizTimeLimit(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return s ? `${m}m ${s}s` : `${m}m`;
+}
 
 // --- Quiz types - MUST stay byte-for-byte in sync with Present.tsx /
 // AudienceJoin.tsx, since this is all one JSON shape round-tripping
@@ -296,13 +303,6 @@ export default function MobileRemote() {
   // Local laser preview — mirrors what gets broadcast, so the phone shows
   // the exact same dot (position + on/off) as the projector.
   const [myLaser, setMyLaser] = useState({ x: 0.5, y: 0.5, active: false });
-  // Local preview of the virtual mouse pointer, same idea as myLaser above.
-  // Stays put between drags (a mouse doesn't vanish when you lift your
-  // finger off a trackpad), so the CLICK button always has a known target.
-  const [myCursor, setMyCursor] = useState({ x: 0.5, y: 0.5, active: false });
-  // Tap-vs-drag detection for mouse mode: a touch that neither moves far nor
-  // lasts long is a click, anything else is just a pointer move.
-  const cursorTap = useRef<{ x: number; y: number; t: number; moved: boolean } | null>(null);
   const zoomDrag = useRef<{ lastX: number; lastY: number } | null>(null);
   // Two-finger pinch-to-zoom on the trackpad - independent of activeMode
   // (works no matter what tool is selected, same as it would on a native
@@ -926,25 +926,6 @@ export default function MobileRemote() {
     });
   };
 
-  // --- Remote mouse click ---------------------------------------------------
-  // Fires a real click on the projector at the pointer's current spot. See
-  // the long comment above dispatchRealClick in Present.tsx for exactly what
-  // "real" does and doesn't cover.
-  const sendRemoteClick = (x: number, y: number) => {
-    if (!ready || !channelRef.current) return;
-    channelRef.current.send({ type: 'broadcast', event: 'remote_click', payload: { x, y } });
-  };
-
-  // --- Remote keyboard ------------------------------------------------------
-  // The ‹ / › keycap buttons. Sends the key itself rather than a "next
-  // slide" command on purpose: Present.tsx turns this back into a genuine
-  // KeyboardEvent, so these buttons and the projector's own arrow keys go
-  // through one single code path and can never behave differently.
-  const sendRemoteKey = (key: 'ArrowLeft' | 'ArrowRight') => {
-    if (!ready || !channelRef.current) return;
-    channelRef.current.send({ type: 'broadcast', event: 'remote_key', payload: { key } });
-  };
-
   const sendPointerData = (e: React.TouchEvent | React.MouseEvent, type: 'start' | 'move' | 'end') => {
     if (!ready || !channelRef.current || activeMode === 'none' || !trackpadRef.current) return;
 
@@ -958,38 +939,6 @@ export default function MobileRemote() {
 
     const x = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
     const y = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
-
-    if (activeMode === 'mouse') {
-      // Absolute mapping: the trackpad's full area corresponds to the whole
-      // projector screen, so lifting and re-touching jumps straight there
-      // rather than nudging relatively like a laptop trackpad. That's the
-      // behaviour you want when aiming at something you can see.
-      const now = Date.now();
-      if (type === 'start') {
-        cursorTap.current = { x: clientX, y: clientY, t: now, moved: false };
-        setMyCursor({ x, y, active: true });
-        channelRef.current.send({ type: 'broadcast', event: 'remote_cursor', payload: { x, y, active: true } });
-        return;
-      }
-      if (type === 'move') {
-        const start = cursorTap.current;
-        // 8px of slop, so the tiny wobble of a finger landing on glass
-        // doesn't disqualify an intended tap.
-        if (start && Math.hypot(clientX - start.x, clientY - start.y) > 8) start.moved = true;
-        if (now - lastSentTime.current < 16) return;
-        lastSentTime.current = now;
-        setMyCursor({ x, y, active: true });
-        channelRef.current.send({ type: 'broadcast', event: 'remote_cursor', payload: { x, y, active: true } });
-        return;
-      }
-      // type === 'end'
-      const start = cursorTap.current;
-      cursorTap.current = null;
-      setMyCursor({ x, y, active: true });
-      channelRef.current.send({ type: 'broadcast', event: 'remote_cursor', payload: { x, y, active: true } });
-      if (start && !start.moved && now - start.t < 400) sendRemoteClick(x, y);
-      return;
-    }
 
     if (activeMode === 'laser') {
       const now = Date.now();
@@ -1110,18 +1059,6 @@ export default function MobileRemote() {
     }
     if (activeMode === 'spotlight' && newMode !== 'spotlight') {
       channelRef.current?.send({ type: 'broadcast', event: 'spotlight_move', payload: { x: 0.5, y: 0.5, active: false, radius: spotlightRadius } });
-    }
-    // Same reasoning as the laser above: leaving mouse mode takes the
-    // pointer off the projector rather than leaving an orphaned arrow
-    // sitting on the slide.
-    if (activeMode === 'mouse' && newMode !== 'mouse') {
-      setMyCursor((prev) => ({ ...prev, active: false }));
-      cursorTap.current = null;
-      channelRef.current?.send({ type: 'broadcast', event: 'remote_cursor', payload: { x: myCursor.x, y: myCursor.y, active: false } });
-    }
-    if (newMode === 'mouse') {
-      setMyCursor((prev) => ({ ...prev, active: true }));
-      channelRef.current?.send({ type: 'broadcast', event: 'remote_cursor', payload: { x: myCursor.x, y: myCursor.y, active: true } });
     }
 
     setActiveMode(newMode as ToolMode);
@@ -1357,8 +1294,13 @@ export default function MobileRemote() {
           >
             {isProjectorFullscreen ? '🗗' : '⛶'}
           </button>
-          <div className="bg-gradient-to-r from-blue-500 to-purple-500 shadow-[0_0_16px_rgba(99,102,241,0.5)] px-3 py-1 rounded-full font-bold" style={{ direction: 'ltr' }}>{t.slide} {currentSlide}{flatSlides.length ? ` / ${flatSlides.length}` : ''}</div>
         </div>
+      </div>
+
+      {/* Slide counter - its own row right below the focus-mode/language
+          toolbar, rather than crammed inline with those buttons. */}
+      <div className="w-full flex justify-center py-1.5 bg-[#12172b] border-b border-[#232a45]">
+        <div className="bg-gradient-to-r from-blue-500 to-purple-500 shadow-[0_0_16px_rgba(99,102,241,0.5)] px-3 py-1 rounded-full font-bold text-sm" style={{ direction: 'ltr' }}>{t.slide} {currentSlide}{flatSlides.length ? ` / ${flatSlides.length}` : ''}</div>
       </div>
 
       {/* Slide thumbnails - one per global slide number, sourced from the
@@ -1416,33 +1358,6 @@ export default function MobileRemote() {
       <div className="p-4 grid grid-cols-2 gap-4">
         <button disabled={!ready} onClick={() => advance(-1)} className={`h-20 rounded-2xl bg-gradient-to-br from-violet-600 to-purple-800 text-white text-xl font-bold shadow-[0_4px_20px_rgba(124,58,237,0.35)] flex items-center justify-center gap-2 ${!ready ? 'opacity-50' : 'active:brightness-90'}`}><span>‹</span> {t.prev}</button>
         <button disabled={!ready} onClick={() => advance(1)} className={`h-20 rounded-2xl bg-gradient-to-br from-blue-500 to-blue-700 text-white text-xl font-bold shadow-[0_4px_20px_rgba(37,99,235,0.4)] flex items-center justify-center gap-2 ${!ready ? 'opacity-50' : 'active:brightness-90'}`}>{t.next} <span>›</span></button>
-      </div>
-
-      {/* Real keyboard arrow keys. Distinct from PREV/NEXT above on purpose:
-          those send a slide_change command, whereas these two make the
-          projector fire an actual ArrowLeft/ArrowRight KeyboardEvent, so
-          whatever that page does for a physical arrow press is exactly what
-          happens here. Styled as keycaps so the difference is obvious.
-          dir="ltr" pins ‹ to the left and › to the right even in Kurdish
-          RTL layout - these mirror physical keys, which don't flip. */}
-      <div dir="ltr" className="px-4 pb-3 flex items-center gap-2">
-        <span className="text-[10px] text-gray-500 font-bold uppercase tracking-wide shrink-0">⌨ {t.keyboardKeys}</span>
-        <button
-          disabled={!ready}
-          onClick={() => sendRemoteKey('ArrowLeft')}
-          aria-label="Left arrow key"
-          className={`flex-1 h-12 rounded-xl bg-[#1b2140] border-b-4 border-[#2c3560] text-white text-2xl font-bold flex items-center justify-center ${!ready ? 'opacity-40' : 'active:border-b-0 active:mt-1 active:brightness-110'}`}
-        >
-          ‹
-        </button>
-        <button
-          disabled={!ready}
-          onClick={() => sendRemoteKey('ArrowRight')}
-          aria-label="Right arrow key"
-          className={`flex-1 h-12 rounded-xl bg-[#1b2140] border-b-4 border-[#2c3560] text-white text-2xl font-bold flex items-center justify-center ${!ready ? 'opacity-40' : 'active:border-b-0 active:mt-1 active:brightness-110'}`}
-        >
-          ›
-        </button>
       </div>
 
       {/* Screen controls: black/white screen restore-to-color, spotlight,
@@ -1518,7 +1433,6 @@ export default function MobileRemote() {
             ['highlight', '🖍️', t.highlight, 'from-emerald-500/20 to-emerald-500/5', 'border-emerald-500', 'shadow-emerald-500/40'],
             ['erase', '🧼', t.erase, 'from-pink-500/20 to-pink-500/5', 'border-pink-500', 'shadow-pink-500/40'],
             ['zoom', '🔍', t.zoom, 'from-teal-400/20 to-teal-400/5', 'border-teal-400', 'shadow-teal-400/40'],
-            ['mouse', '🖱️', t.mouse, 'from-sky-400/20 to-sky-400/5', 'border-sky-400', 'shadow-sky-400/40'],
           ] as const).map(([mode, icon, label, grad, border, glow]) => (
             <button
               key={mode}
@@ -1567,26 +1481,6 @@ export default function MobileRemote() {
                 />
               ))}
             </div>
-          </div>
-        )}
-
-        {/* Mouse mode controls - only shown while mouse mode is active.
-            The trackpad below becomes an absolute pointer surface; the big
-            CLICK button is for when you want to aim carefully first and
-            only then click, instead of relying on tap-to-click. */}
-        {activeMode === 'mouse' && (
-          <div className="flex items-center gap-3 mb-2 bg-gray-900 border border-gray-800 rounded-lg px-3 py-2">
-            <div className="flex flex-col min-w-0 flex-1">
-              <span className="text-xs text-gray-400 font-bold">🖱️ {t.mouse}</span>
-              <span className="text-[10px] text-gray-500 leading-tight">{t.mouseHint}</span>
-            </div>
-            <button
-              disabled={!ready}
-              onClick={() => sendRemoteClick(myCursor.x, myCursor.y)}
-              className="px-5 py-2 rounded-xl bg-gradient-to-br from-sky-500 to-sky-700 text-white text-sm font-bold shadow-[0_3px_14px_rgba(14,165,233,0.4)] active:brightness-90 disabled:opacity-40 shrink-0"
-            >
-              {t.click}
-            </button>
           </div>
         )}
 
@@ -1706,19 +1600,6 @@ export default function MobileRemote() {
               className="absolute pointer-events-none z-40 rounded-full bg-red-500 shadow-[0_0_12px_#ef4444]"
               style={{ width: '14px', height: '14px', left: `${myLaser.x * 100}%`, top: `${myLaser.y * 100}%`, transform: 'translate(-50%, -50%)' }}
             />
-          )}
-
-          {/* Local mirror of the projector's virtual mouse pointer, so you
-              can aim without looking up at the screen. */}
-          {activeMode === 'mouse' && myCursor.active && (
-            <div
-              className="absolute pointer-events-none z-40"
-              style={{ left: `${myCursor.x * 100}%`, top: `${myCursor.y * 100}%`, transform: 'translate(-2px, -2px)' }}
-            >
-              <svg width="24" height="24" viewBox="0 0 24 24" style={{ filter: 'drop-shadow(0 1px 2px rgba(0,0,0,0.5))' }}>
-                <path d="M5 2 L5 20 L10 15.5 L13 22 L16 20.5 L13 14.5 L19.5 14.5 Z" fill="#ffffff" stroke="#0284c7" strokeWidth="1.5" strokeLinejoin="round" />
-              </svg>
-            </div>
           )}
         </div>
       </div>
@@ -1852,13 +1733,21 @@ export default function MobileRemote() {
                 <div className="flex flex-col gap-2.5 border-t border-gray-800 pt-3">
                   <p className="text-xs font-bold text-gray-400 uppercase">{t.addQuestion}</p>
                   <div className="flex gap-1.5">
-                    {(['mcq', 'short', 'long'] as QuizQuestionType[]).map((qt) => (
+                    {(['mcq', 'short', 'long', 'discussion'] as QuizQuestionType[]).map((qt) => (
                       <button
                         key={qt}
-                        onClick={() => setQType(qt)}
+                        onClick={() => {
+                          setQType(qt);
+                          // Discussions need much longer than a quick MCQ timer -
+                          // jump to a sensible 5-minute default rather than
+                          // leaving a stale 20s value; and back down again if
+                          // leaving discussion with a now out-of-range value.
+                          if (qt === 'discussion' && qTimeLimit < 30) setQTimeLimit(300);
+                          else if (qt !== 'discussion' && qTimeLimit > 60) setQTimeLimit(20);
+                        }}
                         className={`flex-1 rounded-lg py-1.5 text-[11px] font-bold ${qType === qt ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400'}`}
                       >
-                        {qt === 'mcq' ? 'MCQ' : qt === 'short' ? 'Short' : 'Long'}
+                        {qt === 'mcq' ? 'MCQ' : qt === 'short' ? 'Short' : qt === 'long' ? 'Long' : 'Discussion'}
                       </button>
                     ))}
                   </div>
@@ -1883,12 +1772,25 @@ export default function MobileRemote() {
                     <button onClick={() => setQOptions((prev) => [...prev, ''])} className="text-xs text-blue-400 self-start">+ Option</button>
                   )}
                   {qType === 'mcq' && <p className="text-[10px] text-gray-500">{t.correctMark}</p>}
-                  {qType !== 'mcq' && <p className="text-[10px] text-gray-500">Everyone types their own answer - shows as a card on the projector once submitted.</p>}
+                  {(qType === 'short' || qType === 'long') && (
+                    <p className="text-[10px] text-gray-500">Everyone types their own answer - shows as a card on the projector once submitted.</p>
+                  )}
+                  {qType === 'discussion' && (
+                    <p className="text-[10px] text-gray-500">A shared wall, not a single answer: everyone can post their own idea, and everyone can comment or react on anyone's idea, live.</p>
+                  )}
                   <input value={qSource} onChange={(e) => setQSource(e.target.value)} placeholder="Source (optional)" className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs" />
                   <div className="flex items-center gap-2">
                     <span className="text-xs text-gray-400">⏱ {t.timeLimit}</span>
-                    <input type="range" min={5} max={60} step={5} value={qTimeLimit} onChange={(e) => setQTimeLimit(Number(e.target.value))} className="flex-1" />
-                    <span className="text-xs font-mono w-10 text-right">{qTimeLimit}s</span>
+                    <input
+                      type="range"
+                      min={qType === 'discussion' ? 30 : 5}
+                      max={qType === 'discussion' ? DISCUSSION_MAX_TIME_SECONDS : 60}
+                      step={qType === 'discussion' ? 30 : 5}
+                      value={qTimeLimit}
+                      onChange={(e) => setQTimeLimit(Number(e.target.value))}
+                      className="flex-1"
+                    />
+                    <span className="text-xs font-mono w-14 text-right">{formatQuizTimeLimit(qTimeLimit)}</span>
                   </div>
                   <button onClick={addDraftQuestion} disabled={!qText.trim() || (qType === 'mcq' && qCorrectIndex === null)} className="bg-gray-700 disabled:opacity-30 rounded-lg py-2 text-sm font-bold">
                     + {t.addQuestion}

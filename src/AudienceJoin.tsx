@@ -833,7 +833,7 @@ function DiscussionWall({ quiz, question, myParticipantId, onPostIdea, onAddComm
                         <span className="text-gray-300 break-words">{c.text}</span>
                       </div>
                     ))}
-                    <div className="flex gap-1.5 mt-1">
+                    <div className="flex flex-col gap-2 mt-2 pt-2 border-t border-white/10">
                       <input
                         value={commentDrafts[idea.id] || ''}
                         onChange={(e) => setCommentDrafts((prev) => ({ ...prev, [idea.id]: e.target.value }))}
@@ -842,7 +842,7 @@ function DiscussionWall({ quiz, question, myParticipantId, onPostIdea, onAddComm
                         autoCorrect="off"
                         autoCapitalize="off"
                         spellCheck={false}
-                        className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-2.5 py-1.5 text-xs"
+                        className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3.5 py-3 text-sm focus:outline-none focus:border-purple-500"
                       />
                       <button
                         onClick={() => {
@@ -852,7 +852,7 @@ function DiscussionWall({ quiz, question, myParticipantId, onPostIdea, onAddComm
                           setCommentDrafts((prev) => ({ ...prev, [idea.id]: '' }));
                         }}
                         disabled={!(commentDrafts[idea.id] || '').trim()}
-                        className="bg-blue-600 disabled:opacity-30 rounded-lg px-3 text-xs font-bold shrink-0"
+                        className="self-end bg-blue-600 disabled:opacity-30 rounded-lg px-4 py-1.5 text-xs font-bold"
                       >
                         Post
                       </button>
