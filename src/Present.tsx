@@ -450,9 +450,14 @@ function withPlaybackParams(embedUrl: string, platform: string | undefined, audi
       return url.toString();
     }
     if (platform === 'google-drive' || platform === 'drive' || url.hostname.includes('drive.google.com')) {
-      // Google Drive's /preview embed doesn't have a documented autoplay
-      // parameter the way YouTube/Vimeo do - nothing reliable to add here.
-      return embedUrl;
+      // Undocumented, and no separate mute param exists here the way it
+      // does for YouTube/Vimeo, so there's no muted-then-unmute trick
+      // available. Only attempt autoplay once a genuine click has landed
+      // on this page (audioUnlocked) - before that, adding autoplay=1
+      // would just get silently blocked with sound anyway, so there's
+      // nothing to gain from trying it early.
+      if (audioUnlocked) url.searchParams.set('autoplay', '1');
+      return url.toString();
     }
     if (platform === 'vimeo' || url.hostname.includes('vimeo.com')) {
       url.searchParams.set('autoplay', '1');
@@ -1546,7 +1551,7 @@ export default function Present() {
       clearTimeout(initial);
       clearInterval(retry);
     };
-  }, [resolved]);
+  }, [resolved, audioUnlocked]);
 
   // Initial load: figure out whether this id is a lesson or a single slide.
   useEffect(() => {
