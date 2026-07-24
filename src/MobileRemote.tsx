@@ -22,6 +22,10 @@ const texts = {
     number: 'ژمارە',
     shape: 'شێوە', shapeCircle: 'بازنە', shapeRect: 'لاکێشە', shapeArrow: 'ئاڕاستە', shapeLine: 'هێڵ',
     shapeHint: 'بۆ دروستکردن؛ دەست بگرە و بیکێشە. بۆ دیاریکردن؛ کرتەی لەسەری بکە.',
+    shapeHintQuick: 'کرتە بکە بۆ دانانی شێوەیەک بە قەبارەی بنەڕەت. بۆ دیاریکردن؛ کرتەی لەسەری بکە.',
+    placementStyle: 'شێوازی دانان', quickStyle: 'خێرا', precisionStyle: 'وردبینانە',
+    shapeOutline: 'بۆشایی', shapeFilled: 'پڕکراوە', shapeWidth: 'ئەستوورییی هێڵ',
+    shapeThin: 'باریک', shapeMedium: 'مامناوەند', shapeThick: 'ئەستوور',
     play: 'لێدان', pause: 'وەستان', mute: 'بێدەنگ', unmute: 'دەنگ', reset: 'ڕێکخستنەوە', video: 'ڤیدیۆ',
     videoLoading: 'چاوەڕوانی ڤیدیۆ...',
     start: 'دەستپێکردن', minutesLabel: 'خولەک', undo: 'گەڕانەوە', first: 'یەکەم', last: 'کۆتایی',
@@ -44,6 +48,10 @@ const texts = {
     number: 'Number',
     shape: 'Shapes', shapeCircle: 'Circle', shapeRect: 'Rectangle', shapeArrow: 'Arrow', shapeLine: 'Line',
     shapeHint: 'Drag to draw. Tap an existing shape to select, move, or resize it.',
+    shapeHintQuick: 'Tap to place a default-sized shape. Tap an existing one to select, move, or resize it.',
+    placementStyle: 'Placement', quickStyle: 'Quick', precisionStyle: 'Precision',
+    shapeOutline: 'Outline', shapeFilled: 'Filled', shapeWidth: 'Width',
+    shapeThin: 'Thin', shapeMedium: 'Medium', shapeThick: 'Thick',
     play: 'Play', pause: 'Pause', mute: 'Mute', unmute: 'Unmute', reset: 'Reset', video: 'Video',
     videoLoading: 'Waiting for video...',
     start: 'Start', minutesLabel: 'min', undo: 'Undo', first: 'First', last: 'Last',
@@ -68,8 +76,15 @@ type AnnotationKind = 'textbox' | 'number' | 'shape';
 type ShapeKind = 'circle' | 'rect' | 'arrow' | 'line';
 // x/y is the primary anchor (textbox/number position, or a shape's first
 // corner/endpoint); x2/y2 is a shape's second corner/endpoint only.
-interface Annotation { id: string; kind: AnnotationKind; x: number; y: number; x2?: number; y2?: number; color: string; text: string; shapeKind?: ShapeKind; }
+interface Annotation { id: string; kind: AnnotationKind; x: number; y: number; x2?: number; y2?: number; color: string; text: string; shapeKind?: ShapeKind; filled?: boolean; strokeWidth?: number; }
 type AnnotationsMap = Record<number, Annotation[]>;
+
+// Ephemeral "about to place this" preview - broadcast live while
+// hold-dragging in Precision mode (see PlacementStyle below), shown on the
+// projector so there's feedback before something is actually committed.
+// Never persisted, unlike Annotation above - purely a live UI cue.
+type PlacementStyle = 'quick' | 'precision';
+interface AnnotationPreview { kind: AnnotationKind; x: number; y: number; x2?: number; y2?: number; color: string; text?: string; shapeKind?: ShapeKind; filled?: boolean; strokeWidth?: number; }
 
 // One entry per visible slide (mirrors the type in Present.tsx). Built and
 // shared by the host - the remote no longer guesses a fixed total.
@@ -402,6 +417,19 @@ export default function MobileRemote() {
   const [shapeDraft, setShapeDraft] = useState<{ x1: number; y1: number; x2: number; y2: number; shapeKind: ShapeKind } | null>(null);
   const [selectedShapeId, setSelectedShapeId] = useState<string | null>(null);
   const shapeHandleDragRef = useRef<{ mode: 'move' | 'resize'; id: string; startX: number; startY: number; orig: { x: number; y: number; x2: number; y2: number } } | null>(null);
+  // ◼ Outline (default, as before) or filled; stroke thickness in SVG units.
+  const [shapeFilled, setShapeFilled] = useState(false);
+  const [shapeStrokeWidth, setShapeStrokeWidth] = useState(0.6);
+
+  // 🎯 Quick vs Precision placement - shared across Number/Textbox/Shapes.
+  // Quick is each tool's original single-tap behavior (default, unchanged).
+  // Precision holds+drags before committing, so you can fine-tune the exact
+  // spot without your fingertip hiding it - see the live preview state
+  // below, offset above the finger on-screen and mirrored to the projector
+  // (via annotation_preview) so there's feedback before anything commits.
+  const [placementStyle, setPlacementStyle] = useState<PlacementStyle>('quick');
+  const [numberPreview, setNumberPreview] = useState<{ x: number; y: number } | null>(null);
+  const [textboxPreview, setTextboxPreview] = useState<{ x: number; y: number } | null>(null);
 
   const activeFlat = flatSlides[currentSlide - 1];
   // How many builds (bullet/shape reveals) the current slide has, so
@@ -1112,61 +1140,91 @@ export default function MobileRemote() {
         }
       }
     } else if (activeMode === 'textbox') {
-      // A tap, not a drag - only the release matters, opening the modal
-      // right where the finger lifted. Tapping an *existing* pin is
-      // handled separately (see its own onClick in the trackpad JSX
-      // below), which stops this from also firing and dropping a new pin
-      // underneath it.
-      if (type === 'end') setTextboxDraft({ x, y, text: '' });
+      // Tapping an *existing* pin is handled separately (see its own
+      // onClick in the trackpad JSX below), which stops this from also
+      // firing and dropping a new pin underneath it.
+      if (placementStyle === 'quick') {
+        // Quick: a tap, not a drag - only the release matters, opening the
+        // modal right where the finger lifted.
+        if (type === 'end') setTextboxDraft({ x, y, text: '' });
+        return;
+      }
+      // Precision: hold to preview where the pin will anchor (offset above
+      // your fingertip on-screen, so it isn't hidden under your own
+      // finger - see the trackpad JSX below), drag to fine-tune, release
+      // to open the same modal as Quick, but at the final held position.
+      if (type === 'start' || type === 'move') {
+        setTextboxPreview({ x, y });
+        sendAnnotationPreview({ kind: 'textbox', x, y, color: selectedColor });
+        return;
+      }
+      setTextboxPreview(null);
+      sendAnnotationPreview(null);
+      setTextboxDraft({ x, y, text: '' });
     } else if (activeMode === 'number') {
-      // No modal needed - a tap immediately drops the next badge, numbered
-      // and colored from how many number badges are already on this slide.
       // Tapping an existing badge to remove it is handled by its own
       // onClick in the trackpad JSX below (same stopPropagation trick as
       // textbox pins).
-      if (type !== 'end') return;
-      const slideNum = currentSlideRef.current;
-      const existingCount = (annotationsRef.current[slideNum] || []).filter((a) => a.kind === 'number').length;
-      const annotation: Annotation = {
-        id: `ann_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
-        kind: 'number', x, y, color: NUMBER_COLORS[existingCount % NUMBER_COLORS.length], text: String(existingCount + 1),
-      };
-      const nextMap = { ...annotationsRef.current, [slideNum]: [...(annotationsRef.current[slideNum] || []), annotation] };
-      annotationsRef.current = nextMap;
-      setAnnotations(nextMap);
-      channelRef.current.send({ type: 'broadcast', event: 'annotation_add', payload: { annotation } });
+      if (placementStyle === 'quick') {
+        // Quick: a tap immediately drops the next badge - no hold needed.
+        if (type === 'end') placeNumberAt(x, y);
+        return;
+      }
+      // Precision: hold to preview (offset above your fingertip, same idea
+      // as textbox above), drag to fine-tune, release to commit.
+      if (type === 'start' || type === 'move') {
+        setNumberPreview({ x, y });
+        const slideNum = currentSlideRef.current;
+        const existingCount = (annotationsRef.current[slideNum] || []).filter((a) => a.kind === 'number').length;
+        sendAnnotationPreview({ kind: 'number', x, y, color: NUMBER_COLORS[existingCount % NUMBER_COLORS.length], text: String(existingCount + 1) });
+        return;
+      }
+      setNumberPreview(null);
+      sendAnnotationPreview(null);
+      placeNumberAt(x, y);
     } else if (activeMode === 'shape') {
       // Selecting/moving/resizing an EXISTING shape is handled entirely by
       // its own hit-area and handle elements in the trackpad JSX below
-      // (with stopPropagation, so it never reaches here). This branch only
-      // ever does two things: drag-to-draw a brand NEW shape on empty
-      // space, or - if something is currently selected - treat a tap on
-      // empty space as "deselect" rather than immediately starting a new
-      // shape underneath it (a second, deliberate drag starts the new one).
+      // (with stopPropagation, so it never reaches here).
+      if (placementStyle === 'quick') {
+        // Quick: a single tap drops a fixed-size shape centered on the tap
+        // point - no drag needed. Still respects "tap on empty space
+        // deselects" for consistency with Precision below - shapeDragRef
+        // doubles as a simple "this gesture is a legitimate placement, not
+        // a deselect" flag here, since selectedShapeId itself may already
+        // have cleared (re-rendered) by the time 'end' fires.
+        if (type === 'start') {
+          if (selectedShapeId) { setSelectedShapeId(null); shapeDragRef.current = null; return; }
+          shapeDragRef.current = { x1: x, y1: y, x2: x, y2: y };
+          return;
+        }
+        if (type !== 'end' || !shapeDragRef.current) return;
+        shapeDragRef.current = null;
+        const half = 0.05;
+        placeShape(x - half, y - half, x + half, y + half);
+        return;
+      }
+      // Precision: drag to define the shape's bounds (as before), now also
+      // mirroring a live preview to the projector while dragging.
       if (type === 'start') {
         if (selectedShapeId) { setSelectedShapeId(null); return; }
         shapeDragRef.current = { x1: x, y1: y, x2: x, y2: y };
         setShapeDraft({ x1: x, y1: y, x2: x, y2: y, shapeKind: shapeType });
+        sendAnnotationPreview({ kind: 'shape', x, y, x2: x, y2: y, color: selectedColor, shapeKind: shapeType, filled: shapeFilled, strokeWidth: shapeStrokeWidth });
         return;
       }
       if (!shapeDragRef.current) return;
       if (type === 'move') {
         shapeDragRef.current = { ...shapeDragRef.current, x2: x, y2: y };
         setShapeDraft({ ...shapeDragRef.current, shapeKind: shapeType });
+        sendAnnotationPreview({ kind: 'shape', x: shapeDragRef.current.x1, y: shapeDragRef.current.y1, x2, y2, color: selectedColor, shapeKind: shapeType, filled: shapeFilled, strokeWidth: shapeStrokeWidth });
       } else if (type === 'end') {
         const { x1, y1, x2, y2 } = shapeDragRef.current;
         shapeDragRef.current = null;
         setShapeDraft(null);
+        sendAnnotationPreview(null);
         if (Math.hypot(x2 - x1, y2 - y1) < 0.02) return; // too small to be a deliberate shape - likely just a tap
-        const slideNum = currentSlideRef.current;
-        const annotation: Annotation = {
-          id: `ann_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
-          kind: 'shape', x: x1, y: y1, x2, y2, color: selectedColor, text: '', shapeKind: shapeType,
-        };
-        const nextMap = { ...annotationsRef.current, [slideNum]: [...(annotationsRef.current[slideNum] || []), annotation] };
-        annotationsRef.current = nextMap;
-        setAnnotations(nextMap);
-        channelRef.current.send({ type: 'broadcast', event: 'annotation_add', payload: { annotation } });
+        placeShape(x1, y1, x2, y2);
       }
     }
   };
@@ -1212,6 +1270,44 @@ export default function MobileRemote() {
     annotationsRef.current = nextMap;
     setAnnotations(nextMap);
     channelRef.current.send({ type: 'broadcast', event: 'annotation_remove', payload: { id } });
+  };
+
+  // 🎯 Precision-mode live preview - broadcast continuously while held/
+  // dragged so the projector shows feedback before anything commits. Send
+  // null to clear it (gesture ended, whether committed or cancelled).
+  const sendAnnotationPreview = (preview: AnnotationPreview | null) => {
+    channelRef.current?.send({ type: 'broadcast', event: 'annotation_preview', payload: preview });
+  };
+
+  // Commits a number badge at (x, y) - shared by both Quick (tap) and
+  // Precision (hold+drag, then release) styles below.
+  const placeNumberAt = (x: number, y: number) => {
+    if (!channelRef.current) return;
+    const slideNum = currentSlideRef.current;
+    const existingCount = (annotationsRef.current[slideNum] || []).filter((a) => a.kind === 'number').length;
+    const annotation: Annotation = {
+      id: `ann_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+      kind: 'number', x, y, color: NUMBER_COLORS[existingCount % NUMBER_COLORS.length], text: String(existingCount + 1),
+    };
+    const nextMap = { ...annotationsRef.current, [slideNum]: [...(annotationsRef.current[slideNum] || []), annotation] };
+    annotationsRef.current = nextMap;
+    setAnnotations(nextMap);
+    channelRef.current.send({ type: 'broadcast', event: 'annotation_add', payload: { annotation } });
+  };
+
+  // Commits a shape spanning (x1,y1)-(x2,y2) - shared by Quick (tap, fixed
+  // default size) and Precision (drag-to-define, as before) styles below.
+  const placeShape = (x1: number, y1: number, x2: number, y2: number) => {
+    if (!channelRef.current) return;
+    const slideNum = currentSlideRef.current;
+    const annotation: Annotation = {
+      id: `ann_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+      kind: 'shape', x: x1, y: y1, x2, y2, color: selectedColor, text: '', shapeKind: shapeType, filled: shapeFilled, strokeWidth: shapeStrokeWidth,
+    };
+    const nextMap = { ...annotationsRef.current, [slideNum]: [...(annotationsRef.current[slideNum] || []), annotation] };
+    annotationsRef.current = nextMap;
+    setAnnotations(nextMap);
+    channelRef.current.send({ type: 'broadcast', event: 'annotation_add', payload: { annotation } });
   };
 
   const saveTextboxDraft = () => {
@@ -1345,12 +1441,19 @@ export default function MobileRemote() {
     }
     if (activeMode === 'textbox' && newMode !== 'textbox') {
       setTextboxDraft(null);
+      setTextboxPreview(null);
+    }
+    if (activeMode === 'number' && newMode !== 'number') {
+      setNumberPreview(null);
     }
     if (activeMode === 'shape' && newMode !== 'shape') {
       setSelectedShapeId(null);
       shapeDragRef.current = null;
       setShapeDraft(null);
       shapeHandleDragRef.current = null;
+    }
+    if ((activeMode === 'textbox' || activeMode === 'number' || activeMode === 'shape') && newMode !== activeMode) {
+      sendAnnotationPreview(null); // in case a Precision-mode hold/drag was mid-gesture when the mode changed
     }
 
     setActiveMode(newMode as ToolMode);
@@ -1740,6 +1843,28 @@ export default function MobileRemote() {
             </div>
           )}
         </div>
+
+        {/* 🎯 Quick vs Precision - shared toggle for Textbox/Number/Shapes.
+            Quick is each tool's original single-tap placement (default).
+            Precision holds+drags before committing, previewed live (offset
+            above your fingertip) on both this screen and the projector. */}
+        {(activeMode === 'textbox' || activeMode === 'number' || activeMode === 'shape') && (
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-xs text-gray-400 font-bold shrink-0">{t.placementStyle}:</span>
+            <button
+              onClick={() => setPlacementStyle('quick')}
+              className={`px-3 py-1 rounded-full text-xs font-bold ${placementStyle === 'quick' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400'}`}
+            >
+              ⚡ {t.quickStyle}
+            </button>
+            <button
+              onClick={() => setPlacementStyle('precision')}
+              className={`px-3 py-1 rounded-full text-xs font-bold ${placementStyle === 'precision' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400'}`}
+            >
+              🎯 {t.precisionStyle}
+            </button>
+          </div>
+        )}
         <div className="grid grid-cols-3 gap-1.5 mb-2">
           {([
             ['laser', '🔴', t.laser, 'from-rose-500/20 to-rose-500/5', 'border-rose-500', 'shadow-rose-500/40'],
@@ -1868,7 +1993,33 @@ export default function MobileRemote() {
                 </button>
               ))}
             </div>
-            <p className="text-[10px] text-gray-500">{t.shapeHint}</p>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShapeFilled(false)}
+                className={`flex-1 rounded-lg py-1.5 text-[11px] font-bold ${!shapeFilled ? 'bg-violet-600 text-white' : 'bg-gray-800 text-gray-400'}`}
+              >
+                ▭ {t.shapeOutline}
+              </button>
+              <button
+                onClick={() => setShapeFilled(true)}
+                className={`flex-1 rounded-lg py-1.5 text-[11px] font-bold ${shapeFilled ? 'bg-violet-600 text-white' : 'bg-gray-800 text-gray-400'}`}
+              >
+                ◼ {t.shapeFilled}
+              </button>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-gray-400 font-bold shrink-0">{t.shapeWidth}:</span>
+              {([['Thin', 0.3], ['Medium', 0.6], ['Thick', 1.2]] as const).map(([label, w]) => (
+                <button
+                  key={label}
+                  onClick={() => setShapeStrokeWidth(w)}
+                  className={`flex-1 rounded-lg py-1.5 text-[11px] font-bold ${shapeStrokeWidth === w ? 'bg-violet-600 text-white' : 'bg-gray-800 text-gray-400'}`}
+                >
+                  {label === 'Thin' ? t.shapeThin : label === 'Medium' ? t.shapeMedium : t.shapeThick}
+                </button>
+              ))}
+            </div>
+            <p className="text-[10px] text-gray-500">{placementStyle === 'quick' ? t.shapeHintQuick : t.shapeHint}</p>
           </div>
         )}
 
@@ -1958,8 +2109,10 @@ export default function MobileRemote() {
               const x1 = ann.x * 100, y1 = ann.y * 100, x2 = (ann.x2 ?? ann.x) * 100, y2 = (ann.y2 ?? ann.y) * 100;
               const selected = ann.id === selectedShapeId;
               const dash = selected ? '2 1.5' : undefined;
-              if (ann.shapeKind === 'circle') return <ellipse key={ann.id} cx={(x1 + x2) / 2} cy={(y1 + y2) / 2} rx={Math.abs(x2 - x1) / 2} ry={Math.abs(y2 - y1) / 2} fill="none" stroke={ann.color} strokeWidth={selected ? 1 : 0.6} strokeDasharray={dash} vectorEffect="non-scaling-stroke" />;
-              if (ann.shapeKind === 'rect') return <rect key={ann.id} x={Math.min(x1, x2)} y={Math.min(y1, y2)} width={Math.abs(x2 - x1)} height={Math.abs(y2 - y1)} fill="none" stroke={ann.color} strokeWidth={selected ? 1 : 0.6} strokeDasharray={dash} vectorEffect="non-scaling-stroke" />;
+              const sw = selected ? Math.max(1, ann.strokeWidth ?? 0.6) : (ann.strokeWidth ?? 0.6);
+              const fillProps = ann.filled ? { fill: ann.color, fillOpacity: 0.35 } : { fill: 'none' };
+              if (ann.shapeKind === 'circle') return <ellipse key={ann.id} cx={(x1 + x2) / 2} cy={(y1 + y2) / 2} rx={Math.abs(x2 - x1) / 2} ry={Math.abs(y2 - y1) / 2} {...fillProps} stroke={ann.color} strokeWidth={sw} strokeDasharray={dash} vectorEffect="non-scaling-stroke" />;
+              if (ann.shapeKind === 'rect') return <rect key={ann.id} x={Math.min(x1, x2)} y={Math.min(y1, y2)} width={Math.abs(x2 - x1)} height={Math.abs(y2 - y1)} {...fillProps} stroke={ann.color} strokeWidth={sw} strokeDasharray={dash} vectorEffect="non-scaling-stroke" />;
               if (ann.shapeKind === 'arrow') {
                 // Own marker per arrow (rather than one shared marker + CSS
                 // context-stroke) so its arrowhead always matches ITS OWN
@@ -1973,16 +2126,17 @@ export default function MobileRemote() {
                         <path d="M 0 0 L 10 5 L 0 10 z" fill={ann.color} />
                       </marker>
                     </defs>
-                    <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={ann.color} strokeWidth={selected ? 1 : 0.6} strokeDasharray={dash} vectorEffect="non-scaling-stroke" markerEnd={`url(#${markerId})`} />
+                    <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={ann.color} strokeWidth={sw} strokeDasharray={dash} vectorEffect="non-scaling-stroke" markerEnd={`url(#${markerId})`} />
                   </g>
                 );
               }
-              return <line key={ann.id} x1={x1} y1={y1} x2={x2} y2={y2} stroke={ann.color} strokeWidth={selected ? 1 : 0.6} strokeDasharray={dash} vectorEffect="non-scaling-stroke" />;
+              return <line key={ann.id} x1={x1} y1={y1} x2={x2} y2={y2} stroke={ann.color} strokeWidth={sw} strokeDasharray={dash} vectorEffect="non-scaling-stroke" />;
             })}
             {shapeDraft && (() => {
               const x1 = shapeDraft.x1 * 100, y1 = shapeDraft.y1 * 100, x2 = shapeDraft.x2 * 100, y2 = shapeDraft.y2 * 100;
-              if (shapeDraft.shapeKind === 'circle') return <ellipse cx={(x1 + x2) / 2} cy={(y1 + y2) / 2} rx={Math.abs(x2 - x1) / 2} ry={Math.abs(y2 - y1) / 2} fill="none" stroke={selectedColor} strokeWidth={0.6} strokeDasharray="2 1.5" vectorEffect="non-scaling-stroke" />;
-              if (shapeDraft.shapeKind === 'rect') return <rect x={Math.min(x1, x2)} y={Math.min(y1, y2)} width={Math.abs(x2 - x1)} height={Math.abs(y2 - y1)} fill="none" stroke={selectedColor} strokeWidth={0.6} strokeDasharray="2 1.5" vectorEffect="non-scaling-stroke" />;
+              const fillProps = shapeFilled ? { fill: selectedColor, fillOpacity: 0.35 } : { fill: 'none' };
+              if (shapeDraft.shapeKind === 'circle') return <ellipse cx={(x1 + x2) / 2} cy={(y1 + y2) / 2} rx={Math.abs(x2 - x1) / 2} ry={Math.abs(y2 - y1) / 2} {...fillProps} stroke={selectedColor} strokeWidth={shapeStrokeWidth} strokeDasharray="2 1.5" vectorEffect="non-scaling-stroke" />;
+              if (shapeDraft.shapeKind === 'rect') return <rect x={Math.min(x1, x2)} y={Math.min(y1, y2)} width={Math.abs(x2 - x1)} height={Math.abs(y2 - y1)} {...fillProps} stroke={selectedColor} strokeWidth={shapeStrokeWidth} strokeDasharray="2 1.5" vectorEffect="non-scaling-stroke" />;
               if (shapeDraft.shapeKind === 'arrow') {
                 return (
                   <g>
@@ -1991,13 +2145,41 @@ export default function MobileRemote() {
                         <path d="M 0 0 L 10 5 L 0 10 z" fill={selectedColor} />
                       </marker>
                     </defs>
-                    <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={selectedColor} strokeWidth={0.6} strokeDasharray="2 1.5" vectorEffect="non-scaling-stroke" markerEnd="url(#remote-arrow-draft)" />
+                    <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={selectedColor} strokeWidth={shapeStrokeWidth} strokeDasharray="2 1.5" vectorEffect="non-scaling-stroke" markerEnd="url(#remote-arrow-draft)" />
                   </g>
                 );
               }
-              return <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={selectedColor} strokeWidth={0.6} strokeDasharray="2 1.5" vectorEffect="non-scaling-stroke" />;
+              return <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={selectedColor} strokeWidth={shapeStrokeWidth} strokeDasharray="2 1.5" vectorEffect="non-scaling-stroke" />;
             })()}
           </svg>
+
+          {/* 🎯 Precision-mode live preview for Number/Textbox - offset
+              above the fingertip (translateY -40px) so it's visible while
+              held, not hidden under your own finger. */}
+          {placementStyle === 'precision' && numberPreview && (
+            <div
+              className="absolute z-40 pointer-events-none w-7 h-7 rounded-full flex items-center justify-center text-xs font-black text-white border-2 border-dashed border-white/80 opacity-80"
+              style={{
+                left: `${numberPreview.x * 100}%`, top: `${numberPreview.y * 100}%`,
+                backgroundColor: NUMBER_COLORS[(annotations[currentSlide] || []).filter((a) => a.kind === 'number').length % NUMBER_COLORS.length],
+                transform: 'translate(-50%, calc(-50% - 40px))',
+              }}
+            >
+              {(annotations[currentSlide] || []).filter((a) => a.kind === 'number').length + 1}
+            </div>
+          )}
+          {placementStyle === 'precision' && textboxPreview && (
+            <div
+              className="absolute z-40 pointer-events-none w-7 h-7 rounded-full flex items-center justify-center text-sm border-2 border-dashed border-white/80 opacity-80"
+              style={{
+                left: `${textboxPreview.x * 100}%`, top: `${textboxPreview.y * 100}%`,
+                backgroundColor: selectedColor,
+                transform: 'translate(-50%, calc(-50% - 40px))',
+              }}
+            >
+              📍
+            </div>
+          )}
 
           {/* Per-shape hit-area (tap to select) + move/resize handles for
               whichever one is currently selected - plain HTML buttons, not

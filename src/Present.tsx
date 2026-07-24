@@ -296,8 +296,15 @@ type AnnotationKind = 'textbox' | 'number' | 'shape';
 type ShapeKind = 'circle' | 'rect' | 'arrow' | 'line';
 // x/y is the primary anchor (textbox/number position, or a shape's first
 // corner/endpoint); x2/y2 is a shape's second corner/endpoint only.
-interface Annotation { id: string; kind: AnnotationKind; x: number; y: number; x2?: number; y2?: number; color: string; text: string; shapeKind?: ShapeKind; }
+interface Annotation { id: string; kind: AnnotationKind; x: number; y: number; x2?: number; y2?: number; color: string; text: string; shapeKind?: ShapeKind; filled?: boolean; strokeWidth?: number; }
 type AnnotationsMap = Record<number, Annotation[]>; // keyed by flat slide number (1-based), same pattern as CanvasDataMap
+
+// Ephemeral "about to place this" preview - broadcast live while
+// hold-dragging in Precision mode (see PlacementStyle below), shown on the
+// projector so there's feedback before something is actually committed.
+// Never persisted, unlike Annotation above - purely a live UI cue.
+type PlacementStyle = 'quick' | 'precision';
+interface AnnotationPreview { kind: AnnotationKind; x: number; y: number; x2?: number; y2?: number; color: string; text?: string; shapeKind?: ShapeKind; filled?: boolean; strokeWidth?: number; }
 
 // Turns a getPdf response into something we know how to render.
 // Doesn't do any network calls itself - pure data shaping.
@@ -567,6 +574,10 @@ export default function Present() {
   // (unlike pen strokes) these are real DOM elements, not canvas pixels.
   const annotationsRef = useRef<AnnotationsMap>({});
   const [annotations, setAnnotations] = useState<AnnotationsMap>({});
+  // Live "about to place this" preview from Precision-mode placement on
+  // the phone - never persisted, just a temporary display cue; see
+  // annotation_preview below.
+  const [previewAnnotation, setPreviewAnnotation] = useState<AnnotationPreview | null>(null);
   // Pixel coords of the last point drawn for the in-progress remote stroke.
   // See the draw_stroke handler below for why this exists (fixes highlighter
   // strokes rendering much darker than their final, redrawn appearance).
@@ -1357,11 +1368,21 @@ export default function Present() {
       channel.on('broadcast', { event: 'annotation_add' }, (payload) => {
         const annotation = payload.payload?.annotation as Annotation | undefined;
         if (!annotation || !annotation.id) return;
+        setPreviewAnnotation(null); // the real thing just landed - drop any in-flight preview
         const flatNum = currentFlatIndexRef.current + 1;
         const next = { ...annotationsRef.current, [flatNum]: [...(annotationsRef.current[flatNum] || []), annotation] };
         annotationsRef.current = next;
         setAnnotations(next);
         supabase.from('sessions').upsert({ id: sessionId, annotations_data: next });
+      });
+
+      // Live "about to place this" preview - Precision-mode placement on
+      // the phone broadcasts this continuously while held/dragged, so
+      // there's feedback here before anything is actually committed.
+      // Deliberately NOT persisted - a null/empty payload clears it.
+      channel.on('broadcast', { event: 'annotation_preview' }, (payload) => {
+        const preview = payload.payload as AnnotationPreview | null;
+        setPreviewAnnotation(preview && preview.kind ? preview : null);
       });
 
       // Update/remove look the annotation up by id across every slide
@@ -2199,12 +2220,16 @@ export default function Present() {
             {/* ⭕ Placed shapes - display only here; all drawing/moving/
                 resizing happens on the phone remote. Same percent-based
                 0-100 viewBox trick as the pins below, so it lines up with
-                everything else positioned by left/top percentages. */}
+                everything else positioned by left/top percentages. Filled
+                shapes use partial opacity so they never fully hide slide
+                content underneath. */}
             <svg className="absolute top-0 left-0 w-full h-full z-[15] pointer-events-none" viewBox="0 0 100 100" preserveAspectRatio="none">
               {(annotations[currentFlatIndex + 1] || []).filter((a) => a.kind === 'shape').map((ann) => {
                 const x1 = ann.x * 100, y1 = ann.y * 100, x2 = (ann.x2 ?? ann.x) * 100, y2 = (ann.y2 ?? ann.y) * 100;
-                if (ann.shapeKind === 'circle') return <ellipse key={ann.id} cx={(x1 + x2) / 2} cy={(y1 + y2) / 2} rx={Math.abs(x2 - x1) / 2} ry={Math.abs(y2 - y1) / 2} fill="none" stroke={ann.color} strokeWidth={0.5} vectorEffect="non-scaling-stroke" />;
-                if (ann.shapeKind === 'rect') return <rect key={ann.id} x={Math.min(x1, x2)} y={Math.min(y1, y2)} width={Math.abs(x2 - x1)} height={Math.abs(y2 - y1)} fill="none" stroke={ann.color} strokeWidth={0.5} vectorEffect="non-scaling-stroke" />;
+                const sw = ann.strokeWidth ?? 0.5;
+                const fillProps = ann.filled ? { fill: ann.color, fillOpacity: 0.35 } : { fill: 'none' };
+                if (ann.shapeKind === 'circle') return <ellipse key={ann.id} cx={(x1 + x2) / 2} cy={(y1 + y2) / 2} rx={Math.abs(x2 - x1) / 2} ry={Math.abs(y2 - y1) / 2} {...fillProps} stroke={ann.color} strokeWidth={sw} vectorEffect="non-scaling-stroke" />;
+                if (ann.shapeKind === 'rect') return <rect key={ann.id} x={Math.min(x1, x2)} y={Math.min(y1, y2)} width={Math.abs(x2 - x1)} height={Math.abs(y2 - y1)} {...fillProps} stroke={ann.color} strokeWidth={sw} vectorEffect="non-scaling-stroke" />;
                 if (ann.shapeKind === 'arrow') {
                   // Each arrow gets its own marker (rather than one shared
                   // marker + CSS context-stroke) so its arrowhead always
@@ -2218,12 +2243,21 @@ export default function Present() {
                           <path d="M 0 0 L 10 5 L 0 10 z" fill={ann.color} />
                         </marker>
                       </defs>
-                      <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={ann.color} strokeWidth={0.5} vectorEffect="non-scaling-stroke" markerEnd={`url(#${markerId})`} />
+                      <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={ann.color} strokeWidth={sw} vectorEffect="non-scaling-stroke" markerEnd={`url(#${markerId})`} />
                     </g>
                   );
                 }
-                return <line key={ann.id} x1={x1} y1={y1} x2={x2} y2={y2} stroke={ann.color} strokeWidth={0.5} vectorEffect="non-scaling-stroke" />;
+                return <line key={ann.id} x1={x1} y1={y1} x2={x2} y2={y2} stroke={ann.color} strokeWidth={sw} vectorEffect="non-scaling-stroke" />;
               })}
+              {previewAnnotation?.kind === 'shape' && (() => {
+                const p = previewAnnotation;
+                const x1 = p.x * 100, y1 = p.y * 100, x2 = (p.x2 ?? p.x) * 100, y2 = (p.y2 ?? p.y) * 100;
+                const sw = p.strokeWidth ?? 0.5;
+                const fillProps = p.filled ? { fill: p.color, fillOpacity: 0.35 } : { fill: 'none' };
+                if (p.shapeKind === 'circle') return <ellipse cx={(x1 + x2) / 2} cy={(y1 + y2) / 2} rx={Math.abs(x2 - x1) / 2} ry={Math.abs(y2 - y1) / 2} {...fillProps} stroke={p.color} strokeWidth={sw} strokeDasharray="2 1.5" vectorEffect="non-scaling-stroke" />;
+                if (p.shapeKind === 'rect') return <rect x={Math.min(x1, x2)} y={Math.min(y1, y2)} width={Math.abs(x2 - x1)} height={Math.abs(y2 - y1)} {...fillProps} stroke={p.color} strokeWidth={sw} strokeDasharray="2 1.5" vectorEffect="non-scaling-stroke" />;
+                return <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={p.color} strokeWidth={sw} strokeDasharray="2 1.5" vectorEffect="non-scaling-stroke" />;
+              })()}
             </svg>
 
             {/* 📍 Text-label pins + 🔢 number badges - display only here;
@@ -2248,6 +2282,27 @@ export default function Present() {
                 </div>
               )
             ))}
+
+            {/* Live "about to place this" preview (Precision-mode number/
+                textbox only - the shape preview above already covers
+                shapes) - dashed/translucent/pulsing so it reads clearly as
+                "not committed yet". */}
+            {previewAnnotation?.kind === 'number' && (
+              <div
+                className="absolute z-[16] pointer-events-none w-9 h-9 rounded-full flex items-center justify-center text-base font-black text-white border-2 border-dashed border-white/90 opacity-70 animate-pulse"
+                style={{ left: `${previewAnnotation.x * 100}%`, top: `${previewAnnotation.y * 100}%`, backgroundColor: previewAnnotation.color, transform: 'translate(-50%, -50%)' }}
+              >
+                {previewAnnotation.text}
+              </div>
+            )}
+            {previewAnnotation?.kind === 'textbox' && (
+              <div
+                className="absolute z-[16] pointer-events-none rounded-lg px-2.5 py-1.5 text-sm font-bold border-2 border-dashed border-white/90 opacity-70 animate-pulse"
+                style={{ left: `${previewAnnotation.x * 100}%`, top: `${previewAnnotation.y * 100}%`, backgroundColor: previewAnnotation.color, color: '#111827', transform: 'translate(-8%, -110%)' }}
+              >
+                📍
+              </div>
+            )}
             </div>
           </div>
           <style>{TRANSITION_KEYFRAMES_CSS}</style>
