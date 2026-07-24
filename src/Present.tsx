@@ -112,6 +112,60 @@ const DEFAULT_ZOOM: ZoomState = { scale: 1, x: 0, y: 0 };
 const DEFAULT_VIDEO_STATE: VideoState = { playing: false, time: 0, duration: 0, volume: 100 };
 const DEFAULT_SESSION_STATE: SessionState = { screenMode: 'normal', zoom: DEFAULT_ZOOM, videoState: DEFAULT_VIDEO_STATE };
 
+// --- Remote mouse + remote keyboard ----------------------------------------
+// Virtual cursor driven from the phone (`remote_cursor` / `remote_click`).
+// x/y are 0..1 fractions of the *viewport*, not of the slide stage, so the
+// phone's trackpad maps 1:1 onto the whole projector screen and can reach
+// the toolbar/sidebar too, not just the slide itself.
+interface RemoteCursorState { x: number; y: number; active: boolean; }
+const DEFAULT_REMOTE_CURSOR: RemoteCursorState = { x: 0.5, y: 0.5, active: false };
+
+// IMPORTANT / please read before filing a bug about this:
+// A web page is sandboxed by the browser and physically cannot move the
+// operating system's mouse pointer or inject OS-level keystrokes - there is
+// no such API, in any browser, by design. What the two helpers below do
+// instead is dispatch *real* DOM events into this page. For anything inside
+// the presentation tab that is genuinely identical to a physical key press /
+// click: the very same listeners fire, through the very same code path.
+// What it cannot do is reach outside this browser tab (the desktop,
+// PowerPoint.exe, another Chrome tab) or into a cross-origin iframe such as
+// the Google Slides embed, which the browser walls off from us.
+
+// Fires a real KeyboardEvent at the page, exactly as if the key had been
+// pressed on the projector computer's own keyboard. Present.tsx's arrow-key
+// handler is bound to `window`, so this reaches it verbatim.
+// Dispatched at document.activeElement (falling back to body) so the event
+// bubbles up through the normal target->window path a physical press takes,
+// rather than materialising at window out of nowhere.
+function dispatchRealKey(key: string, code: string, keyCode: number) {
+  const target: EventTarget = document.activeElement || document.body;
+  const init: KeyboardEventInit = {
+    key, code, keyCode, which: keyCode,
+    bubbles: true, cancelable: true, composed: true, view: window,
+  } as KeyboardEventInit;
+  target.dispatchEvent(new KeyboardEvent('keydown', init));
+  target.dispatchEvent(new KeyboardEvent('keyup', init));
+}
+
+// Performs a real click at a viewport point: finds whatever element is
+// actually under the virtual cursor and sends it the full pointer/mouse
+// event sequence a physical click produces. React's delegated listeners at
+// the root pick this up like any other click, so onClick handlers, links,
+// buttons and video controls all respond normally.
+function dispatchRealClick(clientX: number, clientY: number) {
+  const el = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
+  if (!el) return;
+  const base = { bubbles: true, cancelable: true, composed: true, view: window, clientX, clientY, button: 0, buttons: 1 };
+  // Focus first - matches what a real click does, and makes clicked inputs
+  // and the Google Slides embed actually take the keyboard afterwards.
+  try { el.focus({ preventScroll: true }); } catch { /* not focusable, fine */ }
+  el.dispatchEvent(new PointerEvent('pointerdown', { ...base, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+  el.dispatchEvent(new MouseEvent('mousedown', base));
+  el.dispatchEvent(new PointerEvent('pointerup', { ...base, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+  el.dispatchEvent(new MouseEvent('mouseup', { ...base, buttons: 0 }));
+  el.dispatchEvent(new MouseEvent('click', { ...base, buttons: 0, detail: 1 }));
+}
+
 // --- Audience-facing live quiz ---------------------------------------------
 // These shapes must stay in sync with AudienceJoin.tsx (voting/answer UI,
 // leaderboard, Q&A, reactions) and MobileRemote.tsx (phone-side quiz
@@ -484,6 +538,15 @@ export default function Present() {
     return () => clearTimeout(id);
   }, [timerAlert]);
   const [laser, setLaser] = useState({ x: 0.5, y: 0.5, active: false, size: 16, color: '#ef4444' });
+  // Virtual mouse driven from the phone. `clickFlash` is just the visual
+  // ping that confirms a click landed; it clears itself after ~300ms.
+  const [remoteCursor, setRemoteCursor] = useState<RemoteCursorState>(DEFAULT_REMOTE_CURSOR);
+  const [clickFlash, setClickFlash] = useState<{ x: number; y: number; key: number } | null>(null);
+  useEffect(() => {
+    if (!clickFlash) return;
+    const id = setTimeout(() => setClickFlash((cur) => (cur?.key === clickFlash.key ? null : cur)), 320);
+    return () => clearTimeout(id);
+  }, [clickFlash]);
   const [videoState, setVideoState] = useState<VideoState>(DEFAULT_VIDEO_STATE);
 
   const presentCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -984,6 +1047,41 @@ export default function Present() {
         if (typeof x === 'number' && typeof y === 'number') {
           setLaser((prev) => ({ x, y, active: !!active, size: size ?? prev.size, color: color ?? prev.color }));
         }
+      });
+
+      // --- Remote mouse: position updates from the phone's trackpad. ------
+      // Purely visual; nothing is clicked until `remote_click` arrives.
+      channel.on('broadcast', { event: 'remote_cursor' }, (payload) => {
+        const { x, y, active } = payload.payload || {};
+        if (typeof x !== 'number' || typeof y !== 'number') return;
+        setRemoteCursor({ x, y, active: active !== false });
+      });
+
+      // --- Remote mouse: the actual click. --------------------------------
+      // Uses the coordinates carried in the payload rather than the cursor
+      // state, so a tap always lands exactly where the phone last drew the
+      // cursor even if a position update is still in flight.
+      channel.on('broadcast', { event: 'remote_click' }, (payload) => {
+        const { x, y } = payload.payload || {};
+        if (typeof x !== 'number' || typeof y !== 'number') return;
+        const clientX = x * window.innerWidth;
+        const clientY = y * window.innerHeight;
+        setRemoteCursor({ x, y, active: true });
+        setClickFlash({ x, y, key: Date.now() });
+        dispatchRealClick(clientX, clientY);
+      });
+
+      // --- Remote keyboard: real arrow-key presses on this machine. -------
+      // The phone's ‹ / › buttons send this. Deliberately NOT wired to
+      // goNext/goPrev directly: dispatching the key event means the remote
+      // buttons and the projector's own keyboard run identical code, so the
+      // two can never drift apart.
+      channel.on('broadcast', { event: 'remote_key' }, (payload) => {
+        const key = payload.payload?.key;
+        if (key === 'ArrowRight') dispatchRealKey('ArrowRight', 'ArrowRight', 39);
+        else if (key === 'ArrowLeft') dispatchRealKey('ArrowLeft', 'ArrowLeft', 37);
+        else if (key === 'ArrowUp') dispatchRealKey('ArrowUp', 'ArrowUp', 38);
+        else if (key === 'ArrowDown') dispatchRealKey('ArrowDown', 'ArrowDown', 40);
       });
 
       channel.on('broadcast', { event: 'spotlight_move' }, (payload) => {
@@ -2054,38 +2152,6 @@ export default function Present() {
             />
           )}
 
-          {/* Floating Prev/Next arrow buttons, overlaid directly on the
-              slide. They call the exact same goPrev/goNext used by the
-              ArrowLeft/ArrowRight keyboard shortcuts above, so clicking
-              behaves identically (build-step-then-advance, landing fully
-              built when stepping back, etc). Shown in every mode, including
-              fullscreen/focus mode, since the keyboard shortcuts also work
-              in every mode - this just gives the same control as a clickable
-              on-screen option. z-40 keeps them under the black/white screen
-              (z-50) so they hide along with the slide during a blackout. */}
-          {flatSlides.length > 1 && !loading && !error && (
-            <>
-              {!isFirstSlide && (
-                <button
-                  onClick={goPrev}
-                  aria-label="Previous slide"
-                  className="absolute left-4 top-1/2 -translate-y-1/2 z-40 w-12 h-12 flex items-center justify-center rounded-full bg-black/40 hover:bg-black/70 text-white text-3xl font-bold leading-none transition-colors"
-                >
-                  ‹
-                </button>
-              )}
-              {!isLastSlide && (
-                <button
-                  onClick={goNext}
-                  aria-label="Next slide"
-                  className="absolute right-4 top-1/2 -translate-y-1/2 z-40 w-12 h-12 flex items-center justify-center rounded-full bg-black/40 hover:bg-black/70 text-white text-3xl font-bold leading-none transition-colors"
-                >
-                  ›
-                </button>
-              )}
-            </>
-          )}
-
           {/* Black/White screen - fully covers the stage, topmost layer. */}
           {screenMode !== 'normal' && (
             <div className={`absolute inset-0 z-50 ${screenMode === 'black' ? 'bg-black' : 'bg-white'}`} />
@@ -2170,6 +2236,42 @@ export default function Present() {
           fullscreenTargetRef (see the comment above) so it stays visible
           while the presenter is in real full screen. */}
       <ProjectorTimer state={projectorTimer} alert={timerAlert} />
+
+      {/* Virtual mouse pointer driven from the phone. Sits inside
+          fullscreenTargetRef so it survives real full screen, above every
+          other layer, and is strictly pointer-events-none - if it ever
+          captured events it would sit under itself and
+          document.elementFromPoint would only ever find this arrow instead
+          of the thing being clicked. */}
+      {remoteCursor.active && (
+        <div
+          className="fixed z-[400] pointer-events-none"
+          style={{
+            left: `${remoteCursor.x * 100}%`,
+            top: `${remoteCursor.y * 100}%`,
+            transform: 'translate(-2px, -2px)',
+            transition: 'left 0.05s linear, top 0.05s linear',
+          }}
+        >
+          <svg width="26" height="26" viewBox="0 0 24 24" style={{ filter: 'drop-shadow(0 2px 3px rgba(0,0,0,0.6))' }}>
+            <path d="M5 2 L5 20 L10 15.5 L13 22 L16 20.5 L13 14.5 L19.5 14.5 Z" fill="#ffffff" stroke="#111827" strokeWidth="1.5" strokeLinejoin="round" />
+          </svg>
+        </div>
+      )}
+      {clickFlash && (
+        <div
+          key={clickFlash.key}
+          className="fixed z-[399] pointer-events-none rounded-full border-2 border-sky-400"
+          style={{
+            left: `${clickFlash.x * 100}%`,
+            top: `${clickFlash.y * 100}%`,
+            width: 34, height: 34,
+            marginLeft: -17, marginTop: -17,
+            animation: 'remote-click-ping 0.32s ease-out forwards',
+          }}
+        />
+      )}
+      <style>{`@keyframes remote-click-ping { 0% { transform: scale(0.3); opacity: 1; } 100% { transform: scale(1.5); opacity: 0; } }`}</style>
       </div>
 
       {/* Off-screen (not visually visible, but fully rendered so html2canvas
