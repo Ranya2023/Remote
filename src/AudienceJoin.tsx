@@ -235,8 +235,12 @@ export default function AudienceJoin() {
     const fetchInitialState = async () => {
       const { data } = await supabase.from('sessions').select('audience_state').eq('id', session).single();
       if (data?.audience_state && !cancelled) {
-        audienceStateRef.current = data.audience_state as AudienceState;
-        setAudienceState(data.audience_state as AudienceState);
+        // Merge with defaults - see the matching comment in Present.tsx's
+        // setupSession for why (an older saved session may be missing a
+        // field like questionBank entirely, not just have it empty).
+        const hydrated = { ...DEFAULT_AUDIENCE_STATE, ...(data.audience_state as Partial<AudienceState>) };
+        audienceStateRef.current = hydrated;
+        setAudienceState(hydrated);
       }
     };
 
@@ -259,8 +263,12 @@ export default function AudienceJoin() {
       const channel = supabase.channel(`session_${session}`, { config: { broadcast: { ack: true } } });
 
       channel.on('broadcast', { event: 'audience_state_update' }, (payload: any) => {
-        const next = payload.payload?.audienceState as AudienceState | undefined;
-        if (next) { audienceStateRef.current = next; setAudienceState(next); }
+        const next = payload.payload?.audienceState as Partial<AudienceState> | undefined;
+        if (next) {
+          const merged = { ...DEFAULT_AUDIENCE_STATE, ...next };
+          audienceStateRef.current = merged;
+          setAudienceState(merged);
+        }
       });
 
       channel.subscribe(async (status: string) => {

@@ -1088,8 +1088,15 @@ export default function Present() {
           if (s.pin) setSessionPin(s.pin);
         }
         if (data.audience_state) {
-          audienceStateRef.current = data.audience_state as AudienceState;
-          setAudienceState(data.audience_state as AudienceState);
+          // Merge with DEFAULT_AUDIENCE_STATE rather than trusting the
+          // stored shape completely - a session created before a field
+          // like questionBank existed won't have it in its saved JSON, and
+          // reading .length on a genuinely missing (not just empty) array
+          // crashes the whole app. Spreading a matching default first
+          // means any such gap fills in with a safe empty value instead.
+          const hydrated = { ...DEFAULT_AUDIENCE_STATE, ...(data.audience_state as Partial<AudienceState>) };
+          audienceStateRef.current = hydrated;
+          setAudienceState(hydrated);
         }
       }
 

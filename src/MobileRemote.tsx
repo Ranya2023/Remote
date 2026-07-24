@@ -575,8 +575,12 @@ export default function MobileRemote() {
           if (s.pin) setRequiredPin((prev) => prev ?? s.pin);
         }
         if (extra?.audience_state) {
-          audienceStateRef.current = extra.audience_state as AudienceState;
-          setAudienceState(extra.audience_state as AudienceState);
+          // Merge with defaults - see the matching comment in Present.tsx's
+          // setupSession for why (an older saved session may be missing a
+          // field like questionBank entirely, not just have it empty).
+          const hydrated = { ...DEFAULT_AUDIENCE_STATE, ...(extra.audience_state as Partial<AudienceState>) };
+          audienceStateRef.current = hydrated;
+          setAudienceState(hydrated);
         }
       } catch (drawErr) {
         console.error('🚨 Extra session data fetch error (non-blocking):', drawErr);
@@ -646,8 +650,12 @@ export default function MobileRemote() {
       });
 
       room.on('broadcast', { event: 'audience_state_update' }, (payload: any) => {
-        const next = payload.payload?.audienceState as AudienceState | undefined;
-        if (next) { audienceStateRef.current = next; setAudienceState(next); }
+        const next = payload.payload?.audienceState as Partial<AudienceState> | undefined;
+        if (next) {
+          const merged = { ...DEFAULT_AUDIENCE_STATE, ...next };
+          audienceStateRef.current = merged;
+          setAudienceState(merged);
+        }
       });
 
       // Presence: who else is currently connected to this session's
