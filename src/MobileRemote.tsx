@@ -17,6 +17,8 @@ const texts = {
     save: 'پاشەکەوتکردن', saved: 'پاشەکەوتکرا', couldNotSave: 'پاشەکەوت نەکرا', notesKeepUntilRemoved: 'هەتا سڕینەوەی وانەکە دەمێنێتەوە',
     spotlightSize: 'قەبارە',
     laserSize: 'قەبارە', laserColor: 'ڕەنگ',
+    textbox: 'دەق', addLabel: 'دانانی نیشانە', labelPlaceholder: 'دەقەکەت لێرە بنووسە...', delete: 'سڕینەوە',
+    number: 'ژمارە',
     play: 'لێدان', pause: 'وەستان', mute: 'بێدەنگ', unmute: 'دەنگ', reset: 'ڕێکخستنەوە', video: 'ڤیدیۆ',
     videoLoading: 'چاوەڕوانی ڤیدیۆ...',
     start: 'دەستپێکردن', minutesLabel: 'خولەک', undo: 'گەڕانەوە', first: 'یەکەم', last: 'کۆتایی',
@@ -34,6 +36,8 @@ const texts = {
     save: 'Save', saved: 'Saved', couldNotSave: 'Could not save', notesKeepUntilRemoved: 'Kept until you remove this lesson',
     spotlightSize: 'Size',
     laserSize: 'Size', laserColor: 'Color',
+    textbox: 'Text', addLabel: 'Add label', labelPlaceholder: 'Type your label...', delete: 'Delete',
+    number: 'Number',
     play: 'Play', pause: 'Pause', mute: 'Mute', unmute: 'Unmute', reset: 'Reset', video: 'Video',
     videoLoading: 'Waiting for video...',
     start: 'Start', minutesLabel: 'min', undo: 'Undo', first: 'First', last: 'Last',
@@ -48,6 +52,15 @@ interface Point { x: number; y: number; }
 type DrawMode = 'draw' | 'highlight' | 'erase';
 interface Stroke { points: Point[]; color: string; width: number; mode: DrawMode; }
 type CanvasDataMap = Record<number, Stroke[]>;
+
+// Point-anchored annotations (📍 text labels for now - numbered badges,
+// shapes, and emoji stickers are planned to slot into this same map
+// later). Unlike the pen strokes above, these stay as editable objects you
+// can add/edit/delete one at a time. MUST stay in sync with the matching
+// types in Present.tsx.
+type AnnotationKind = 'textbox' | 'number';
+interface Annotation { id: string; kind: AnnotationKind; x: number; y: number; color: string; text: string; }
+type AnnotationsMap = Record<number, Annotation[]>;
 
 // One entry per visible slide (mirrors the type in Present.tsx). Built and
 // shared by the host - the remote no longer guesses a fixed total.
@@ -76,12 +89,16 @@ type ResolvedPreview =
 // them lets you pick literally any color, so this list is just convenience.
 const PRESET_COLORS = ['#eab308', '#ef4444', '#3b82f6', '#22c55e', '#f97316', '#ffffff', '#000000'];
 
+// 🔢 Auto-cycled per badge - not user-picked, unlike PRESET_COLORS above -
+// so consecutive numbers are always visually distinct at a glance.
+const NUMBER_COLORS = ['#f87171', '#fb923c', '#fbbf24', '#a3e635', '#34d399', '#22d3ee', '#60a5fa', '#a78bfa', '#f472b6', '#fb7185'];
+
 // Highlight is a thick, semi-transparent stroke (marker style). Erase uses
 // destination-out compositing, so its "color" is irrelevant — only the
 // stroke shape matters — but it still needs a width.
 const STROKE_WIDTHS: Record<DrawMode, number> = { draw: 4, highlight: 22, erase: 28 };
 
-type ToolMode = 'none' | 'laser' | DrawMode | 'spotlight' | 'zoom';
+type ToolMode = 'none' | 'laser' | DrawMode | 'spotlight' | 'zoom' | 'textbox' | 'number';
 
 const TYPE_ICON: Record<string, string> = { pdf: '📄', image: '🖼️', 'video-link': '▶️', other: '📁' };
 
@@ -343,6 +360,15 @@ export default function MobileRemote() {
   // sendPointerData's 'move' branch for why this is needed.
   const lastStrokePxRef = useRef<{ x: number; y: number } | null>(null);
 
+  // 📍 Text-label annotations - annotationsRef is the mutable source of
+  // truth (same role as allDrawingsRef above), the `annotations` state
+  // exists to trigger a re-render since these render as real elements, not
+  // canvas pixels. textboxDraft holds a pending add (no editingId) or edit
+  // (editingId set) while its modal is open; null the rest of the time.
+  const annotationsRef = useRef<AnnotationsMap>({});
+  const [annotations, setAnnotations] = useState<AnnotationsMap>({});
+  const [textboxDraft, setTextboxDraft] = useState<{ x: number; y: number; editingId?: string; text: string } | null>(null);
+
   const activeFlat = flatSlides[currentSlide - 1];
   // How many builds (bullet/shape reveals) the current slide has, so
   // Next/Prev below know whether to step a build or move to a new slide.
@@ -422,12 +448,16 @@ export default function MobileRemote() {
       try {
         const { data: extra } = await supabase
           .from('sessions')
-          .select('canvas_data, session_state, audience_state')
+          .select('canvas_data, annotations_data, session_state, audience_state')
           .eq('id', session)
           .maybeSingle();
         if (extra?.canvas_data) {
           allDrawingsRef.current = extra.canvas_data as CanvasDataMap;
           setTimeout(() => redrawCanvasForSlide(currentSlideRef.current, allDrawingsRef.current), 500);
+        }
+        if (extra?.annotations_data) {
+          annotationsRef.current = extra.annotations_data as AnnotationsMap;
+          setAnnotations(annotationsRef.current);
         }
         if (extra?.session_state) {
           const s = extra.session_state as any;
@@ -1037,6 +1067,30 @@ export default function MobileRemote() {
           }
         }
       }
+    } else if (activeMode === 'textbox') {
+      // A tap, not a drag - only the release matters, opening the modal
+      // right where the finger lifted. Tapping an *existing* pin is
+      // handled separately (see its own onClick in the trackpad JSX
+      // below), which stops this from also firing and dropping a new pin
+      // underneath it.
+      if (type === 'end') setTextboxDraft({ x, y, text: '' });
+    } else if (activeMode === 'number') {
+      // No modal needed - a tap immediately drops the next badge, numbered
+      // and colored from how many number badges are already on this slide.
+      // Tapping an existing badge to remove it is handled by its own
+      // onClick in the trackpad JSX below (same stopPropagation trick as
+      // textbox pins).
+      if (type !== 'end') return;
+      const slideNum = currentSlideRef.current;
+      const existingCount = (annotationsRef.current[slideNum] || []).filter((a) => a.kind === 'number').length;
+      const annotation: Annotation = {
+        id: `ann_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+        kind: 'number', x, y, color: NUMBER_COLORS[existingCount % NUMBER_COLORS.length], text: String(existingCount + 1),
+      };
+      const nextMap = { ...annotationsRef.current, [slideNum]: [...(annotationsRef.current[slideNum] || []), annotation] };
+      annotationsRef.current = nextMap;
+      setAnnotations(nextMap);
+      channelRef.current.send({ type: 'broadcast', event: 'annotation_add', payload: { annotation } });
     }
   };
 
@@ -1063,6 +1117,68 @@ export default function MobileRemote() {
     await channelRef.current.send({ type: 'broadcast', event: 'draw_undo', payload: {} });
   };
 
+  // 📍 Text-label annotations + 🔢 number badges - separate save/delete/
+  // undo/clear from the pen tool above on purpose, so clearing a scribble
+  // never also wipes out annotations placed on purpose. Both kinds share
+  // one array per slide (see AnnotationsMap), so undo/clear are kind-aware
+  // - clearing numbers never touches labels and vice versa. Annotations
+  // stay until deleted (no auto-fade).
+  const annotationKindForMode = (mode: ToolMode): AnnotationKind | null => (mode === 'textbox' ? 'textbox' : mode === 'number' ? 'number' : null);
+
+  const closeTextboxModal = () => setTextboxDraft(null);
+
+  const deleteAnnotation = (id: string) => {
+    if (!channelRef.current) return;
+    const slideNum = currentSlideRef.current;
+    const nextForSlide = (annotationsRef.current[slideNum] || []).filter((a) => a.id !== id);
+    const nextMap = { ...annotationsRef.current, [slideNum]: nextForSlide };
+    annotationsRef.current = nextMap;
+    setAnnotations(nextMap);
+    channelRef.current.send({ type: 'broadcast', event: 'annotation_remove', payload: { id } });
+  };
+
+  const saveTextboxDraft = () => {
+    if (!textboxDraft || !channelRef.current) return;
+    const text = textboxDraft.text.trim();
+    const slideNum = currentSlideRef.current;
+    if (textboxDraft.editingId) {
+      if (!text) { deleteAnnotation(textboxDraft.editingId); setTextboxDraft(null); return; }
+      const nextForSlide = (annotationsRef.current[slideNum] || []).map((a) => (a.id === textboxDraft.editingId ? { ...a, text } : a));
+      const nextMap = { ...annotationsRef.current, [slideNum]: nextForSlide };
+      annotationsRef.current = nextMap;
+      setAnnotations(nextMap);
+      channelRef.current.send({ type: 'broadcast', event: 'annotation_update', payload: { id: textboxDraft.editingId, text } });
+    } else {
+      if (!text) { setTextboxDraft(null); return; }
+      const annotation: Annotation = { id: `ann_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`, kind: 'textbox', x: textboxDraft.x, y: textboxDraft.y, color: selectedColor, text };
+      const nextMap = { ...annotationsRef.current, [slideNum]: [...(annotationsRef.current[slideNum] || []), annotation] };
+      annotationsRef.current = nextMap;
+      setAnnotations(nextMap);
+      channelRef.current.send({ type: 'broadcast', event: 'annotation_add', payload: { annotation } });
+    }
+    setTextboxDraft(null);
+  };
+
+  const handleUndoAnnotation = () => {
+    const kind = annotationKindForMode(activeMode);
+    if (!kind) return;
+    const slideNum = currentSlideRef.current;
+    const list = (annotationsRef.current[slideNum] || []).filter((a) => a.kind === kind);
+    if (!list.length) return;
+    deleteAnnotation(list[list.length - 1].id);
+  };
+
+  const handleClearAnnotations = () => {
+    const kind = annotationKindForMode(activeMode);
+    if (!kind || !channelRef.current) return;
+    const slideNum = currentSlideRef.current;
+    const nextForSlide = (annotationsRef.current[slideNum] || []).filter((a) => a.kind !== kind);
+    const nextMap = { ...annotationsRef.current, [slideNum]: nextForSlide };
+    annotationsRef.current = nextMap;
+    setAnnotations(nextMap);
+    channelRef.current.send({ type: 'broadcast', event: 'annotation_clear', payload: { kind } });
+  };
+
   // Switching modes (or tapping the active mode off) force-hides the laser
   // immediately, so if you forget to lift your finger and just hit the
   // button instead, the dot still disappears on both screens.
@@ -1075,6 +1191,9 @@ export default function MobileRemote() {
     }
     if (activeMode === 'spotlight' && newMode !== 'spotlight') {
       channelRef.current?.send({ type: 'broadcast', event: 'spotlight_move', payload: { x: 0.5, y: 0.5, active: false, radius: spotlightRadius } });
+    }
+    if (activeMode === 'textbox' && newMode !== 'textbox') {
+      setTextboxDraft(null);
     }
 
     setActiveMode(newMode as ToolMode);
@@ -1434,6 +1553,18 @@ export default function MobileRemote() {
               <button onClick={handleClear} className="px-3 py-1 rounded-full bg-[#1b2140] border border-[#2c3560] text-white text-xs font-bold">{t.clear}</button>
             </div>
           )}
+          {activeMode === 'textbox' && (
+            <div className="flex gap-2">
+              <button onClick={handleUndoAnnotation} className="px-3 py-1 rounded-full bg-[#1b2140] border border-[#2c3560] text-white text-xs font-bold">↶ {t.undo}</button>
+              <button onClick={handleClearAnnotations} className="px-3 py-1 rounded-full bg-[#1b2140] border border-[#2c3560] text-white text-xs font-bold">{t.clear}</button>
+            </div>
+          )}
+          {activeMode === 'number' && (
+            <div className="flex gap-2">
+              <button onClick={handleUndoAnnotation} className="px-3 py-1 rounded-full bg-[#1b2140] border border-[#2c3560] text-white text-xs font-bold">↶ {t.undo}</button>
+              <button onClick={handleClearAnnotations} className="px-3 py-1 rounded-full bg-[#1b2140] border border-[#2c3560] text-white text-xs font-bold">{t.clear}</button>
+            </div>
+          )}
         </div>
         <div className="grid grid-cols-3 gap-1.5 mb-2">
           {([
@@ -1443,6 +1574,8 @@ export default function MobileRemote() {
             ['highlight', '🖍️', t.highlight, 'from-emerald-500/20 to-emerald-500/5', 'border-emerald-500', 'shadow-emerald-500/40'],
             ['erase', '🧼', t.erase, 'from-pink-500/20 to-pink-500/5', 'border-pink-500', 'shadow-pink-500/40'],
             ['zoom', '🔍', t.zoom, 'from-teal-400/20 to-teal-400/5', 'border-teal-400', 'shadow-teal-400/40'],
+            ['textbox', '📍', t.textbox, 'from-cyan-400/20 to-cyan-400/5', 'border-cyan-400', 'shadow-cyan-400/40'],
+            ['number', '🔢', t.number, 'from-orange-400/20 to-orange-400/5', 'border-orange-400', 'shadow-orange-400/40'],
           ] as const).map(([mode, icon, label, grad, border, glow]) => (
             <button
               key={mode}
@@ -1528,8 +1661,8 @@ export default function MobileRemote() {
           </div>
         )}
 
-        {/* Color picker — only meaningful for draw/highlight (erase ignores color) */}
-        {(activeMode === 'draw' || activeMode === 'highlight') && (
+        {/* Color picker — only meaningful for draw/highlight (erase ignores color), and now textbox labels too */}
+        {(activeMode === 'draw' || activeMode === 'highlight' || activeMode === 'textbox') && (
           <div className="flex items-center gap-2 mb-2 overflow-x-auto pb-1">
             <span className="text-xs text-gray-400 font-bold shrink-0">{t.color}:</span>
             {PRESET_COLORS.map((c) => (
@@ -1604,6 +1737,45 @@ export default function MobileRemote() {
           {/* Local drawing overlay, mirrors what's drawn via Present.tsx's canvas */}
           <canvas ref={canvasRef} className="absolute top-0 left-0 w-full h-full pointer-events-none z-30" />
 
+          {/* 📍 Placed text-label pins + 🔢 number badges - always visible,
+              but only tappable (to edit/remove) while their own tool is
+              active, so they don't intercept taps meant for other tools. */}
+          {(annotations[currentSlide] || []).map((ann) => (
+            ann.kind === 'number' ? (
+              <button
+                key={ann.id}
+                onClick={(e) => { e.stopPropagation(); if (activeMode === 'number') deleteAnnotation(ann.id); }}
+                onTouchStart={(e) => e.stopPropagation()}
+                onMouseDown={(e) => e.stopPropagation()}
+                className="absolute z-[25] w-7 h-7 rounded-full flex items-center justify-center text-xs font-black text-white shadow-lg border-2 border-white/70"
+                style={{
+                  left: `${ann.x * 100}%`, top: `${ann.y * 100}%`,
+                  backgroundColor: ann.color, transform: 'translate(-50%, -50%)',
+                  pointerEvents: activeMode === 'number' ? 'auto' : 'none',
+                }}
+              >
+                {ann.text}
+              </button>
+            ) : (
+              <button
+                key={ann.id}
+                onClick={(e) => { e.stopPropagation(); if (activeMode === 'textbox') setTextboxDraft({ x: ann.x, y: ann.y, editingId: ann.id, text: ann.text }); }}
+                onTouchStart={(e) => e.stopPropagation()}
+                onMouseDown={(e) => e.stopPropagation()}
+                className="absolute z-[25] max-w-[70%] rounded-lg px-2 py-1 text-[11px] font-bold shadow-lg flex items-start gap-1 text-left"
+                style={{
+                  left: `${ann.x * 100}%`, top: `${ann.y * 100}%`,
+                  backgroundColor: ann.color, color: '#111827',
+                  transform: 'translate(-8%, -110%)',
+                  pointerEvents: activeMode === 'textbox' ? 'auto' : 'none',
+                }}
+              >
+                <span className="shrink-0">📍</span>
+                <span className="truncate">{ann.text}</span>
+              </button>
+            )
+          ))}
+
           {/* Local laser dot — same visual as the projector, mirrors myLaser state */}
           {myLaser.active && (
             <div
@@ -1653,6 +1825,53 @@ export default function MobileRemote() {
                 {notesSaveStatus === 'error' && <span className="text-xs text-red-400">{t.couldNotSave}</span>}
                 <span className="text-[10px] text-gray-500 ml-auto">{t.notesKeepUntilRemoved}</span>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {textboxDraft && (
+        <div className="fixed inset-0 z-[200] bg-black/80 flex items-end sm:items-center justify-center" onClick={closeTextboxModal}>
+          <div
+            className="bg-gray-900 border border-gray-700 rounded-t-2xl sm:rounded-2xl w-full sm:max-w-sm p-5 flex flex-col gap-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-bold">📍 {t.addLabel}</h3>
+              <button onClick={closeTextboxModal} className="text-gray-400 hover:text-white text-xl leading-none">✕</button>
+            </div>
+
+            <textarea
+              autoFocus
+              value={textboxDraft.text}
+              onChange={(e) => setTextboxDraft((prev) => (prev ? { ...prev, text: e.target.value } : prev))}
+              placeholder={t.labelPlaceholder}
+              rows={3}
+              className="w-full bg-gray-800 border border-gray-700 rounded-xl px-3 py-2 text-sm text-gray-100 resize-none focus:outline-none focus:border-blue-500"
+            />
+
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-gray-400 font-bold shrink-0">{t.color}:</span>
+              {PRESET_COLORS.map((c) => (
+                <button
+                  key={c}
+                  onClick={() => setSelectedColor(c)}
+                  aria-label={c}
+                  className={`shrink-0 w-7 h-7 rounded-full border-2 ${selectedColor === c ? 'border-blue-400 scale-110' : 'border-gray-700'}`}
+                  style={{ backgroundColor: c }}
+                />
+              ))}
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button onClick={saveTextboxDraft} className="flex-1 px-4 py-2 rounded-lg bg-gradient-to-r from-blue-500 to-purple-500 text-white text-sm font-bold">
+                💾 {t.save}
+              </button>
+              {textboxDraft.editingId && (
+                <button onClick={() => { deleteAnnotation(textboxDraft.editingId!); setTextboxDraft(null); }} className="px-4 py-2 rounded-lg bg-red-700 text-white text-sm font-bold">
+                  🗑 {t.delete}
+                </button>
+              )}
             </div>
           </div>
         </div>

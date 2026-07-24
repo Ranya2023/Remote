@@ -285,6 +285,17 @@ type DrawMode = 'draw' | 'highlight' | 'erase';
 interface Stroke { points: Point[]; color: string; width: number; mode: DrawMode; }
 type CanvasDataMap = Record<number, Stroke[]>; // keyed by flat slide number (1-based)
 
+// Point-anchored annotations (📍 text labels for now - numbered badges,
+// shapes, and emoji stickers are planned to slot into this same map later).
+// Unlike the pen strokes above, which get baked permanently into canvas
+// pixels, these stay as editable objects the phone can add/edit/delete
+// individually - see the annotation_add/update/remove/clear broadcast
+// handlers below. MUST stay in sync with the matching types in
+// MobileRemote.tsx.
+type AnnotationKind = 'textbox' | 'number';
+interface Annotation { id: string; kind: AnnotationKind; x: number; y: number; color: string; text: string; }
+type AnnotationsMap = Record<number, Annotation[]>; // keyed by flat slide number (1-based), same pattern as CanvasDataMap
+
 // Turns a getPdf response into something we know how to render.
 // Doesn't do any network calls itself - pure data shaping.
 function normalizeResponse(json: any, nameHint?: string): ResolvedSlide {
@@ -547,6 +558,12 @@ export default function Present() {
   const presentCtxRef = useRef<CanvasRenderingContext2D | null>(null);
   const allDrawingsRef = useRef<CanvasDataMap>({});
   const currentLineRef = useRef<Point[]>([]);
+  // 📍 Text-label annotations placed from the phone - annotationsRef is the
+  // mutable source of truth (mirrors allDrawingsRef's role above), while
+  // the `annotations` state exists purely to trigger a re-render, since
+  // (unlike pen strokes) these are real DOM elements, not canvas pixels.
+  const annotationsRef = useRef<AnnotationsMap>({});
+  const [annotations, setAnnotations] = useState<AnnotationsMap>({});
   // Pixel coords of the last point drawn for the in-progress remote stroke.
   // See the draw_stroke handler below for why this exists (fixes highlighter
   // strokes rendering much darker than their final, redrawn appearance).
@@ -980,7 +997,7 @@ export default function Present() {
     const setupSession = async () => {
       const { data } = await supabase
         .from('sessions')
-        .select('id, canvas_data, session_state, audience_state')
+        .select('id, canvas_data, annotations_data, session_state, audience_state')
         .eq('id', sessionId)
         .maybeSingle();
 
@@ -990,13 +1007,14 @@ export default function Present() {
         const pin = String(Math.floor(1000 + Math.random() * 9000));
         setSessionPin(pin);
         await supabase.from('sessions').insert([{
-          id: sessionId, file_id: fileId, current_slide: 1, current_build: 0, canvas_data: {},
+          id: sessionId, file_id: fileId, current_slide: 1, current_build: 0, canvas_data: {}, annotations_data: {},
           session_state: { ...DEFAULT_SESSION_STATE, pin },
           audience_state: DEFAULT_AUDIENCE_STATE,
         }]);
       } else {
         await supabase.from('sessions').update({ file_id: fileId }).eq('id', sessionId);
         if (data.canvas_data) allDrawingsRef.current = data.canvas_data as CanvasDataMap;
+        if (data.annotations_data) { annotationsRef.current = data.annotations_data as AnnotationsMap; setAnnotations(annotationsRef.current); }
         if (data.session_state) {
           const s = data.session_state as SessionState;
           if (s.screenMode) setScreenMode(s.screenMode);
@@ -1324,6 +1342,69 @@ export default function Present() {
         allDrawingsRef.current[flatNum] = strokes.slice(0, -1);
         redrawCanvasForSlide(flatNum, allDrawingsRef.current);
         supabase.from('sessions').upsert({ id: sessionId, canvas_data: allDrawingsRef.current });
+      });
+
+      // 📍 Text-label annotations placed from the phone. Unlike the pen
+      // strokes above, these stay as editable objects (add/update/remove
+      // one at a time) rather than getting baked into canvas pixels - the
+      // slide bucket is always this host's OWN current position
+      // (currentFlatIndexRef), the same rule draw_stroke/draw_clear use
+      // above, so a stray desync on the phone's side can't file a new
+      // label under the wrong slide.
+      channel.on('broadcast', { event: 'annotation_add' }, (payload) => {
+        const annotation = payload.payload?.annotation as Annotation | undefined;
+        if (!annotation || !annotation.id) return;
+        const flatNum = currentFlatIndexRef.current + 1;
+        const next = { ...annotationsRef.current, [flatNum]: [...(annotationsRef.current[flatNum] || []), annotation] };
+        annotationsRef.current = next;
+        setAnnotations(next);
+        supabase.from('sessions').upsert({ id: sessionId, annotations_data: next });
+      });
+
+      // Update/remove look the annotation up by id across every slide
+      // (rather than trusting a slide number from the phone) - simpler and
+      // more robust, since an id is always unique regardless of which
+      // slide it's actually filed under.
+      channel.on('broadcast', { event: 'annotation_update' }, (payload) => {
+        const { id, text } = payload.payload || {};
+        if (!id || typeof text !== 'string') return;
+        const next: AnnotationsMap = {};
+        for (const key of Object.keys(annotationsRef.current)) {
+          const slideNum = Number(key);
+          next[slideNum] = annotationsRef.current[slideNum].map((a) => (a.id === id ? { ...a, text } : a));
+        }
+        annotationsRef.current = next;
+        setAnnotations(next);
+        supabase.from('sessions').upsert({ id: sessionId, annotations_data: next });
+      });
+
+      channel.on('broadcast', { event: 'annotation_remove' }, (payload) => {
+        const id = payload.payload?.id;
+        if (!id) return;
+        const next: AnnotationsMap = {};
+        for (const key of Object.keys(annotationsRef.current)) {
+          const slideNum = Number(key);
+          next[slideNum] = annotationsRef.current[slideNum].filter((a) => a.id !== id);
+        }
+        annotationsRef.current = next;
+        setAnnotations(next);
+        supabase.from('sessions').upsert({ id: sessionId, annotations_data: next });
+      });
+
+      // Clears just the labels (or just the number badges - see `kind`) on
+      // the CURRENT slide - deliberately its own control on the remote,
+      // separate from the pen's Clear button, so wiping a scribble never
+      // also wipes annotations placed on purpose, and clearing one kind
+      // never wipes the other.
+      channel.on('broadcast', { event: 'annotation_clear' }, (payload) => {
+        const flatNum = currentFlatIndexRef.current + 1;
+        const kind = payload.payload?.kind as AnnotationKind | undefined;
+        const existing = annotationsRef.current[flatNum] || [];
+        const nextForSlide = kind ? existing.filter((a) => a.kind !== kind) : [];
+        const next = { ...annotationsRef.current, [flatNum]: nextForSlide };
+        annotationsRef.current = next;
+        setAnnotations(next);
+        supabase.from('sessions').upsert({ id: sessionId, annotations_data: next });
       });
 
       // Presence: count phones connected to this session (excluding this
@@ -2110,6 +2191,29 @@ export default function Present() {
 
             {/* Annotation layer - laser/draw/highlight/erase strokes broadcast from the phone now render here too. */}
             <canvas ref={presentCanvasRef} className="absolute top-0 left-0 w-full h-full pointer-events-none z-10" />
+
+            {/* 📍 Text-label pins + 🔢 number badges - display only here;
+                all placing/editing/deleting happens on the phone remote. */}
+            {(annotations[currentFlatIndex + 1] || []).map((ann) => (
+              ann.kind === 'number' ? (
+                <div
+                  key={ann.id}
+                  className="absolute z-[15] pointer-events-none w-9 h-9 rounded-full flex items-center justify-center text-base font-black text-white shadow-lg border-2 border-white/80"
+                  style={{ left: `${ann.x * 100}%`, top: `${ann.y * 100}%`, backgroundColor: ann.color, transform: 'translate(-50%, -50%)' }}
+                >
+                  {ann.text}
+                </div>
+              ) : (
+                <div
+                  key={ann.id}
+                  className="absolute z-[15] pointer-events-none max-w-[55%] rounded-lg px-2.5 py-1.5 text-sm font-bold shadow-lg flex items-start gap-1"
+                  style={{ left: `${ann.x * 100}%`, top: `${ann.y * 100}%`, backgroundColor: ann.color, color: '#111827', transform: 'translate(-8%, -110%)' }}
+                >
+                  <span className="shrink-0">📍</span>
+                  <span className="whitespace-pre-wrap break-words">{ann.text}</span>
+                </div>
+              )
+            ))}
             </div>
           </div>
           <style>{TRANSITION_KEYFRAMES_CSS}</style>
