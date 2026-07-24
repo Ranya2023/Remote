@@ -1217,7 +1217,7 @@ export default function MobileRemote() {
       if (type === 'move') {
         shapeDragRef.current = { ...shapeDragRef.current, x2: x, y2: y };
         setShapeDraft({ ...shapeDragRef.current, shapeKind: shapeType });
-        sendAnnotationPreview({ kind: 'shape', x: shapeDragRef.current.x1, y: shapeDragRef.current.y1, x2, y2, color: selectedColor, shapeKind: shapeType, filled: shapeFilled, strokeWidth: shapeStrokeWidth });
+        sendAnnotationPreview({ kind: 'shape', x: shapeDragRef.current.x1, y: shapeDragRef.current.y1, x2: x, y2: y, color: selectedColor, shapeKind: shapeType, filled: shapeFilled, strokeWidth: shapeStrokeWidth });
       } else if (type === 'end') {
         const { x1, y1, x2, y2 } = shapeDragRef.current;
         shapeDragRef.current = null;

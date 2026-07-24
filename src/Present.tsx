@@ -300,10 +300,9 @@ interface Annotation { id: string; kind: AnnotationKind; x: number; y: number; x
 type AnnotationsMap = Record<number, Annotation[]>; // keyed by flat slide number (1-based), same pattern as CanvasDataMap
 
 // Ephemeral "about to place this" preview - broadcast live while
-// hold-dragging in Precision mode (see PlacementStyle below), shown on the
-// projector so there's feedback before something is actually committed.
+// hold-dragging in Precision mode (the phone tracks the quick/precision
+// choice itself; the projector only ever displays whatever it's sent).
 // Never persisted, unlike Annotation above - purely a live UI cue.
-type PlacementStyle = 'quick' | 'precision';
 interface AnnotationPreview { kind: AnnotationKind; x: number; y: number; x2?: number; y2?: number; color: string; text?: string; shapeKind?: ShapeKind; filled?: boolean; strokeWidth?: number; }
 
 // Turns a getPdf response into something we know how to render.
