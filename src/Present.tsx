@@ -292,8 +292,11 @@ type CanvasDataMap = Record<number, Stroke[]>; // keyed by flat slide number (1-
 // individually - see the annotation_add/update/remove/clear broadcast
 // handlers below. MUST stay in sync with the matching types in
 // MobileRemote.tsx.
-type AnnotationKind = 'textbox' | 'number';
-interface Annotation { id: string; kind: AnnotationKind; x: number; y: number; color: string; text: string; }
+type AnnotationKind = 'textbox' | 'number' | 'shape';
+type ShapeKind = 'circle' | 'rect' | 'arrow' | 'line';
+// x/y is the primary anchor (textbox/number position, or a shape's first
+// corner/endpoint); x2/y2 is a shape's second corner/endpoint only.
+interface Annotation { id: string; kind: AnnotationKind; x: number; y: number; x2?: number; y2?: number; color: string; text: string; shapeKind?: ShapeKind; }
 type AnnotationsMap = Record<number, Annotation[]>; // keyed by flat slide number (1-based), same pattern as CanvasDataMap
 
 // Turns a getPdf response into something we know how to render.
@@ -551,7 +554,7 @@ export default function Present() {
     const id = setTimeout(() => setTimerAlert((cur) => (cur?.key === timerAlert.key ? null : cur)), timerAlert.flashMs);
     return () => clearTimeout(id);
   }, [timerAlert]);
-  const [laser, setLaser] = useState({ x: 0.5, y: 0.5, active: false, size: 16, color: '#ef4444' });
+  const [laser, setLaser] = useState({ x: 0.5, y: 0.5, active: false, size: 16, color: '#ef4444', label: '' });
   const [videoState, setVideoState] = useState<VideoState>(DEFAULT_VIDEO_STATE);
 
   const presentCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -1081,9 +1084,9 @@ export default function Present() {
       });
 
       channel.on('broadcast', { event: 'laser_move' }, (payload) => {
-        const { x, y, active, size, color } = payload.payload || {};
+        const { x, y, active, size, color, label } = payload.payload || {};
         if (typeof x === 'number' && typeof y === 'number') {
-          setLaser((prev) => ({ x, y, active: !!active, size: size ?? prev.size, color: color ?? prev.color }));
+          setLaser((prev) => ({ x, y, active: !!active, size: size ?? prev.size, color: color ?? prev.color, label: typeof label === 'string' ? label : prev.label }));
         }
       });
 
@@ -1364,14 +1367,15 @@ export default function Present() {
       // Update/remove look the annotation up by id across every slide
       // (rather than trusting a slide number from the phone) - simpler and
       // more robust, since an id is always unique regardless of which
-      // slide it's actually filed under.
+      // slide it's actually filed under. `patch` is a generic partial -
+      // textbox edits send { text }, shape move/resize send { x, y, x2, y2 }.
       channel.on('broadcast', { event: 'annotation_update' }, (payload) => {
-        const { id, text } = payload.payload || {};
-        if (!id || typeof text !== 'string') return;
+        const { id, patch } = payload.payload || {};
+        if (!id || !patch || typeof patch !== 'object') return;
         const next: AnnotationsMap = {};
         for (const key of Object.keys(annotationsRef.current)) {
           const slideNum = Number(key);
-          next[slideNum] = annotationsRef.current[slideNum].map((a) => (a.id === id ? { ...a, text } : a));
+          next[slideNum] = annotationsRef.current[slideNum].map((a) => (a.id === id ? { ...a, ...patch } : a));
         }
         annotationsRef.current = next;
         setAnnotations(next);
@@ -2192,9 +2196,39 @@ export default function Present() {
             {/* Annotation layer - laser/draw/highlight/erase strokes broadcast from the phone now render here too. */}
             <canvas ref={presentCanvasRef} className="absolute top-0 left-0 w-full h-full pointer-events-none z-10" />
 
+            {/* ⭕ Placed shapes - display only here; all drawing/moving/
+                resizing happens on the phone remote. Same percent-based
+                0-100 viewBox trick as the pins below, so it lines up with
+                everything else positioned by left/top percentages. */}
+            <svg className="absolute top-0 left-0 w-full h-full z-[15] pointer-events-none" viewBox="0 0 100 100" preserveAspectRatio="none">
+              {(annotations[currentFlatIndex + 1] || []).filter((a) => a.kind === 'shape').map((ann) => {
+                const x1 = ann.x * 100, y1 = ann.y * 100, x2 = (ann.x2 ?? ann.x) * 100, y2 = (ann.y2 ?? ann.y) * 100;
+                if (ann.shapeKind === 'circle') return <ellipse key={ann.id} cx={(x1 + x2) / 2} cy={(y1 + y2) / 2} rx={Math.abs(x2 - x1) / 2} ry={Math.abs(y2 - y1) / 2} fill="none" stroke={ann.color} strokeWidth={0.5} vectorEffect="non-scaling-stroke" />;
+                if (ann.shapeKind === 'rect') return <rect key={ann.id} x={Math.min(x1, x2)} y={Math.min(y1, y2)} width={Math.abs(x2 - x1)} height={Math.abs(y2 - y1)} fill="none" stroke={ann.color} strokeWidth={0.5} vectorEffect="non-scaling-stroke" />;
+                if (ann.shapeKind === 'arrow') {
+                  // Each arrow gets its own marker (rather than one shared
+                  // marker + CSS context-stroke) so its arrowhead always
+                  // matches ITS OWN color - context-stroke is a newer SVG
+                  // feature without universal browser support yet.
+                  const markerId = `arrow-${ann.id}`;
+                  return (
+                    <g key={ann.id}>
+                      <defs>
+                        <marker id={markerId} viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                          <path d="M 0 0 L 10 5 L 0 10 z" fill={ann.color} />
+                        </marker>
+                      </defs>
+                      <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={ann.color} strokeWidth={0.5} vectorEffect="non-scaling-stroke" markerEnd={`url(#${markerId})`} />
+                    </g>
+                  );
+                }
+                return <line key={ann.id} x1={x1} y1={y1} x2={x2} y2={y2} stroke={ann.color} strokeWidth={0.5} vectorEffect="non-scaling-stroke" />;
+              })}
+            </svg>
+
             {/* 📍 Text-label pins + 🔢 number badges - display only here;
                 all placing/editing/deleting happens on the phone remote. */}
-            {(annotations[currentFlatIndex + 1] || []).map((ann) => (
+            {(annotations[currentFlatIndex + 1] || []).filter((a) => a.kind !== 'shape').map((ann) => (
               ann.kind === 'number' ? (
                 <div
                   key={ann.id}
@@ -2240,6 +2274,20 @@ export default function Present() {
                 boxShadow: `0 0 ${Math.round(laser.size)}px ${laser.color}`,
               }}
             />
+          )}
+
+          {/* ✍️ Laser-write caption - deliberately independent of laser.active
+              (typing happens with the presenter's thumb off the trackpad, so
+              the dot itself is briefly inactive right when they're typing) -
+              stays wherever the laser last pointed until cleared, the tool
+              changes, or the laser is switched off. */}
+          {laser.label && (
+            <div
+              className="absolute pointer-events-none z-30 max-w-[50%] rounded-full px-3 py-1.5 text-base font-bold shadow-lg"
+              style={{ left: `${laser.x * 100}%`, top: `${laser.y * 100}%`, backgroundColor: laser.color, color: '#111827', transform: 'translate(10%, -50%)' }}
+            >
+              {laser.label}
+            </div>
           )}
 
           {/* Black/White screen - fully covers the stage, topmost layer. */}

@@ -17,8 +17,11 @@ const texts = {
     save: 'پاشەکەوتکردن', saved: 'پاشەکەوتکرا', couldNotSave: 'پاشەکەوت نەکرا', notesKeepUntilRemoved: 'هەتا سڕینەوەی وانەکە دەمێنێتەوە',
     spotlightSize: 'قەبارە',
     laserSize: 'قەبارە', laserColor: 'ڕەنگ',
+    laserWrite: 'نووسین', laserWritePlaceholder: 'دەقێک بنووسە بۆ پیشاندان...',
     textbox: 'دەق', addLabel: 'دانانی نیشانە', labelPlaceholder: 'دەقەکەت لێرە بنووسە...', delete: 'سڕینەوە',
     number: 'ژمارە',
+    shape: 'شێوە', shapeCircle: 'بازنە', shapeRect: 'لاکێشە', shapeArrow: 'ئاڕاستە', shapeLine: 'هێڵ',
+    shapeHint: 'بۆ دروستکردن؛ دەست بگرە و بیکێشە. بۆ دیاریکردن؛ کرتەی لەسەری بکە.',
     play: 'لێدان', pause: 'وەستان', mute: 'بێدەنگ', unmute: 'دەنگ', reset: 'ڕێکخستنەوە', video: 'ڤیدیۆ',
     videoLoading: 'چاوەڕوانی ڤیدیۆ...',
     start: 'دەستپێکردن', minutesLabel: 'خولەک', undo: 'گەڕانەوە', first: 'یەکەم', last: 'کۆتایی',
@@ -36,8 +39,11 @@ const texts = {
     save: 'Save', saved: 'Saved', couldNotSave: 'Could not save', notesKeepUntilRemoved: 'Kept until you remove this lesson',
     spotlightSize: 'Size',
     laserSize: 'Size', laserColor: 'Color',
+    laserWrite: 'Write', laserWritePlaceholder: 'Type something to show...',
     textbox: 'Text', addLabel: 'Add label', labelPlaceholder: 'Type your label...', delete: 'Delete',
     number: 'Number',
+    shape: 'Shapes', shapeCircle: 'Circle', shapeRect: 'Rectangle', shapeArrow: 'Arrow', shapeLine: 'Line',
+    shapeHint: 'Drag to draw. Tap an existing shape to select, move, or resize it.',
     play: 'Play', pause: 'Pause', mute: 'Mute', unmute: 'Unmute', reset: 'Reset', video: 'Video',
     videoLoading: 'Waiting for video...',
     start: 'Start', minutesLabel: 'min', undo: 'Undo', first: 'First', last: 'Last',
@@ -58,8 +64,11 @@ type CanvasDataMap = Record<number, Stroke[]>;
 // later). Unlike the pen strokes above, these stay as editable objects you
 // can add/edit/delete one at a time. MUST stay in sync with the matching
 // types in Present.tsx.
-type AnnotationKind = 'textbox' | 'number';
-interface Annotation { id: string; kind: AnnotationKind; x: number; y: number; color: string; text: string; }
+type AnnotationKind = 'textbox' | 'number' | 'shape';
+type ShapeKind = 'circle' | 'rect' | 'arrow' | 'line';
+// x/y is the primary anchor (textbox/number position, or a shape's first
+// corner/endpoint); x2/y2 is a shape's second corner/endpoint only.
+interface Annotation { id: string; kind: AnnotationKind; x: number; y: number; x2?: number; y2?: number; color: string; text: string; shapeKind?: ShapeKind; }
 type AnnotationsMap = Record<number, Annotation[]>;
 
 // One entry per visible slide (mirrors the type in Present.tsx). Built and
@@ -98,7 +107,7 @@ const NUMBER_COLORS = ['#f87171', '#fb923c', '#fbbf24', '#a3e635', '#34d399', '#
 // stroke shape matters — but it still needs a width.
 const STROKE_WIDTHS: Record<DrawMode, number> = { draw: 4, highlight: 22, erase: 28 };
 
-type ToolMode = 'none' | 'laser' | DrawMode | 'spotlight' | 'zoom' | 'textbox' | 'number';
+type ToolMode = 'none' | 'laser' | DrawMode | 'spotlight' | 'zoom' | 'textbox' | 'number' | 'shape';
 
 const TYPE_ICON: Record<string, string> = { pdf: '📄', image: '🖼️', 'video-link': '▶️', other: '📁' };
 
@@ -220,6 +229,14 @@ export default function MobileRemote() {
   // 60fps for something a poll loop will only check a few times a second.
   const lastPersistedPointerTime = useRef<number>(0);
   const isDrawing = useRef(false);
+  // Touchscreens fire a real touch event AND a synthetic "echo" mouse event
+  // (mousedown/mouseup) for the same physical tap, moments apart, unless
+  // explicitly suppressed. Since these same handlers are wired to both
+  // onTouch* and onMouse* (see the trackpad JSX below) so mouse still works
+  // for desktop testing, an echo would otherwise double-fire anything that
+  // acts immediately on tap (Number, Shapes) - this timestamp lets the
+  // mouse-event path recognize "a real touch JUST handled this" and bail.
+  const lastRealTouchTimeRef = useRef(0);
 
   // Preview state - now generalized to whatever type the active slide is,
   // not just pdf.
@@ -230,6 +247,12 @@ export default function MobileRemote() {
   const [laserSize, setLaserSize] = useState(16);
   const LASER_COLORS = ['#ef4444', '#22c55e', '#3b82f6', '#eab308', '#a855f7', '#ffffff'] as const;
   const [laserColor, setLaserColor] = useState<string>(LASER_COLORS[0]);
+  // ✍️ Laser write - a text caption that rides along with the laser dot.
+  // Deliberately NOT tied to the dot's active/dragging state (typing means
+  // your thumb is off the trackpad, so the dot itself is inactive at that
+  // exact moment) - it just sticks at wherever the laser last pointed until
+  // cleared, tools change, or laser mode turns off.
+  const [laserLabel, setLaserLabel] = useState('');
 
   // This button controls the PROJECTOR's full screen, not the phone's -
   // just sends a request; Present.tsx does the actual toggling and reports
@@ -368,6 +391,17 @@ export default function MobileRemote() {
   const annotationsRef = useRef<AnnotationsMap>({});
   const [annotations, setAnnotations] = useState<AnnotationsMap>({});
   const [textboxDraft, setTextboxDraft] = useState<{ x: number; y: number; editingId?: string; text: string } | null>(null);
+
+  // ⭕ Shapes - which kind gets drawn next; a live preview while dragging
+  // out a NEW shape (shapeDragRef is the mutable in-progress box, shapeDraft
+  // mirrors it into state purely to render the live preview); which shape
+  // (if any) is currently selected for move/resize; and the in-progress
+  // move/resize gesture on a selected shape's handle, if any.
+  const [shapeType, setShapeType] = useState<ShapeKind>('rect');
+  const shapeDragRef = useRef<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
+  const [shapeDraft, setShapeDraft] = useState<{ x1: number; y1: number; x2: number; y2: number; shapeKind: ShapeKind } | null>(null);
+  const [selectedShapeId, setSelectedShapeId] = useState<string | null>(null);
+  const shapeHandleDragRef = useRef<{ mode: 'move' | 'resize'; id: string; startX: number; startY: number; orig: { x: number; y: number; x2: number; y2: number } } | null>(null);
 
   const activeFlat = flatSlides[currentSlide - 1];
   // How many builds (bullet/shape reveals) the current slide has, so
@@ -972,6 +1006,16 @@ export default function MobileRemote() {
     });
   };
 
+  // ✍️ Laser write - fires the instant you type, unlike the drag-driven
+  // broadcast above, since typing happens with your thumb off the
+  // trackpad (the dot itself briefly goes inactive at that exact moment,
+  // but the caption should still update right away). Rides along at
+  // whatever position the laser dot last had.
+  const updateLaserLabel = (text: string) => {
+    setLaserLabel(text);
+    channelRef.current?.send({ type: 'broadcast', event: 'laser_move', payload: { x: myLaser.x, y: myLaser.y, active: myLaser.active, size: laserSize, color: laserColor, label: text } });
+  };
+
   const sendPointerData = (e: React.TouchEvent | React.MouseEvent, type: 'start' | 'move' | 'end') => {
     if (!ready || !channelRef.current || activeMode === 'none' || !trackpadRef.current) return;
 
@@ -993,8 +1037,8 @@ export default function MobileRemote() {
 
       const isActive = type !== 'end';
       setMyLaser({ x, y, active: isActive });
-      channelRef.current.send({ type: 'broadcast', event: 'laser_move', payload: { x, y, active: isActive, size: laserSize, color: laserColor } });
-      persistPointerState('laser', { x, y, active: isActive, size: laserSize, color: laserColor });
+      channelRef.current.send({ type: 'broadcast', event: 'laser_move', payload: { x, y, active: isActive, size: laserSize, color: laserColor, label: laserLabel } });
+      persistPointerState('laser', { x, y, active: isActive, size: laserSize, color: laserColor, label: laserLabel });
     } else if (activeMode === 'spotlight') {
       const now = Date.now();
       if (now - lastSentTime.current < 16 && type === 'move') return;
@@ -1091,6 +1135,39 @@ export default function MobileRemote() {
       annotationsRef.current = nextMap;
       setAnnotations(nextMap);
       channelRef.current.send({ type: 'broadcast', event: 'annotation_add', payload: { annotation } });
+    } else if (activeMode === 'shape') {
+      // Selecting/moving/resizing an EXISTING shape is handled entirely by
+      // its own hit-area and handle elements in the trackpad JSX below
+      // (with stopPropagation, so it never reaches here). This branch only
+      // ever does two things: drag-to-draw a brand NEW shape on empty
+      // space, or - if something is currently selected - treat a tap on
+      // empty space as "deselect" rather than immediately starting a new
+      // shape underneath it (a second, deliberate drag starts the new one).
+      if (type === 'start') {
+        if (selectedShapeId) { setSelectedShapeId(null); return; }
+        shapeDragRef.current = { x1: x, y1: y, x2: x, y2: y };
+        setShapeDraft({ x1: x, y1: y, x2: x, y2: y, shapeKind: shapeType });
+        return;
+      }
+      if (!shapeDragRef.current) return;
+      if (type === 'move') {
+        shapeDragRef.current = { ...shapeDragRef.current, x2: x, y2: y };
+        setShapeDraft({ ...shapeDragRef.current, shapeKind: shapeType });
+      } else if (type === 'end') {
+        const { x1, y1, x2, y2 } = shapeDragRef.current;
+        shapeDragRef.current = null;
+        setShapeDraft(null);
+        if (Math.hypot(x2 - x1, y2 - y1) < 0.02) return; // too small to be a deliberate shape - likely just a tap
+        const slideNum = currentSlideRef.current;
+        const annotation: Annotation = {
+          id: `ann_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+          kind: 'shape', x: x1, y: y1, x2, y2, color: selectedColor, text: '', shapeKind: shapeType,
+        };
+        const nextMap = { ...annotationsRef.current, [slideNum]: [...(annotationsRef.current[slideNum] || []), annotation] };
+        annotationsRef.current = nextMap;
+        setAnnotations(nextMap);
+        channelRef.current.send({ type: 'broadcast', event: 'annotation_add', payload: { annotation } });
+      }
     }
   };
 
@@ -1123,7 +1200,7 @@ export default function MobileRemote() {
   // one array per slide (see AnnotationsMap), so undo/clear are kind-aware
   // - clearing numbers never touches labels and vice versa. Annotations
   // stay until deleted (no auto-fade).
-  const annotationKindForMode = (mode: ToolMode): AnnotationKind | null => (mode === 'textbox' ? 'textbox' : mode === 'number' ? 'number' : null);
+  const annotationKindForMode = (mode: ToolMode): AnnotationKind | null => (mode === 'textbox' ? 'textbox' : mode === 'number' ? 'number' : mode === 'shape' ? 'shape' : null);
 
   const closeTextboxModal = () => setTextboxDraft(null);
 
@@ -1147,7 +1224,7 @@ export default function MobileRemote() {
       const nextMap = { ...annotationsRef.current, [slideNum]: nextForSlide };
       annotationsRef.current = nextMap;
       setAnnotations(nextMap);
-      channelRef.current.send({ type: 'broadcast', event: 'annotation_update', payload: { id: textboxDraft.editingId, text } });
+      channelRef.current.send({ type: 'broadcast', event: 'annotation_update', payload: { id: textboxDraft.editingId, patch: { text } } });
     } else {
       if (!text) { setTextboxDraft(null); return; }
       const annotation: Annotation = { id: `ann_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`, kind: 'textbox', x: textboxDraft.x, y: textboxDraft.y, color: selectedColor, text };
@@ -1179,6 +1256,79 @@ export default function MobileRemote() {
     channelRef.current.send({ type: 'broadcast', event: 'annotation_clear', payload: { kind } });
   };
 
+  // ⭕ Shape move/resize - dragging a selected shape's handle. Deliberately
+  // separate from sendPointerData's generic drag flow above: the handle
+  // itself only fires the START (with stopPropagation, so the trackpad's
+  // own create-a-new-shape drag doesn't also fire at the same time) - the
+  // CONTINUING move/end while dragging is picked up by the trackpad's own
+  // handleTouchMove/handleTouchEnd (see the check added at the top of each),
+  // since those already reliably track the gesture across the full trackpad
+  // area for both touch and mouse, which a tiny handle element can't do on
+  // its own for mouse (a touch stays targeted at its start element; a mouse
+  // does not once the cursor leaves that tiny element).
+  const clientXYFromEvent = (e: React.TouchEvent | React.MouseEvent): { x: number; y: number } | null => {
+    const touchEvent = e as React.TouchEvent;
+    const touch = touchEvent.touches?.[0] ?? touchEvent.changedTouches?.[0];
+    const clientX = 'touches' in e ? touch?.clientX : (e as React.MouseEvent).clientX;
+    const clientY = 'touches' in e ? touch?.clientY : (e as React.MouseEvent).clientY;
+    if (clientX === undefined || clientY === undefined) return null;
+    return { x: clientX, y: clientY };
+  };
+
+  const startShapeHandleDrag = (e: React.TouchEvent | React.MouseEvent, mode: 'move' | 'resize', ann: Annotation) => {
+    e.stopPropagation();
+    if (!trackpadRef.current) return;
+    const pos = clientXYFromEvent(e);
+    if (!pos) return;
+    const rect = trackpadRef.current.getBoundingClientRect();
+    shapeHandleDragRef.current = {
+      mode, id: ann.id,
+      startX: (pos.x - rect.left) / rect.width, startY: (pos.y - rect.top) / rect.height,
+      orig: { x: ann.x, y: ann.y, x2: ann.x2 ?? ann.x, y2: ann.y2 ?? ann.y },
+    };
+  };
+
+  const moveShapeHandleDrag = (e: React.TouchEvent | React.MouseEvent) => {
+    const drag = shapeHandleDragRef.current;
+    if (!drag || !trackpadRef.current) return;
+    const pos = clientXYFromEvent(e);
+    if (!pos) return;
+    const rect = trackpadRef.current.getBoundingClientRect();
+    const curX = Math.max(0, Math.min(1, (pos.x - rect.left) / rect.width));
+    const curY = Math.max(0, Math.min(1, (pos.y - rect.top) / rect.height));
+    const dx = curX - drag.startX;
+    const dy = curY - drag.startY;
+    const patch = drag.mode === 'move'
+      ? { x: drag.orig.x + dx, y: drag.orig.y + dy, x2: drag.orig.x2 + dx, y2: drag.orig.y2 + dy }
+      : { x2: drag.orig.x2 + dx, y2: drag.orig.y2 + dy };
+    const slideNum = currentSlideRef.current;
+    const nextForSlide = (annotationsRef.current[slideNum] || []).map((a) => (a.id === drag.id ? { ...a, ...patch } : a));
+    const nextMap = { ...annotationsRef.current, [slideNum]: nextForSlide };
+    annotationsRef.current = nextMap;
+    setAnnotations(nextMap);
+  };
+
+  // Broadcasts only once, on release - not on every move like the laser
+  // dot - so a resize doesn't flood the channel. The phone already sees it
+  // move live (the local state update above); the projector catches up the
+  // moment you let go.
+  const endShapeHandleDrag = () => {
+    const drag = shapeHandleDragRef.current;
+    if (!drag) return;
+    shapeHandleDragRef.current = null;
+    const slideNum = currentSlideRef.current;
+    const updated = (annotationsRef.current[slideNum] || []).find((a) => a.id === drag.id);
+    if (updated && channelRef.current) {
+      channelRef.current.send({ type: 'broadcast', event: 'annotation_update', payload: { id: updated.id, patch: { x: updated.x, y: updated.y, x2: updated.x2, y2: updated.y2 } } });
+    }
+  };
+
+  const deleteSelectedShape = () => {
+    if (!selectedShapeId) return;
+    deleteAnnotation(selectedShapeId);
+    setSelectedShapeId(null);
+  };
+
   // Switching modes (or tapping the active mode off) force-hides the laser
   // immediately, so if you forget to lift your finger and just hit the
   // button instead, the dot still disappears on both screens.
@@ -1187,13 +1337,20 @@ export default function MobileRemote() {
 
     if (activeMode === 'laser' && newMode !== 'laser') {
       setMyLaser((prev) => ({ ...prev, active: false }));
-      channelRef.current?.send({ type: 'broadcast', event: 'laser_move', payload: { x: myLaser.x, y: myLaser.y, active: false } });
+      setLaserLabel('');
+      channelRef.current?.send({ type: 'broadcast', event: 'laser_move', payload: { x: myLaser.x, y: myLaser.y, active: false, label: '' } });
     }
     if (activeMode === 'spotlight' && newMode !== 'spotlight') {
       channelRef.current?.send({ type: 'broadcast', event: 'spotlight_move', payload: { x: 0.5, y: 0.5, active: false, radius: spotlightRadius } });
     }
     if (activeMode === 'textbox' && newMode !== 'textbox') {
       setTextboxDraft(null);
+    }
+    if (activeMode === 'shape' && newMode !== 'shape') {
+      setSelectedShapeId(null);
+      shapeDragRef.current = null;
+      setShapeDraft(null);
+      shapeHandleDragRef.current = null;
     }
 
     setActiveMode(newMode as ToolMode);
@@ -1227,6 +1384,8 @@ export default function MobileRemote() {
   const touchDist = (t1: React.Touch, t2: React.Touch) => Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
 
   const handleTouchStart = (e: React.TouchEvent | React.MouseEvent) => {
+    if (e.type.startsWith('touch')) lastRealTouchTimeRef.current = Date.now();
+    else if (Date.now() - lastRealTouchTimeRef.current < 800) return; // synthetic mouse echo of a touch we just handled
     const touches = (e as React.TouchEvent).touches;
     if (touches && touches.length === 2) {
       pinchRef.current = { startDist: touchDist(touches[0], touches[1]), startScale: zoom.scale };
@@ -1237,6 +1396,9 @@ export default function MobileRemote() {
     sendPointerData(e, 'start');
   };
   const handleTouchMove = (e: React.TouchEvent | React.MouseEvent) => {
+    if (e.type.startsWith('touch')) lastRealTouchTimeRef.current = Date.now();
+    else if (Date.now() - lastRealTouchTimeRef.current < 800) return;
+    if (shapeHandleDragRef.current) { moveShapeHandleDrag(e); return; }
     const touches = (e as React.TouchEvent).touches;
     if (touches && touches.length === 2) {
       if (!ready || !channelRef.current) return;
@@ -1259,6 +1421,9 @@ export default function MobileRemote() {
     sendPointerData(e, 'move');
   };
   const handleTouchEnd = (e: React.TouchEvent | React.MouseEvent) => {
+    if (e.type.startsWith('touch')) lastRealTouchTimeRef.current = Date.now();
+    else if (Date.now() - lastRealTouchTimeRef.current < 800) return;
+    if (shapeHandleDragRef.current) { endShapeHandleDrag(); return; }
     const touches = (e as React.TouchEvent).touches;
     if (pinchRef.current && (!touches || touches.length < 2)) {
       // Pinch ending (fingers lifted) - don't let the remaining single
@@ -1565,6 +1730,15 @@ export default function MobileRemote() {
               <button onClick={handleClearAnnotations} className="px-3 py-1 rounded-full bg-[#1b2140] border border-[#2c3560] text-white text-xs font-bold">{t.clear}</button>
             </div>
           )}
+          {activeMode === 'shape' && (
+            <div className="flex gap-2">
+              {selectedShapeId && (
+                <button onClick={deleteSelectedShape} className="px-3 py-1 rounded-full bg-red-900/60 border border-red-700 text-white text-xs font-bold">🗑 {t.delete}</button>
+              )}
+              <button onClick={handleUndoAnnotation} className="px-3 py-1 rounded-full bg-[#1b2140] border border-[#2c3560] text-white text-xs font-bold">↶ {t.undo}</button>
+              <button onClick={handleClearAnnotations} className="px-3 py-1 rounded-full bg-[#1b2140] border border-[#2c3560] text-white text-xs font-bold">{t.clear}</button>
+            </div>
+          )}
         </div>
         <div className="grid grid-cols-3 gap-1.5 mb-2">
           {([
@@ -1576,6 +1750,7 @@ export default function MobileRemote() {
             ['zoom', '🔍', t.zoom, 'from-teal-400/20 to-teal-400/5', 'border-teal-400', 'shadow-teal-400/40'],
             ['textbox', '📍', t.textbox, 'from-cyan-400/20 to-cyan-400/5', 'border-cyan-400', 'shadow-cyan-400/40'],
             ['number', '🔢', t.number, 'from-orange-400/20 to-orange-400/5', 'border-orange-400', 'shadow-orange-400/40'],
+            ['shape', '⭕', t.shape, 'from-violet-400/20 to-violet-400/5', 'border-violet-400', 'shadow-violet-400/40'],
           ] as const).map(([mode, icon, label, grad, border, glow]) => (
             <button
               key={mode}
@@ -1624,6 +1799,18 @@ export default function MobileRemote() {
                 />
               ))}
             </div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-gray-400 font-bold shrink-0">✍️ {t.laserWrite}</span>
+              <input
+                value={laserLabel}
+                onChange={(e) => updateLaserLabel(e.target.value)}
+                placeholder={t.laserWritePlaceholder}
+                className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+              />
+              {laserLabel && (
+                <button onClick={() => updateLaserLabel('')} className="shrink-0 text-gray-500 hover:text-red-400 text-sm">✕</button>
+              )}
+            </div>
           </div>
         )}
 
@@ -1661,8 +1848,32 @@ export default function MobileRemote() {
           </div>
         )}
 
-        {/* Color picker — only meaningful for draw/highlight (erase ignores color), and now textbox labels too */}
-        {(activeMode === 'draw' || activeMode === 'highlight' || activeMode === 'textbox') && (
+        {/* Shape-kind picker - only shown while Shapes mode is active. */}
+        {activeMode === 'shape' && (
+          <div className="flex flex-col gap-1.5 mb-2">
+            <div className="flex gap-1.5">
+              {([
+                ['circle', '⭕', t.shapeCircle],
+                ['rect', '▭', t.shapeRect],
+                ['arrow', '↗️', t.shapeArrow],
+                ['line', '➖', t.shapeLine],
+              ] as const).map(([kind, icon, label]) => (
+                <button
+                  key={kind}
+                  onClick={() => setShapeType(kind)}
+                  className={`flex-1 rounded-lg py-1.5 text-[11px] font-bold flex flex-col items-center gap-0.5 ${shapeType === kind ? 'bg-violet-600 text-white' : 'bg-gray-800 text-gray-400'}`}
+                >
+                  <span className="text-sm leading-none">{icon}</span>
+                  {label}
+                </button>
+              ))}
+            </div>
+            <p className="text-[10px] text-gray-500">{t.shapeHint}</p>
+          </div>
+        )}
+
+        {/* Color picker — only meaningful for draw/highlight (erase ignores color), and now textbox labels + shapes too */}
+        {(activeMode === 'draw' || activeMode === 'highlight' || activeMode === 'textbox' || activeMode === 'shape') && (
           <div className="flex items-center gap-2 mb-2 overflow-x-auto pb-1">
             <span className="text-xs text-gray-400 font-bold shrink-0">{t.color}:</span>
             {PRESET_COLORS.map((c) => (
@@ -1737,6 +1948,102 @@ export default function MobileRemote() {
           {/* Local drawing overlay, mirrors what's drawn via Present.tsx's canvas */}
           <canvas ref={canvasRef} className="absolute top-0 left-0 w-full h-full pointer-events-none z-30" />
 
+          {/* ⭕ Shapes - one SVG overlay draws every placed shape plus the
+              live preview of one being dragged out right now. Percent-based
+              0-100 viewBox stretched non-uniformly (preserveAspectRatio=
+              "none") to match the same left/top-percentage positioning
+              used everywhere else on this trackpad. */}
+          <svg className="absolute top-0 left-0 w-full h-full z-[24] pointer-events-none" viewBox="0 0 100 100" preserveAspectRatio="none">
+            {(annotations[currentSlide] || []).filter((a) => a.kind === 'shape').map((ann) => {
+              const x1 = ann.x * 100, y1 = ann.y * 100, x2 = (ann.x2 ?? ann.x) * 100, y2 = (ann.y2 ?? ann.y) * 100;
+              const selected = ann.id === selectedShapeId;
+              const dash = selected ? '2 1.5' : undefined;
+              if (ann.shapeKind === 'circle') return <ellipse key={ann.id} cx={(x1 + x2) / 2} cy={(y1 + y2) / 2} rx={Math.abs(x2 - x1) / 2} ry={Math.abs(y2 - y1) / 2} fill="none" stroke={ann.color} strokeWidth={selected ? 1 : 0.6} strokeDasharray={dash} vectorEffect="non-scaling-stroke" />;
+              if (ann.shapeKind === 'rect') return <rect key={ann.id} x={Math.min(x1, x2)} y={Math.min(y1, y2)} width={Math.abs(x2 - x1)} height={Math.abs(y2 - y1)} fill="none" stroke={ann.color} strokeWidth={selected ? 1 : 0.6} strokeDasharray={dash} vectorEffect="non-scaling-stroke" />;
+              if (ann.shapeKind === 'arrow') {
+                // Own marker per arrow (rather than one shared marker + CSS
+                // context-stroke) so its arrowhead always matches ITS OWN
+                // color - context-stroke doesn't have universal browser
+                // support yet.
+                const markerId = `remote-arrow-${ann.id}`;
+                return (
+                  <g key={ann.id}>
+                    <defs>
+                      <marker id={markerId} viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+                        <path d="M 0 0 L 10 5 L 0 10 z" fill={ann.color} />
+                      </marker>
+                    </defs>
+                    <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={ann.color} strokeWidth={selected ? 1 : 0.6} strokeDasharray={dash} vectorEffect="non-scaling-stroke" markerEnd={`url(#${markerId})`} />
+                  </g>
+                );
+              }
+              return <line key={ann.id} x1={x1} y1={y1} x2={x2} y2={y2} stroke={ann.color} strokeWidth={selected ? 1 : 0.6} strokeDasharray={dash} vectorEffect="non-scaling-stroke" />;
+            })}
+            {shapeDraft && (() => {
+              const x1 = shapeDraft.x1 * 100, y1 = shapeDraft.y1 * 100, x2 = shapeDraft.x2 * 100, y2 = shapeDraft.y2 * 100;
+              if (shapeDraft.shapeKind === 'circle') return <ellipse cx={(x1 + x2) / 2} cy={(y1 + y2) / 2} rx={Math.abs(x2 - x1) / 2} ry={Math.abs(y2 - y1) / 2} fill="none" stroke={selectedColor} strokeWidth={0.6} strokeDasharray="2 1.5" vectorEffect="non-scaling-stroke" />;
+              if (shapeDraft.shapeKind === 'rect') return <rect x={Math.min(x1, x2)} y={Math.min(y1, y2)} width={Math.abs(x2 - x1)} height={Math.abs(y2 - y1)} fill="none" stroke={selectedColor} strokeWidth={0.6} strokeDasharray="2 1.5" vectorEffect="non-scaling-stroke" />;
+              if (shapeDraft.shapeKind === 'arrow') {
+                return (
+                  <g>
+                    <defs>
+                      <marker id="remote-arrow-draft" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+                        <path d="M 0 0 L 10 5 L 0 10 z" fill={selectedColor} />
+                      </marker>
+                    </defs>
+                    <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={selectedColor} strokeWidth={0.6} strokeDasharray="2 1.5" vectorEffect="non-scaling-stroke" markerEnd="url(#remote-arrow-draft)" />
+                  </g>
+                );
+              }
+              return <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={selectedColor} strokeWidth={0.6} strokeDasharray="2 1.5" vectorEffect="non-scaling-stroke" />;
+            })()}
+          </svg>
+
+          {/* Per-shape hit-area (tap to select) + move/resize handles for
+              whichever one is currently selected - plain HTML buttons, not
+              SVG, so they can reuse the same touch/mouse drag wiring as the
+              rest of this file. Only interactive while Shapes mode is
+              active, so they don't intercept taps meant for other tools. */}
+          {activeMode === 'shape' && (annotations[currentSlide] || []).filter((a) => a.kind === 'shape').map((ann) => {
+            const left = Math.min(ann.x, ann.x2 ?? ann.x) * 100, top = Math.min(ann.y, ann.y2 ?? ann.y) * 100;
+            const width = Math.abs((ann.x2 ?? ann.x) - ann.x) * 100, height = Math.abs((ann.y2 ?? ann.y) - ann.y) * 100;
+            const selected = ann.id === selectedShapeId;
+            const midX = (ann.x + (ann.x2 ?? ann.x)) / 2 * 100, midY = (ann.y + (ann.y2 ?? ann.y)) / 2 * 100;
+            const cornerX = (ann.x2 ?? ann.x) * 100, cornerY = (ann.y2 ?? ann.y) * 100;
+            return (
+              <React.Fragment key={ann.id}>
+                <button
+                  onClick={(e) => { e.stopPropagation(); setSelectedShapeId(ann.id); }}
+                  onTouchStart={(e) => e.stopPropagation()}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  aria-label="shape"
+                  className="absolute z-[24]"
+                  style={{ left: `${left}%`, top: `${top}%`, width: `${Math.max(width, 4)}%`, height: `${Math.max(height, 4)}%` }}
+                />
+                {selected && (
+                  <>
+                    <button
+                      onTouchStart={(e) => startShapeHandleDrag(e, 'move', ann)}
+                      onMouseDown={(e) => startShapeHandleDrag(e, 'move', ann)}
+                      aria-label="move shape"
+                      className="absolute z-[26] w-6 h-6 -ml-3 -mt-3 rounded-full bg-white/90 border-2 border-violet-500 flex items-center justify-center text-[10px]"
+                      style={{ left: `${midX}%`, top: `${midY}%` }}
+                    >
+                      ✥
+                    </button>
+                    <button
+                      onTouchStart={(e) => startShapeHandleDrag(e, 'resize', ann)}
+                      onMouseDown={(e) => startShapeHandleDrag(e, 'resize', ann)}
+                      aria-label="resize shape"
+                      className="absolute z-[26] w-5 h-5 -ml-2.5 -mt-2.5 rounded-full bg-violet-500 border-2 border-white"
+                      style={{ left: `${cornerX}%`, top: `${cornerY}%` }}
+                    />
+                  </>
+                )}
+              </React.Fragment>
+            );
+          })}
+
           {/* 📍 Placed text-label pins + 🔢 number badges - always visible,
               but only tappable (to edit/remove) while their own tool is
               active, so they don't intercept taps meant for other tools. */}
@@ -1782,6 +2089,18 @@ export default function MobileRemote() {
               className="absolute pointer-events-none z-40 rounded-full bg-red-500 shadow-[0_0_12px_#ef4444]"
               style={{ width: '14px', height: '14px', left: `${myLaser.x * 100}%`, top: `${myLaser.y * 100}%`, transform: 'translate(-50%, -50%)' }}
             />
+          )}
+
+          {/* ✍️ Laser-write caption - visible regardless of the dot's
+              active state (typing means your thumb just left the
+              trackpad), so it doesn't flicker out while you're typing. */}
+          {laserLabel && (
+            <div
+              className="absolute pointer-events-none z-40 max-w-[70%] rounded-full px-2.5 py-1 text-xs font-bold shadow-lg"
+              style={{ left: `${myLaser.x * 100}%`, top: `${myLaser.y * 100}%`, backgroundColor: laserColor, color: '#111827', transform: 'translate(10%, -50%)' }}
+            >
+              {laserLabel}
+            </div>
           )}
         </div>
       </div>
