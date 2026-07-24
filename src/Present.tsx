@@ -432,29 +432,36 @@ const TRANSITION_KEYFRAMES_CSS = `
 @keyframes nextslide-slide-in-d { from { transform: translateY(-6%); opacity: 0.3; } to { transform: translateY(0); opacity: 1; } }
 `;
 
-function withPlaybackParams(embedUrl: string, platform?: string): string {
+function withPlaybackParams(embedUrl: string, platform: string | undefined, audioUnlocked: boolean): string {
   try {
     const url = new URL(embedUrl);
+    // Priority order: YouTube, then Google Drive, then Vimeo.
     if (platform === 'youtube' || url.hostname.includes('youtube.com') || url.hostname.includes('youtu.be')) {
       url.searchParams.set('enablejsapi', '1');
       url.searchParams.set('autoplay', '1');
       url.searchParams.set('playsinline', '1');
+      // Browsers only allow autoplay WITH sound once this page has seen a
+      // genuine click (audioUnlocked - set by the Fullscreen button, or any
+      // other click, see the listener below). Until then, autoplay muted
+      // so the video reliably starts instead of silently failing to play
+      // at all; the iframe remounts (see the `key` at the call site) the
+      // instant audioUnlocked flips true, picking up sound right away.
+      if (!audioUnlocked) url.searchParams.set('mute', '1');
       return url.toString();
+    }
+    if (platform === 'google-drive' || platform === 'drive' || url.hostname.includes('drive.google.com')) {
+      // Google Drive's /preview embed doesn't have a documented autoplay
+      // parameter the way YouTube/Vimeo do - nothing reliable to add here.
+      return embedUrl;
     }
     if (platform === 'vimeo' || url.hostname.includes('vimeo.com')) {
       url.searchParams.set('autoplay', '1');
-      // Vimeo's docs note some browsers only honor autoplay if the embed
-      // is also muted at start - unlike YouTube, this isn't optional
-      // there's no separate unmute-after-load trick available here, so a
-      // presenter would need to manually unmute via the player's own
-      // controls if audio is needed. Given the alternative is the video
-      // sometimes not autoplaying at all, autoplaying muted is the safer
-      // default.
-      url.searchParams.set('muted', '1');
+      // Same audioUnlocked gate as YouTube above - this used to force
+      // muted=1 unconditionally, so Vimeo videos autoplayed but were never
+      // heard even after a genuine click had already happened on the page.
+      if (!audioUnlocked) url.searchParams.set('muted', '1');
       return url.toString();
     }
-    // Google Drive's /preview embed doesn't have a documented autoplay
-    // parameter the way YouTube/Vimeo do - nothing reliable to add here.
     return embedUrl;
   } catch {
     return embedUrl;
@@ -767,6 +774,27 @@ export default function Present() {
     }
   }, [persistAudienceState, fileId]);
 
+  // Re-fetches saved quizzes (file-scoped + account-level) and merges them
+  // into audienceState. setupSession below already does this once on load,
+  // but that fetch can still be resolving (or can lose a race with auth
+  // loading) by the time the presenter actually opens the Quiz panel - so
+  // the list looked empty until *something else* (like saving a new quiz)
+  // happened to call persistAudienceState afterwards. Calling this again
+  // every time the Quiz panel opens makes sure it's always current.
+  const refreshSavedQuizzes = useCallback(async () => {
+    if (!fileId) return;
+    const [{ data: savedQuizRow }, accountQuizzes] = await Promise.all([
+      supabase.from('saved_quizzes_by_file').select('quizzes').eq('file_id', fileId).maybeSingle(),
+      fetchAccountSavedQuizzes(),
+    ]);
+    const fileScoped = (savedQuizRow?.quizzes as SavedQuiz[] | undefined) || [];
+    const seenTitles = new Set(fileScoped.map((q) => q.title.trim().toLowerCase()));
+    const merged = [...fileScoped, ...accountQuizzes.filter((q) => !seenTitles.has(q.title.trim().toLowerCase()))];
+    if (merged.length) {
+      persistAudienceState({ ...audienceStateRef.current, savedQuizzes: merged });
+    }
+  }, [persistAudienceState, fileId]);
+
   // Auto-reveal when the countdown for the current question runs out -
   // the presenter tab is the single timer authority so everyone's clock
   // agrees, regardless of individual device clock drift.
@@ -990,18 +1018,7 @@ export default function Present() {
       // session row on its own mount) reliably sees the full list too,
       // instead of only picking it up once something else happens to call
       // persistAudienceState later.
-      if (fileId) {
-        const [{ data: savedQuizRow }, accountQuizzes] = await Promise.all([
-          supabase.from('saved_quizzes_by_file').select('quizzes').eq('file_id', fileId).maybeSingle(),
-          fetchAccountSavedQuizzes(),
-        ]);
-        const fileScoped = (savedQuizRow?.quizzes as SavedQuiz[] | undefined) || [];
-        const seenTitles = new Set(fileScoped.map((q) => q.title.trim().toLowerCase()));
-        const merged = [...fileScoped, ...accountQuizzes.filter((q) => !seenTitles.has(q.title.trim().toLowerCase()))];
-        if (merged.length) {
-          persistAudienceState({ ...audienceStateRef.current, savedQuizzes: merged });
-        }
-      }
+      await refreshSavedQuizzes();
     };
 
     const scheduleReconnect = () => {
@@ -1881,7 +1898,7 @@ export default function Present() {
       {!focusMode && (
       <div className="w-80 bg-gray-900 border-r border-gray-800 p-6 flex flex-col items-center justify-between shrink-0">
         <div className="w-full flex justify-end gap-2">
-          <button onClick={() => setQuizPanelOpen(true)} className="text-xs bg-emerald-600 hover:bg-emerald-700 px-3 py-1 rounded relative">
+          <button onClick={() => { setQuizPanelOpen(true); refreshSavedQuizzes(); }} className="text-xs bg-emerald-600 hover:bg-emerald-700 px-3 py-1 rounded relative">
             🧠 Quiz
             {quiz.status !== 'building' && quiz.status !== 'finished' && <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse" />}
           </button>
@@ -2026,9 +2043,9 @@ export default function Present() {
 
             {!loading && !error && resolved?.fileType === 'video-link' && (
               <iframe
-                key={`video-${currentFlatIndex}`}
+                key={`video-${currentFlatIndex}-${audioUnlocked}`}
                 ref={videoIframeRef}
-                src={withPlaybackParams(resolved.embedUrl, resolved.platform)}
+                src={withPlaybackParams(resolved.embedUrl, resolved.platform, audioUnlocked)}
                 title={resolved.name || 'Video'}
                 className="w-full h-full border-0"
                 allow="autoplay; fullscreen; picture-in-picture"
