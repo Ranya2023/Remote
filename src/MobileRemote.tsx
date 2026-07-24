@@ -169,15 +169,37 @@ const DEFAULT_QUIZ_STATE: QuizState = { questions: [], currentIndex: -1, status:
 interface SavedQuiz { id: string; title: string; questions: QuizQuestion[]; createdAt: number; }
 interface AudienceQuestion { id: string; text: string; upvotes: number; answered: boolean; createdAt: number; }
 type FeedbackKind = '👍' | '❤️' | '👏' | '🤔' | '🐢' | '🚀';
+
+// 📚 Question Bank - students submit a fully-formed question (type, text,
+// options, correct answer) via AudienceJoin.tsx's Bank tab, rather than
+// just a raw text idea like AudienceQuestion above - drop one straight
+// into a quiz with one tap instead of retyping it. Deliberately separate
+// from QuizQuestion (used for LIVE quiz questions) - converting one of
+// these happens on "+ Add" below, generating a fresh id/timeLimitSeconds
+// at that point. MUST stay byte-for-byte in sync with Present.tsx and
+// AudienceJoin.tsx.
+type BankQuestionType = 'mcq' | 'truefalse';
+interface BankQuestionOption { id: string; text: string; }
+interface BankQuestion {
+  id: string;
+  authorName: string;
+  type: BankQuestionType;
+  question: string;
+  options: BankQuestionOption[];
+  correctOptionId: string;
+  createdAt: number;
+}
+
 interface AudienceState {
   joinCount: number;
   quiz: QuizState;
   savedQuizzes: SavedQuiz[];
   questions: AudienceQuestion[];
+  questionBank: BankQuestion[];
   feedback: Record<FeedbackKind, number>;
   qnaOpen: boolean;
 }
-const DEFAULT_AUDIENCE_STATE: AudienceState = { joinCount: 0, quiz: DEFAULT_QUIZ_STATE, savedQuizzes: [], questions: [], feedback: { '👍': 0, '❤️': 0, '👏': 0, '🤔': 0, '🐢': 0, '🚀': 0 }, qnaOpen: true };
+const DEFAULT_AUDIENCE_STATE: AudienceState = { joinCount: 0, quiz: DEFAULT_QUIZ_STATE, savedQuizzes: [], questions: [], questionBank: [], feedback: { '👍': 0, '❤️': 0, '👏': 0, '🤔': 0, '🐢': 0, '🚀': 0 }, qnaOpen: true };
 
 export default function MobileRemote() {
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -332,6 +354,28 @@ export default function MobileRemote() {
   const sendQuizControl = (action: string, extra?: any) => {
     channelRef.current?.send({ type: 'broadcast', event: 'quiz_control', payload: { action, ...extra } });
   };
+
+  // 📚 Question Bank - converts a submission into a real, ready-to-launch
+  // QuizQuestion and drops it straight into THIS screen's own draft - no
+  // retyping. 'truefalse' just becomes an ordinary 2-option MCQ.
+  // Dismissing one (removing it from the shared bank) has to go through
+  // Present.tsx instead, since this phone has no direct Supabase write
+  // access - same quiz_control round-trip save_quiz/delete_saved already
+  // use.
+  const addBankQuestionToDraft = (bq: BankQuestion) => {
+    const newQ: QuizQuestion = {
+      id: `q_${Date.now().toString(36)}`,
+      type: 'mcq',
+      question: bq.question,
+      options: bq.options.map((o, i) => ({ id: `opt_${i}`, text: o.text })),
+      correctOptionId: `opt_${bq.options.findIndex((o) => o.id === bq.correctOptionId)}`,
+      source: `Submitted by ${bq.authorName}`,
+      timeLimitSeconds: 20,
+    };
+    setDraftQuestions((prev) => [...prev, newQ]);
+  };
+  const dismissBankQuestion = (id: string) => sendQuizControl('bank_remove', { id });
+
   const startQuizFromPhone = () => {
     if (!draftQuestions.length) return;
     sendQuizControl('start_quiz', { questions: draftQuestions });
@@ -2432,6 +2476,25 @@ export default function MobileRemote() {
                         <span className="flex-1 text-xs truncate">{sq.title} <span className="text-gray-500">({sq.questions.length}q)</span></span>
                         <button onClick={() => sendQuizControl('start_quiz', { questions: sq.questions })} className="text-[10px] bg-emerald-600 px-2 py-0.5 rounded-full font-bold shrink-0">▶</button>
                         <button onClick={() => sendQuizControl('delete_saved', { id: sq.id })} className="text-gray-500 text-xs shrink-0">✕</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {audienceState.questionBank.length > 0 && (
+                  <div className="flex flex-col gap-1.5 bg-gray-800/40 rounded-lg p-2.5">
+                    <p className="text-[10px] font-bold text-gray-400 uppercase">📚 Question Bank</p>
+                    {[...audienceState.questionBank].sort((a, b) => b.createdAt - a.createdAt).map((bq) => (
+                      <div key={bq.id} className="flex items-start gap-2 bg-gray-800/70 rounded-lg px-2.5 py-1.5">
+                        <div className="flex-1 min-w-0">
+                          <p className="text-[9px] text-gray-500">{bq.authorName} · {bq.type === 'truefalse' ? 'True/False' : 'MCQ'}</p>
+                          <p className="text-xs truncate">{bq.question}</p>
+                          <p className="text-[9px] text-emerald-400 truncate">✓ {bq.options.find((o) => o.id === bq.correctOptionId)?.text}</p>
+                        </div>
+                        <div className="flex flex-col gap-1 items-center shrink-0">
+                          <button onClick={() => addBankQuestionToDraft(bq)} className="text-[10px] bg-emerald-600 px-2 py-0.5 rounded-full font-bold">+ Add</button>
+                          <button onClick={() => dismissBankQuestion(bq.id)} className="text-gray-500 text-xs">✕</button>
+                        </div>
                       </div>
                     ))}
                   </div>

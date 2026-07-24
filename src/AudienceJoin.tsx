@@ -81,15 +81,38 @@ interface AudienceQuestion { id: string; text: string; upvotes: number; answered
 type FeedbackKind = '👍' | '❤️' | '👏' | '🤔' | '🐢' | '🚀';
 type FeedbackCounts = Record<FeedbackKind, number>;
 const EMPTY_FEEDBACK: FeedbackCounts = { '👍': 0, '❤️': 0, '👏': 0, '🤔': 0, '🐢': 0, '🚀': 0 };
+
+// 📚 Question Bank - students submit a fully-formed question (not just a
+// raw text question like AudienceQuestion above) that the presenter can
+// drop straight into a quiz with one tap, instead of retyping it. Kept
+// deliberately separate from QuizQuestion (used for LIVE quiz questions) -
+// converting one of these into a real QuizQuestion happens on the
+// presenter's side, generating a fresh id/timeLimitSeconds at that point.
+// 'truefalse' just becomes a 2-option MCQ once added to a quiz, so nothing
+// about the live quiz-taking experience itself needs to change. MUST stay
+// byte-for-byte in sync with Present.tsx and MobileRemote.tsx.
+type BankQuestionType = 'mcq' | 'truefalse';
+interface BankQuestionOption { id: string; text: string; }
+interface BankQuestion {
+  id: string;
+  authorName: string;
+  type: BankQuestionType;
+  question: string;
+  options: BankQuestionOption[];
+  correctOptionId: string;
+  createdAt: number;
+}
+
 interface AudienceState {
   joinCount: number;
   quiz: QuizState;
   savedQuizzes: SavedQuiz[];
   questions: AudienceQuestion[];
+  questionBank: BankQuestion[];
   feedback: FeedbackCounts;
   qnaOpen: boolean;
 }
-const DEFAULT_AUDIENCE_STATE: AudienceState = { joinCount: 0, quiz: DEFAULT_QUIZ_STATE, savedQuizzes: [], questions: [], feedback: EMPTY_FEEDBACK, qnaOpen: true };
+const DEFAULT_AUDIENCE_STATE: AudienceState = { joinCount: 0, quiz: DEFAULT_QUIZ_STATE, savedQuizzes: [], questions: [], questionBank: [], feedback: EMPTY_FEEDBACK, qnaOpen: true };
 
 const FEEDBACK_OPTIONS: FeedbackKind[] = ['👍', '❤️', '👏', '🤔', '🐢', '🚀'];
 
@@ -109,6 +132,11 @@ const TXT: Record<Lang, Record<string, string>> = {
     questionsClosed: 'پرسیارکردن داخراوە.', noQuestionsYet: 'هێشتا پرسیار نییە - یەکەم کەس بە.',
     answered: 'وەڵامدراوە', tapReact: 'کرتە بکە بۆ ناردنی ڕیاکشنێکی خێرا بۆ وانابەخێر.',
     switchLang: 'English', missingSession: 'ئەم لینکە سیشنی تێدا نییە. داوای کۆدی QR یان لینک لە وانابەخێر بکە.',
+    bank: '📚 بانکی پرسیار', bankIntro: 'پرسیارێکی تەواو دروستکراو بنێرە بۆ وانابەخێر - ئەو دەتوانێت بە یەک کرتە زیادی بکات بۆ کویزێک.',
+    bankType: 'جۆری پرسیار', bankMCQ: 'هەڵبژاردەی فرەیی', bankTrueFalse: 'ڕاست / هەڵە',
+    bankQuestionPlaceholder: 'پرسیارەکەت بنووسە...', bankAddOption: '+ زیادکردنی هەڵبژاردە',
+    bankMarkCorrect: 'کرتە لە بازنەکە بکە بۆ دیاریکردنی وەڵامی ڕاست', bankTrue: 'ڕاست', bankFalse: 'هەڵە',
+    bankSubmit: 'ناردنی پرسیار', bankSent: 'نێردرا - سوپاس! ✓', bankYourQuestions: 'پرسیارە نێردراوەکانت',
   },
   en: {
     live: 'Live', connecting: 'Connecting…', quiz: '🧠 Quiz', qna: '❓ Q&A', react: '💬 React',
@@ -123,6 +151,11 @@ const TXT: Record<Lang, Record<string, string>> = {
     questionsClosed: 'Questions are closed right now.', noQuestionsYet: 'No questions yet - be the first.',
     answered: 'answered', tapReact: 'Tap to send a quick reaction to the presenter, live.',
     switchLang: 'کوردی', missingSession: 'This link is missing a session. Ask the presenter for the QR code or link shown on their screen.',
+    bank: '📚 Question Bank', bankIntro: "Submit a fully-formed question the presenter can add to a quiz with one tap.",
+    bankType: 'Question type', bankMCQ: 'Multiple choice', bankTrueFalse: 'True / False',
+    bankQuestionPlaceholder: 'Write your question...', bankAddOption: '+ Add option',
+    bankMarkCorrect: 'Tap the circle to mark the correct answer', bankTrue: 'True', bankFalse: 'False',
+    bankSubmit: 'Submit question', bankSent: 'Sent - thank you! ✓', bankYourQuestions: 'Your submitted questions',
   },
 };
 
@@ -136,7 +169,7 @@ export default function AudienceJoin() {
   const [lang, setLang] = useState<Lang>('ku');
   const t = TXT[lang];
 
-  const [tab, setTab] = useState<'quiz' | 'qna' | 'feedback'>('quiz');
+  const [tab, setTab] = useState<'quiz' | 'qna' | 'bank' | 'feedback'>('quiz');
   const channelRef = useRef<any>(null);
 
   const [questionDraft, setQuestionDraft] = useState('');
@@ -144,6 +177,18 @@ export default function AudienceJoin() {
   const [recentFeedback, setRecentFeedback] = useState<FeedbackKind | null>(null);
   const [nameDraft, setNameDraft] = useState('');
   const [emojiDraft, setEmojiDraft] = useState<string | null>(null);
+
+  // 📚 Question Bank submission form - bankName is remembered across
+  // submissions (via saveLocal below) so students don't retype it every
+  // time; everything else resets after each successful submit.
+  const [bankName, setBankName] = useState('');
+  const [bankType, setBankType] = useState<BankQuestionType>('mcq');
+  const [bankQuestionText, setBankQuestionText] = useState('');
+  const [bankOptions, setBankOptions] = useState<string[]>(['', '']);
+  const [bankCorrectIndex, setBankCorrectIndex] = useState<number | null>(null);
+  const [bankTrueFalseCorrect, setBankTrueFalseCorrect] = useState<'true' | 'false' | null>(null);
+  const [bankSubmittedCount, setBankSubmittedCount] = useState(0);
+  const [bankSentFlash, setBankSentFlash] = useState(false);
 
   // Local persistence: which quiz participant am I, and my Q&A upvotes -
   // scoped per session so it survives a refresh but doesn't leak across
@@ -159,10 +204,11 @@ export default function AudienceJoin() {
       if (saved.participantId) setParticipantId(saved.participantId);
       if (saved.upvotes) setMyUpvotes(saved.upvotes);
       if (saved.lang) setLang(saved.lang);
+      if (saved.bankName) setBankName(saved.bankName);
     } catch { /* noop */ }
   }, [storageKey]);
 
-  const saveLocal = (next: { participantId?: string | null; upvotes?: Record<string, true>; lang?: Lang }) => {
+  const saveLocal = (next: { participantId?: string | null; upvotes?: Record<string, true>; lang?: Lang; bankName?: string }) => {
     if (!storageKey) return;
     try {
       const prev = JSON.parse(localStorage.getItem(storageKey) || '{}');
@@ -341,6 +387,49 @@ export default function AudienceJoin() {
     setTimeout(() => setQuestionSent(false), 2500);
   };
 
+  // 📚 Question Bank submission - builds a complete BankQuestion (name,
+  // type, question text, options, correct answer) and broadcasts it in one
+  // go. True/False skips typing options entirely - fixed True/False pair,
+  // just pick which one is correct.
+  const canSubmitBank = (() => {
+    if (!bankName.trim() || !bankQuestionText.trim()) return false;
+    if (bankType === 'truefalse') return bankTrueFalseCorrect !== null;
+    const filled = bankOptions.map((o) => o.trim()).filter(Boolean);
+    return filled.length >= 2 && bankCorrectIndex !== null && !!bankOptions[bankCorrectIndex]?.trim();
+  })();
+
+  const submitBankQuestion = () => {
+    if (!canSubmitBank) return;
+    const authorName = bankName.trim();
+    let question: BankQuestion;
+    if (bankType === 'truefalse') {
+      question = {
+        id: `bq_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+        authorName, type: 'truefalse', question: bankQuestionText.trim(),
+        options: [{ id: 'true', text: t.bankTrue }, { id: 'false', text: t.bankFalse }],
+        correctOptionId: bankTrueFalseCorrect as string,
+        createdAt: Date.now(),
+      };
+    } else {
+      const options = bankOptions.map((o, i) => ({ id: `o${i}`, text: o.trim() })).filter((o) => o.text);
+      question = {
+        id: `bq_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+        authorName, type: 'mcq', question: bankQuestionText.trim(),
+        options, correctOptionId: `o${bankCorrectIndex}`,
+        createdAt: Date.now(),
+      };
+    }
+    channelRef.current?.send({ type: 'broadcast', event: 'bank_question_submit', payload: { question } });
+    saveLocal({ bankName: authorName });
+    setBankQuestionText('');
+    setBankOptions(['', '']);
+    setBankCorrectIndex(null);
+    setBankTrueFalseCorrect(null);
+    setBankSubmittedCount((n) => n + 1);
+    setBankSentFlash(true);
+    setTimeout(() => setBankSentFlash(false), 2500);
+  };
+
   const upvote = (q: AudienceQuestion) => {
     if (myUpvotes[q.id]) return;
     const nextUpvotes = { ...myUpvotes, [q.id]: true as const };
@@ -380,13 +469,13 @@ export default function AudienceJoin() {
 
       {!quizActive && (
       <div className="flex gap-1 mx-4 mt-3 bg-gray-900 rounded-lg p-1 shrink-0">
-        {(['quiz', 'qna', 'feedback'] as const).map((tKey) => (
+        {(['quiz', 'qna', 'bank', 'feedback'] as const).map((tKey) => (
           <button
             key={tKey}
             onClick={() => setTab(tKey)}
             className={`flex-1 text-sm py-2 rounded-md font-medium ${tab === tKey ? 'bg-emerald-600' : 'text-gray-400'}`}
           >
-            {tKey === 'quiz' ? `🧠 ${t.quiz}` : tKey === 'qna' ? t.qna : t.react}
+            {tKey === 'quiz' ? `🧠 ${t.quiz}` : tKey === 'qna' ? t.qna : tKey === 'bank' ? t.bank : t.react}
           </button>
         ))}
       </div>
@@ -460,6 +549,99 @@ export default function AudienceJoin() {
                 <p className="text-xs text-gray-600 text-center py-6">{t.noQuestionsYet}</p>
               )}
             </div>
+          </div>
+        )}
+
+        {tab === 'bank' && (
+          <div className="flex flex-col gap-4">
+            <p className="text-xs text-gray-500">{t.bankIntro}</p>
+
+            <input
+              value={bankName}
+              onChange={(e) => setBankName(e.target.value)}
+              placeholder={t.namePlaceholder}
+              maxLength={30}
+              className="w-full bg-gray-900 border border-gray-800 rounded-lg px-3 py-2.5 text-sm"
+            />
+
+            <div className="flex gap-2">
+              <button
+                onClick={() => setBankType('mcq')}
+                className={`flex-1 rounded-lg py-2 text-sm font-bold ${bankType === 'mcq' ? 'bg-emerald-600' : 'bg-gray-900 border border-gray-800 text-gray-400'}`}
+              >
+                {t.bankMCQ}
+              </button>
+              <button
+                onClick={() => setBankType('truefalse')}
+                className={`flex-1 rounded-lg py-2 text-sm font-bold ${bankType === 'truefalse' ? 'bg-emerald-600' : 'bg-gray-900 border border-gray-800 text-gray-400'}`}
+              >
+                {t.bankTrueFalse}
+              </button>
+            </div>
+
+            <textarea
+              value={bankQuestionText}
+              onChange={(e) => setBankQuestionText(e.target.value)}
+              placeholder={t.bankQuestionPlaceholder}
+              rows={2}
+              maxLength={200}
+              className="bg-gray-900 border border-gray-800 rounded-lg px-3 py-2 text-sm resize-none"
+            />
+
+            {bankType === 'mcq' ? (
+              <div className="flex flex-col gap-2">
+                <p className="text-[11px] text-gray-500">{t.bankMarkCorrect}</p>
+                {bankOptions.map((opt, i) => (
+                  <div key={i} className="flex items-center gap-2">
+                    <button
+                      onClick={() => setBankCorrectIndex(i)}
+                      className={`shrink-0 w-6 h-6 rounded-full border-2 flex items-center justify-center text-xs ${bankCorrectIndex === i ? 'bg-emerald-600 border-emerald-400' : 'border-gray-700'}`}
+                    >
+                      {bankCorrectIndex === i ? '✓' : ''}
+                    </button>
+                    <input
+                      value={opt}
+                      onChange={(e) => setBankOptions((prev) => prev.map((o, j) => (j === i ? e.target.value : o)))}
+                      placeholder={`${i + 1}`}
+                      className="flex-1 bg-gray-900 border border-gray-800 rounded-lg px-3 py-2 text-sm"
+                    />
+                    {bankOptions.length > 2 && (
+                      <button onClick={() => setBankOptions((prev) => prev.filter((_, j) => j !== i))} className="shrink-0 text-gray-600 text-sm">✕</button>
+                    )}
+                  </div>
+                ))}
+                {bankOptions.length < 6 && (
+                  <button onClick={() => setBankOptions((prev) => [...prev, ''])} className="text-xs text-blue-400 self-start">{t.bankAddOption}</button>
+                )}
+              </div>
+            ) : (
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setBankTrueFalseCorrect('true')}
+                  className={`flex-1 rounded-xl py-6 text-lg font-bold ${bankTrueFalseCorrect === 'true' ? 'bg-emerald-600' : 'bg-gray-900 border border-gray-800 text-gray-300'}`}
+                >
+                  ✅ {t.bankTrue}
+                </button>
+                <button
+                  onClick={() => setBankTrueFalseCorrect('false')}
+                  className={`flex-1 rounded-xl py-6 text-lg font-bold ${bankTrueFalseCorrect === 'false' ? 'bg-red-700' : 'bg-gray-900 border border-gray-800 text-gray-300'}`}
+                >
+                  ❌ {t.bankFalse}
+                </button>
+              </div>
+            )}
+
+            <button
+              onClick={submitBankQuestion}
+              disabled={!canSubmitBank}
+              className="bg-emerald-600 disabled:opacity-30 rounded-lg py-2.5 text-sm font-semibold"
+            >
+              {bankSentFlash ? t.bankSent : t.bankSubmit}
+            </button>
+
+            {bankSubmittedCount > 0 && (
+              <p className="text-[11px] text-gray-600 text-center">{t.bankYourQuestions}: {bankSubmittedCount}</p>
+            )}
           </div>
         )}
 

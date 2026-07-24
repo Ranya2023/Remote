@@ -269,15 +269,39 @@ interface AudienceQuestion { id: string; text: string; upvotes: number; answered
 type FeedbackKind = '👍' | '❤️' | '👏' | '🤔' | '🐢' | '🚀';
 type FeedbackCounts = Record<FeedbackKind, number>;
 const EMPTY_FEEDBACK: FeedbackCounts = { '👍': 0, '❤️': 0, '👏': 0, '🤔': 0, '🐢': 0, '🚀': 0 };
+
+// 📚 Question Bank - students submit a fully-formed question (type, text,
+// options, correct answer) via AudienceJoin.tsx's Bank tab, rather than
+// just a raw text idea like AudienceQuestion above - the presenter can
+// drop one straight into a quiz with one tap instead of retyping it.
+// Deliberately separate from QuizQuestion (used for LIVE quiz questions) -
+// converting one of these into a real QuizQuestion happens on "+ Add to
+// quiz" below, generating a fresh id/timeLimitSeconds at that point.
+// 'truefalse' just becomes a 2-option MCQ once added, so nothing about the
+// live quiz-taking experience itself needs to change. MUST stay
+// byte-for-byte in sync with MobileRemote.tsx and AudienceJoin.tsx.
+type BankQuestionType = 'mcq' | 'truefalse';
+interface BankQuestionOption { id: string; text: string; }
+interface BankQuestion {
+  id: string;
+  authorName: string;
+  type: BankQuestionType;
+  question: string;
+  options: BankQuestionOption[];
+  correctOptionId: string;
+  createdAt: number;
+}
+
 interface AudienceState {
   joinCount: number;
   quiz: QuizState;
   savedQuizzes: SavedQuiz[];
-  questions: AudienceQuestion[]; // student-submitted questions - doubles as the "question bank" the teacher builds quizzes from
+  questions: AudienceQuestion[]; // student-submitted raw question ideas - free text only, no answer
+  questionBank: BankQuestion[]; // student-submitted, ready-to-use questions - type + options + correct answer already filled in
   feedback: FeedbackCounts;
   qnaOpen: boolean;
 }
-const DEFAULT_AUDIENCE_STATE: AudienceState = { joinCount: 0, quiz: DEFAULT_QUIZ_STATE, savedQuizzes: [], questions: [], feedback: EMPTY_FEEDBACK, qnaOpen: true };
+const DEFAULT_AUDIENCE_STATE: AudienceState = { joinCount: 0, quiz: DEFAULT_QUIZ_STATE, savedQuizzes: [], questions: [], questionBank: [], feedback: EMPTY_FEEDBACK, qnaOpen: true };
 
 
 interface Point { x: number; y: number; }
@@ -809,6 +833,35 @@ export default function Present() {
     }
   }, [persistAudienceState, fileId]);
 
+  // 📚 Question Bank - dismiss a submission (called either directly from
+  // this screen's own Quiz panel, or via the quiz_control listener when
+  // the phone remote dismisses one - same dual-path pattern as
+  // deleteSavedQuiz above).
+  const removeBankQuestion = useCallback((id: string) => {
+    const next = audienceStateRef.current.questionBank.filter((q) => q.id !== id);
+    persistAudienceState({ ...audienceStateRef.current, questionBank: next });
+  }, [persistAudienceState]);
+
+  // Converts a bank submission into a real, ready-to-launch QuizQuestion
+  // and drops it straight into the draft - no retyping. 'truefalse' just
+  // becomes an ordinary 2-option MCQ; timeLimitSeconds defaults the same
+  // way a freshly-typed question does (see qTimeLimit's initial value).
+  // This only ever touches THIS screen's own draftQuestions, same as
+  // MobileRemote.tsx's copy touches its own - draft-building was never
+  // synced between the two screens to begin with.
+  const addBankQuestionToDraft = (bq: BankQuestion) => {
+    const newQ: QuizQuestion = {
+      id: `q_${Date.now().toString(36)}`,
+      type: 'mcq',
+      question: bq.question,
+      options: bq.options.map((o, i) => ({ id: `opt_${i}`, text: o.text })),
+      correctOptionId: `opt_${bq.options.findIndex((o) => o.id === bq.correctOptionId)}`,
+      source: `Submitted by ${bq.authorName}`,
+      timeLimitSeconds: 20,
+    };
+    setDraftQuestions((prev) => [...prev, newQ]);
+  };
+
   // Re-fetches saved quizzes (file-scoped + account-level) and merges them
   // into audienceState. setupSession below already does this once on load,
   // but that fetch can still be resolving (or can lose a race with auth
@@ -1217,6 +1270,17 @@ export default function Present() {
         persistAudienceState({ ...current, questions });
       });
 
+      // 📚 Question Bank - a student on AudienceJoin.tsx's Bank tab
+      // submitted a complete, ready-to-use question (type/options/correct
+      // answer already filled in). Just appends it - "+ Add to quiz" /
+      // "✕ Dismiss" for these live in the Quiz panel below.
+      channel.on('broadcast', { event: 'bank_question_submit' }, (payload) => {
+        const question = payload.payload?.question as BankQuestion | undefined;
+        if (!question || !question.id || !question.question?.trim() || !question.options?.length) return;
+        const current = audienceStateRef.current;
+        persistAudienceState({ ...current, questionBank: [...current.questionBank, question] });
+      });
+
       // Lets the phone remote fully drive quiz creation/flow too.
       channel.on('broadcast', { event: 'quiz_control' }, (payload) => {
         const { action, questions, participantId: spotlightId } = payload.payload || {};
@@ -1228,6 +1292,7 @@ export default function Present() {
         else if (action === 'save_quiz' && Array.isArray(questions) && payload.payload?.title) saveQuiz(payload.payload.title, questions);
         else if (action === 'delete_saved' && payload.payload?.id) deleteSavedQuiz(payload.payload.id);
         else if (action === 'refresh_saved') refreshSavedQuizzes();
+        else if (action === 'bank_remove' && payload.payload?.id) removeBankQuestion(payload.payload.id);
       });
 
       // Discussion-type question activity: post an idea, comment on one,
@@ -2481,6 +2546,25 @@ export default function Present() {
                         <span className="flex-1 text-xs truncate">{sq.title} <span className="text-gray-500">({sq.questions.length}q)</span></span>
                         <button onClick={() => startQuizFlow(sq.questions)} className="text-[11px] bg-emerald-600 hover:bg-emerald-500 px-2.5 py-1 rounded-full font-bold shrink-0">▶ Start</button>
                         <button onClick={() => deleteSavedQuiz(sq.id)} className="text-gray-500 hover:text-red-400 text-xs shrink-0">✕</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {audienceState.questionBank.length > 0 && (
+                  <div className="flex flex-col gap-2 bg-gray-800/40 rounded-xl p-3">
+                    <p className="text-xs font-bold text-gray-400 uppercase">📚 Question Bank</p>
+                    {[...audienceState.questionBank].sort((a, b) => b.createdAt - a.createdAt).map((bq) => (
+                      <div key={bq.id} className="flex items-start gap-2 bg-gray-800/70 rounded-lg px-3 py-2">
+                        <div className="flex-1 min-w-0">
+                          <p className="text-[10px] text-gray-500">{bq.authorName} · {bq.type === 'truefalse' ? 'True/False' : 'Multiple choice'}</p>
+                          <p className="text-xs truncate">{bq.question}</p>
+                          <p className="text-[10px] text-emerald-400 truncate">✓ {bq.options.find((o) => o.id === bq.correctOptionId)?.text}</p>
+                        </div>
+                        <div className="flex flex-col gap-1 items-center shrink-0">
+                          <button onClick={() => addBankQuestionToDraft(bq)} className="text-[11px] bg-emerald-600 hover:bg-emerald-500 px-2.5 py-1 rounded-full font-bold shrink-0">+ Add</button>
+                          <button onClick={() => removeBankQuestion(bq.id)} className="text-gray-500 hover:text-red-400 text-xs">✕</button>
+                        </div>
                       </div>
                     ))}
                   </div>
