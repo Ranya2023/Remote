@@ -367,7 +367,7 @@ export default function AudienceJoin() {
     <div className="flex flex-col h-screen w-full bg-gray-950 text-white" style={{ direction: lang === 'ku' ? 'rtl' : 'ltr' }}>
       <div className="px-4 pt-5 pb-3 border-b border-gray-800 flex items-center justify-between shrink-0">
         <div>
-          <h1 className="text-lg font-bold">NextSlide</h1>
+          <h1 className="text-lg font-bold">Remco</h1>
           <p className="text-[11px] text-gray-500 font-mono" style={{ direction: 'ltr' }}>Session {sessionId}</p>
         </div>
         <div className="flex items-center gap-2">

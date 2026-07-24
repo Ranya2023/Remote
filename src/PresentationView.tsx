@@ -188,7 +188,7 @@ export default function PresentationView() {
           <button onClick={() => setLang(lang === 'ku' ? 'en' : 'ku')} className="text-xs bg-gray-700 px-3 py-1 rounded">{t.switchLang}</button>
         </div>
         <div className="w-full flex flex-col items-center">
-          <h2 className="text-3xl font-bold mb-2">NextSlide</h2>
+          <h2 className="text-3xl font-bold mb-2">Remco</h2>
           <p className="text-sm text-gray-400 mb-8">{t.scan}</p>
           
           <div className="bg-white p-4 rounded-xl mb-2">

@@ -1891,7 +1891,7 @@ export default function Present() {
         </div>
 
         <div className="w-full flex flex-col items-center">
-          <h2 className="text-3xl font-bold mb-2">NextSlide</h2>
+          <h2 className="text-3xl font-bold mb-2">Remco</h2>
           <p className="text-sm text-gray-400 mb-8">Scan to control</p>
 
           <div className="bg-white p-4 rounded-xl mb-2">

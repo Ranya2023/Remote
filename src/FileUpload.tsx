@@ -362,7 +362,7 @@ export default function FileUpload() {
           {user ? `👤 ${profile?.display_name || user.email} · My account` : '👤 Log in / Create account'}
         </button>
       </div>
-      <h1 className="text-3xl font-bold text-white mb-2 text-center">NextSlide Uploader</h1>
+      <h1 className="text-3xl font-bold text-white mb-2 text-center">Remco Uploader</h1>
       <p className="text-sm text-gray-400 mb-8 text-center">
         Add as many files and video links as you need, then start the lesson.
       </p>

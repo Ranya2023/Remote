@@ -141,6 +141,10 @@ const DEFAULT_AUDIENCE_STATE: AudienceState = { joinCount: 0, quiz: DEFAULT_QUIZ
 export default function MobileRemote() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [currentSlide, setCurrentSlide] = useState(1);
+  // Thumbnail buttons, keyed by slide number - lets the scroll-into-view
+  // effect below look one up without re-running scrollIntoView on every
+  // render (see that effect for why that used to be a real problem).
+  const thumbRefsMap = useRef<Map<number, HTMLButtonElement>>(new Map());
   const [currentBuild, setCurrentBuild] = useState(0);
   const [flatSlides, setFlatSlides] = useState<FlatSlide[]>([]);
 
@@ -316,6 +320,18 @@ export default function MobileRemote() {
   // that shouldn't go stale (canvas resize callbacks, etc).
   const currentSlideRef = useRef(1);
   const currentBuildRef = useRef(0);
+
+  // Scrolls the active thumbnail into view - deliberately an effect keyed
+  // on currentSlide (and flatSlides.length, for the initial mount once the
+  // list is populated), NOT the button's inline ref callback. This used to
+  // call scrollIntoView() straight from the ref, which re-fires on every
+  // single render (a laser or spotlight drag alone re-renders this
+  // component up to ~60x/sec) - each call restarted the smooth-scroll
+  // animation mid-flight, which is what was making the whole remote appear
+  // to jump/shift (most visibly landing on slide 1, the strip's edge).
+  useEffect(() => {
+    thumbRefsMap.current.get(currentSlide)?.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+  }, [currentSlide, flatSlides.length]);
 
   // Local drawing overlay — same idea as the one in Present.tsx, so strokes
   // you draw show up on your own phone screen too, not just the projector.
@@ -1197,7 +1213,7 @@ export default function MobileRemote() {
         </div>
       )}
 
-      <div className="flex justify-between items-center p-4 bg-[#12172b] border-b border-[#232a45]">
+      <div className="flex justify-between items-center p-3 bg-[#12172b] border-b border-[#232a45]">
         <div className="flex items-center gap-3 relative">
           <button
             onClick={() => (timerSecondsLeft === null ? setTimerPanelOpen((o) => !o) : togglePauseTimer())}
@@ -1299,52 +1315,46 @@ export default function MobileRemote() {
 
       {/* Slide counter - its own row right below the focus-mode/language
           toolbar, rather than crammed inline with those buttons. */}
-      <div className="w-full flex justify-center py-1.5 bg-[#12172b] border-b border-[#232a45]">
-        <div className="bg-gradient-to-r from-blue-500 to-purple-500 shadow-[0_0_16px_rgba(99,102,241,0.5)] px-3 py-1 rounded-full font-bold text-sm" style={{ direction: 'ltr' }}>{t.slide} {currentSlide}{flatSlides.length ? ` / ${flatSlides.length}` : ''}</div>
+      <div className="w-full flex justify-center py-1 bg-[#12172b] border-b border-[#232a45]">
+        <div className="bg-gradient-to-r from-blue-500 to-purple-500 shadow-[0_0_16px_rgba(99,102,241,0.5)] px-3 py-0.5 rounded-full font-bold text-sm" style={{ direction: 'ltr' }}>{t.slide} {currentSlide}{flatSlides.length ? ` / ${flatSlides.length}` : ''}</div>
       </div>
 
       {/* Slide thumbnails - one per global slide number, sourced from the
           host's flatSlides list so it always matches the real slide count
           (fixes "slide 6 doesn't show" for good, since this can no longer
           drift from what's actually on screen). */}
-      <div className="w-full bg-[#12172b] border-b border-[#232a45] py-2">
-        <div className="flex gap-1.5 px-4 opacity-40" style={{ direction: 'ltr' }}>
-          {Array.from({ length: 14 }).map((_, i) => <span key={i} className="w-1 h-1 rounded-full bg-gray-500 shrink-0" />)}
-        </div>
-        <div className="p-2 overflow-x-auto flex gap-2 scroll-smooth" style={{ direction: 'ltr' }}>
+      <div className="w-full bg-[#12172b] border-b border-[#232a45] py-1">
+        <div className="p-1.5 overflow-x-auto flex gap-2 scroll-smooth" style={{ direction: 'ltr' }}>
           {flatSlides.map((slide, i) => (
             <button
               key={i}
-              ref={(el) => { if (currentSlide === i + 1) el?.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' }); }}
+              ref={(el) => { if (el) thumbRefsMap.current.set(i + 1, el); else thumbRefsMap.current.delete(i + 1); }}
               onClick={() => updateSlide(i + 1)}
               disabled={!ready}
-              className={`min-w-[56px] h-14 rounded-xl flex flex-col items-center justify-center font-bold text-xs gap-0.5 transition-all duration-300 overflow-hidden border-2 ${currentSlide === i + 1 ? 'bg-gradient-to-br from-blue-600 to-purple-600 border-purple-400 text-white scale-110 shadow-[0_0_18px_rgba(168,85,247,0.55)]' : 'bg-[#1b2140] border-transparent text-gray-400 scale-100'} ${!ready ? 'opacity-50 cursor-not-allowed' : ''}`}
+              className={`min-w-[44px] h-11 rounded-lg flex flex-col items-center justify-center font-bold text-[10px] gap-0.5 transition-all duration-300 overflow-hidden border-2 ${currentSlide === i + 1 ? 'bg-gradient-to-br from-blue-600 to-purple-600 border-purple-400 text-white scale-110 shadow-[0_0_18px_rgba(168,85,247,0.55)]' : 'bg-[#1b2140] border-transparent text-gray-400 scale-100'} ${!ready ? 'opacity-50 cursor-not-allowed' : ''}`}
             >
               {slide.thumbnail ? (
-                <img src={slide.thumbnail} alt="" className="w-8 h-6 object-cover rounded-sm" />
+                <img src={slide.thumbnail} alt="" className="w-7 h-5 object-cover rounded-sm" />
               ) : (
-                <span className="text-base leading-none">{TYPE_ICON[slide.fileType] || '📄'}</span>
+                <span className="text-sm leading-none">{TYPE_ICON[slide.fileType] || '📄'}</span>
               )}
               <span>{i + 1}</span>
             </button>
           ))}
         </div>
-        <div className="flex gap-1.5 px-4 opacity-40" style={{ direction: 'ltr' }}>
-          {Array.from({ length: 14 }).map((_, i) => <span key={i} className="w-1 h-1 rounded-full bg-gray-500 shrink-0" />)}
-        </div>
       </div>
 
-      <div className="px-4 pt-3 flex gap-2">
-        <button disabled={!ready || currentSlide <= 1} onClick={() => updateSlide(1)} className="flex-1 h-9 rounded-lg bg-[#1b2140] border border-[#2c3560] text-white text-xs font-bold disabled:opacity-40">
+      <div className="px-4 pt-2 flex gap-2">
+        <button disabled={!ready || currentSlide <= 1} onClick={() => updateSlide(1)} className="flex-1 h-8 rounded-lg bg-[#1b2140] border border-[#2c3560] text-white text-xs font-bold disabled:opacity-40">
           ⏮ {t.first}
         </button>
-        <button disabled={!ready || currentSlide >= flatSlides.length} onClick={() => updateSlide(flatSlides.length)} className="flex-1 h-9 rounded-lg bg-[#1b2140] border border-[#2c3560] text-white text-xs font-bold disabled:opacity-40">
+        <button disabled={!ready || currentSlide >= flatSlides.length} onClick={() => updateSlide(flatSlides.length)} className="flex-1 h-8 rounded-lg bg-[#1b2140] border border-[#2c3560] text-white text-xs font-bold disabled:opacity-40">
           {t.last} ⏭
         </button>
       </div>
 
       {currentBuildCount > 0 && (
-        <div className="px-4 pt-2 flex items-center justify-center gap-1.5">
+        <div className="px-4 pt-1.5 flex items-center justify-center gap-1.5">
           {Array.from({ length: currentBuildCount + 1 }).map((_, i) => (
             <span
               key={i}
@@ -1355,9 +1365,9 @@ export default function MobileRemote() {
         </div>
       )}
 
-      <div className="p-4 grid grid-cols-2 gap-4">
-        <button disabled={!ready} onClick={() => advance(-1)} className={`h-20 rounded-2xl bg-gradient-to-br from-violet-600 to-purple-800 text-white text-xl font-bold shadow-[0_4px_20px_rgba(124,58,237,0.35)] flex items-center justify-center gap-2 ${!ready ? 'opacity-50' : 'active:brightness-90'}`}><span>‹</span> {t.prev}</button>
-        <button disabled={!ready} onClick={() => advance(1)} className={`h-20 rounded-2xl bg-gradient-to-br from-blue-500 to-blue-700 text-white text-xl font-bold shadow-[0_4px_20px_rgba(37,99,235,0.4)] flex items-center justify-center gap-2 ${!ready ? 'opacity-50' : 'active:brightness-90'}`}>{t.next} <span>›</span></button>
+      <div className="px-4 pt-3 pb-1 grid grid-cols-2 gap-3">
+        <button disabled={!ready} onClick={() => advance(-1)} className={`h-14 rounded-2xl bg-gradient-to-br from-violet-600 to-purple-800 text-white text-lg font-bold shadow-[0_4px_20px_rgba(124,58,237,0.35)] flex items-center justify-center gap-2 ${!ready ? 'opacity-50' : 'active:brightness-90'}`}><span>‹</span> {t.prev}</button>
+        <button disabled={!ready} onClick={() => advance(1)} className={`h-14 rounded-2xl bg-gradient-to-br from-blue-500 to-blue-700 text-white text-lg font-bold shadow-[0_4px_20px_rgba(37,99,235,0.4)] flex items-center justify-center gap-2 ${!ready ? 'opacity-50' : 'active:brightness-90'}`}>{t.next} <span>›</span></button>
       </div>
 
       {/* Screen controls: black/white screen restore-to-color, spotlight,
@@ -1415,8 +1425,8 @@ export default function MobileRemote() {
         </div>
       )}
 
-      <div className="flex-1 px-4 pb-4 flex flex-col min-h-0">
-        <div className="flex justify-between items-center mb-2 flex-wrap gap-y-2">
+      <div className="flex-1 px-4 pb-3 flex flex-col min-h-0">
+        <div className="flex justify-between items-center mb-1.5 flex-wrap gap-y-1.5">
           <span className="text-xs text-gray-400 font-bold uppercase tracking-wide">{t.controller}</span>
           {(activeMode === 'draw' || activeMode === 'highlight' || activeMode === 'erase') && (
             <div className="flex gap-2">
@@ -1425,7 +1435,7 @@ export default function MobileRemote() {
             </div>
           )}
         </div>
-        <div className="grid grid-cols-3 gap-2 mb-3">
+        <div className="grid grid-cols-3 gap-1.5 mb-2">
           {([
             ['laser', '🔴', t.laser, 'from-rose-500/20 to-rose-500/5', 'border-rose-500', 'shadow-rose-500/40'],
             ['spotlight', '💡', t.spotlight, 'from-amber-400/20 to-amber-400/5', 'border-amber-400', 'shadow-amber-400/40'],
@@ -1438,10 +1448,10 @@ export default function MobileRemote() {
               key={mode}
               disabled={!ready}
               onClick={() => handleModeChange(mode)}
-              className={`flex flex-col items-center justify-center gap-1 py-3 rounded-2xl border bg-gradient-to-b ${activeMode === mode ? `${grad} ${border} shadow-[0_0_16px_var(--tw-shadow-color)] ${glow}` : 'from-[#1b2140] to-[#1b2140] border-[#2c3560]'} ${!ready ? 'opacity-50' : ''}`}
+              className={`flex flex-col items-center justify-center gap-0.5 py-1.5 rounded-xl border bg-gradient-to-b ${activeMode === mode ? `${grad} ${border} shadow-[0_0_16px_var(--tw-shadow-color)] ${glow}` : 'from-[#1b2140] to-[#1b2140] border-[#2c3560]'} ${!ready ? 'opacity-50' : ''}`}
             >
-              <span className="text-2xl leading-none">{icon}</span>
-              <span className="text-[11px] font-bold text-gray-200">{label}</span>
+              <span className="text-lg leading-none">{icon}</span>
+              <span className="text-[10px] font-bold text-gray-200">{label}</span>
             </button>
           ))}
         </div>
